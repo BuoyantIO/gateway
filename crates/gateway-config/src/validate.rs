@@ -38,6 +38,8 @@ pub enum RejectionReason {
     HeaderInMultipleOps(String),
     #[error("static backend must have at least one endpoint")]
     StaticBackendNoEndpoints,
+    #[error("TCP listener must have exactly one route, found {0}")]
+    TcpListenerRouteCount(usize),
 }
 
 impl fmt::Display for BindProtocol {
@@ -192,6 +194,12 @@ fn validate_tls_route(key: &str, route: &TlsRoute, out: &mut Vec<Rejection>) {
 }
 
 fn validate_tcp_listener(key: &str, l: &TcpListener, out: &mut Vec<Rejection>) {
+    if l.routes.len() != 1 {
+        out.push(Rejection {
+            key: key.to_string(),
+            reason: RejectionReason::TcpListenerRouteCount(l.routes.len()),
+        });
+    }
     check_unique(
         &format!("{key}/routes"),
         l.routes.iter().map(|r| r.name.as_str()),
@@ -319,6 +327,52 @@ gatewayConfig:
             r.reason,
             RejectionReason::BindListenerProtocolMismatch { .. }
         )));
+    }
+
+    #[test]
+    fn tcp_listener_with_multiple_routes_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - name: l
+          listenerProtocol: TCP
+          routes:
+            - { name: r0, backendRefs: [{ name: be0 }] }
+            - { name: r1, backendRefs: [{ name: be1 }] }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::TcpListenerRouteCount(2)))
+        );
+    }
+
+    #[test]
+    fn tcp_listener_with_no_routes_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - { name: l, listenerProtocol: TCP }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::TcpListenerRouteCount(0)))
+        );
     }
 
     #[test]
