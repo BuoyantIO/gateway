@@ -1,0 +1,65 @@
+gatewayConfig:
+  name: demo-gateway-config
+  binds:
+    - name: public-https
+      address: 0.0.0.0
+      port: 443
+      bindProtocol: TLS
+      listeners:
+        - name: app-https
+          listenerProtocol: HTTPS
+          hostname: app.example.com
+          tls:
+            mode: Terminate
+            certificates:
+              - name: app-tls
+                kind: Secret
+          routes:
+            - name: api-route
+              matches:
+                - path:
+                    type: PathPrefix
+                    value: /api
+              backendRefs:
+                - name: api-backend
+              filters:
+                - name: add-gateway-header
+                  type: RequestHeaderModifier
+                  requestHeaders:
+                    add:
+                      - name: x-gateway
+                        value: demo
+            - name: health-route
+              matches:
+                - path:
+                    type: PathPrefix
+                    value: /healthz
+              backendRefs:
+                - name: health-backend
+  backends:
+    - name: api-backend
+      type: Static
+      endpoints:
+        - name: e0
+          address: 10.0.0.1
+          port: 8080
+        - name: e1
+          address: 10.0.0.2
+          port: 8080
+    - name: health-backend
+      type: Static
+      endpoints:
+        - name: e0
+          address: 10.0.0.3
+          port: 8080
+  secrets:
+    - name: app-tls
+      type: TLS
+      certPem: |
+        -----BEGIN CERTIFICATE-----
+        FAKE-CERT-DATA
+        -----END CERTIFICATE-----
+      keyPem: |
+        -----BEGIN PRIVATE KEY-----
+        FAKE-KEY-DATA
+        -----END PRIVATE KEY-----
