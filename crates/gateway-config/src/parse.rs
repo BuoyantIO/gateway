@@ -388,6 +388,33 @@ gatewayConfig:
     }
 
     #[test]
+    fn tcp_bind_with_tcp_listener_and_route() {
+        let cfg = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - name: l
+          listenerProtocol: TCP
+          routes:
+            - name: r
+              backendRefs: [{ name: be }]
+",
+        )
+        .unwrap();
+        let Listener::Tcp(l) = &cfg.binds[0].listeners[0] else {
+            panic!("expected TCP listener");
+        };
+        assert_eq!(l.routes.len(), 1);
+        assert_eq!(l.routes[0].name, "r");
+        assert_eq!(l.routes[0].backend_refs[0].name, "be");
+    }
+
+    #[test]
     fn filter_ordering_preserved() {
         let cfg = parse_yaml(
             r#"

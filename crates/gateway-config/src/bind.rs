@@ -21,6 +21,7 @@ pub struct Bind {
 pub enum BindProtocol {
     Tls,
     Http,
+    Tcp,
 }
 
 fn default_bind_address() -> IpAddr {

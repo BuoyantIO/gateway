@@ -24,6 +24,13 @@ pub struct HttpRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpRoute {
+    pub name: String,
+    pub backend_refs: Vec<BackendRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SniMatch {
     pub sni: String,
 }

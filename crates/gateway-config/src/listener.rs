@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::route::{HttpRoute, TlsRoute};
+use crate::route::{HttpRoute, TcpRoute, TlsRoute};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "listenerProtocol", rename_all = "UPPERCASE")]
@@ -8,6 +8,7 @@ pub enum Listener {
     Tls(TlsListener),
     Https(HttpsListener),
     Http(HttpListener),
+    Tcp(TcpListener),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +44,14 @@ pub struct HttpListener {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpListener {
+    pub name: String,
+    #[serde(default)]
+    pub routes: Vec<TcpRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsConfig {
     pub mode: TlsMode,
     #[serde(default)]
@@ -68,6 +77,7 @@ impl Listener {
             Self::Tls(l) => &l.name,
             Self::Https(l) => &l.name,
             Self::Http(l) => &l.name,
+            Self::Tcp(l) => &l.name,
         }
     }
 }

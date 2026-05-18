@@ -7,7 +7,7 @@ use crate::backend::Backend;
 use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::filter::{HttpFilter, RequestHeaderOps};
-use crate::listener::{HttpsListener, Listener, TlsConfig, TlsListener, TlsMode};
+use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
 use crate::route::{HttpRoute, PathMatchKind, TlsRoute};
 
 #[derive(Debug, Error)]
@@ -45,6 +45,7 @@ impl fmt::Display for BindProtocol {
         match self {
             Self::Tls => f.write_str("TLS"),
             Self::Http => f.write_str("HTTP"),
+            Self::Tcp => f.write_str("TCP"),
         }
     }
 }
@@ -103,12 +104,14 @@ fn validate_bind(key: &str, bind: &Bind, out: &mut Vec<Rejection>) {
             Listener::Tls(_) => "TLS",
             Listener::Https(_) => "HTTPS",
             Listener::Http(_) => "HTTP",
+            Listener::Tcp(_) => "TCP",
         };
 
         let compatible = matches!(
             (bind.bind_protocol, listener),
             (BindProtocol::Tls, Listener::Tls(_) | Listener::Https(_))
                 | (BindProtocol::Http, Listener::Http(_))
+                | (BindProtocol::Tcp, Listener::Tcp(_))
         );
         if !compatible {
             out.push(Rejection {
@@ -133,6 +136,7 @@ fn validate_bind(key: &str, bind: &Bind, out: &mut Vec<Rejection>) {
                     validate_http_route(&format!("{lkey}/routes[{j}]"), route, out);
                 }
             }
+            Listener::Tcp(l) => validate_tcp_listener(&lkey, l, out),
         }
     }
 }
@@ -183,6 +187,14 @@ fn validate_tls_route(key: &str, route: &TlsRoute, out: &mut Vec<Rejection>) {
     check_unique(
         &format!("{key}/filters"),
         route.filters.iter().map(crate::filter::TlsFilter::name),
+        out,
+    );
+}
+
+fn validate_tcp_listener(key: &str, l: &TcpListener, out: &mut Vec<Rejection>) {
+    check_unique(
+        &format!("{key}/routes"),
+        l.routes.iter().map(|r| r.name.as_str()),
         out,
     );
 }
@@ -300,6 +312,28 @@ gatewayConfig:
         - name: l
           listenerProtocol: HTTPS
           tls: { mode: Terminate, certificates: [{ name: s, kind: Secret }] }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(errs.iter().any(|r| matches!(
+            r.reason,
+            RejectionReason::BindListenerProtocolMismatch { .. }
+        )));
+    }
+
+    #[test]
+    fn tcp_bind_with_http_listener_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
 ",
         );
         let errs = validate(&cfg).unwrap_err();
