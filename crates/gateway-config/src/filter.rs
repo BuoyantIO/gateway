@@ -16,6 +16,12 @@ pub enum TlsFilter {
     TlsClientHelloLog { name: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TcpFilter {
+    TcpConnectionLog { name: String },
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestHeaderOps {
     #[serde(default)]
@@ -46,6 +52,15 @@ impl TlsFilter {
     pub fn name(&self) -> &str {
         match self {
             Self::TlsClientHelloLog { name } => name,
+        }
+    }
+}
+
+impl TcpFilter {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::TcpConnectionLog { name } => name,
         }
     }
 }

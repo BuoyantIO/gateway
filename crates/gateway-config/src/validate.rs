@@ -8,7 +8,7 @@ use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::filter::{HttpFilter, RequestHeaderOps};
 use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
-use crate::route::{HttpRoute, PathMatchKind, TlsRoute};
+use crate::route::{HttpRoute, PathMatchKind, TcpRoute, TlsRoute};
 
 #[derive(Debug, Error)]
 #[error("{key}: {reason}")]
@@ -205,6 +205,17 @@ fn validate_tcp_listener(key: &str, l: &TcpListener, out: &mut Vec<Rejection>) {
         l.routes.iter().map(|r| r.name.as_str()),
         out,
     );
+    for (i, route) in l.routes.iter().enumerate() {
+        validate_tcp_route(&format!("{key}/routes[{i}]"), route, out);
+    }
+}
+
+fn validate_tcp_route(key: &str, route: &TcpRoute, out: &mut Vec<Rejection>) {
+    check_unique(
+        &format!("{key}/filters"),
+        route.filters.iter().map(crate::filter::TcpFilter::name),
+        out,
+    );
 }
 
 fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
@@ -351,6 +362,34 @@ gatewayConfig:
         assert!(
             errs.iter()
                 .any(|r| matches!(r.reason, RejectionReason::TcpListenerRouteCount(2)))
+        );
+    }
+
+    #[test]
+    fn duplicate_tcp_filter_name_within_route_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - name: l
+          listenerProtocol: TCP
+          routes:
+            - name: r
+              backendRefs: [{ name: be }]
+              filters:
+                - { name: same, type: TcpConnectionLog }
+                - { name: same, type: TcpConnectionLog }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(&r.reason, RejectionReason::DuplicateName(n) if n == "same"))
         );
     }
 

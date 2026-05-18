@@ -28,7 +28,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::bind::BindProtocol;
-    use crate::filter::{HttpFilter, TlsFilter};
+    use crate::filter::{HttpFilter, TcpFilter, TlsFilter};
     use crate::listener::{Listener, TlsMode};
     use crate::route::PathMatchKind;
 
@@ -412,6 +412,64 @@ gatewayConfig:
         assert_eq!(l.routes.len(), 1);
         assert_eq!(l.routes[0].name, "r");
         assert_eq!(l.routes[0].backend_refs[0].name, "be");
+    }
+
+    #[test]
+    fn tcp_connection_log_filter() {
+        let cfg = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - name: l
+          listenerProtocol: TCP
+          routes:
+            - name: r
+              backendRefs: [{ name: be }]
+              filters:
+                - { name: log, type: TcpConnectionLog }
+",
+        )
+        .unwrap();
+        let Listener::Tcp(l) = &cfg.binds[0].listeners[0] else {
+            panic!()
+        };
+        assert!(matches!(
+            l.routes[0].filters[0],
+            TcpFilter::TcpConnectionLog { .. }
+        ));
+    }
+
+    #[test]
+    fn http_filter_under_tcp_listener_fails() {
+        let err = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 5432
+      bindProtocol: TCP
+      listeners:
+        - name: l
+          listenerProtocol: TCP
+          routes:
+            - name: r
+              backendRefs: [{ name: be }]
+              filters:
+                - name: hdr
+                  type: RequestHeaderModifier
+                  requestHeaders: { add: [{ name: x, value: y }] }
+",
+        );
+        assert!(
+            err.is_err(),
+            "RequestHeaderModifier under TCP listener should fail to parse"
+        );
     }
 
     #[test]

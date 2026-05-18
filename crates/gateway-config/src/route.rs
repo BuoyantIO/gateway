@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::backend::BackendRef;
-use crate::filter::{HttpFilter, TlsFilter};
+use crate::filter::{HttpFilter, TcpFilter, TlsFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,6 +28,8 @@ pub struct HttpRoute {
 pub struct TcpRoute {
     pub name: String,
     pub backend_refs: Vec<BackendRef>,
+    #[serde(default)]
+    pub filters: Vec<TcpFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
