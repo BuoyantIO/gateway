@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gateway-config"]
+members = ["crates/gateway-config", "crates/gateway-state"]
 
 [workspace.package]
 edition = "2024"
