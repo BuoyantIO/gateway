@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::Arc;
 
 use gateway_state::{BindEvent, BindKey, Store};
 use tokio::sync::broadcast::error::RecvError;
@@ -8,17 +9,34 @@ use tokio::task::JoinHandle;
 
 use crate::accept;
 use crate::error::RuntimeError;
+use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
 
 /// The gateway data-plane runtime. Subscribes to `BindEvent`s from a
 /// `Store` and manages one accept task per active bind.
 pub struct Gateway {
-    store: Store,
+    /// Configuration store. Source of truth for binds, listeners,
+    /// routes, and backends. Read briefly per dispatch via a `parking_lot`
+    /// read lock; never held across awaits.
+    pub(crate) store: Store,
+    /// Load-balancer envelope: the picker plus its per-endpoint state.
+    /// `Arc`-cloned into every per-connection task.
+    pub(crate) lb: Arc<LoadBalancer>,
 }
 
 impl Gateway {
-    #[must_use]
+    /// Default gateway: P2C-EWMA picker with default scoring + state policy.
     pub fn new(store: Store) -> Self {
-        Self { store }
+        let lb =
+            LoadBalancer::with_picker(Arc::new(P2cEwma::default()), EndpointStateConfig::default());
+        Self::with_lb(store, lb)
+    }
+
+    /// Custom load balancer (caller-constructed picker + state policy).
+    pub fn with_lb(store: Store, lb: LoadBalancer) -> Self {
+        Self {
+            store,
+            lb: Arc::new(lb),
+        }
     }
 
     /// Run until `shutdown` resolves. Spawns accept tasks for every bind
@@ -31,13 +49,18 @@ impl Gateway {
     /// Returns `RuntimeError` if the event channel closes unexpectedly.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RuntimeError> {
         let mut rx = self.store.subscribe();
-        let mut tasks: HashMap<BindKey, JoinHandle<()>> = HashMap::new();
-        let mut addr_for: HashMap<BindKey, SocketAddr> = HashMap::new();
+        // One BindSession per active bind: the spawned accept task plus
+        // the address it's listening on. Dropping a session aborts its
+        // task; replacing the entry with `insert(...)` swaps in a new
+        // session and drops the old one (aborting the old task).
+        let mut sessions: HashMap<BindKey, BindSession> = HashMap::new();
 
         // Seed: spawn an accept task for every currently-active bind.
         let initial: Vec<_> = self.store.read().binds().collect();
         for bind in initial {
-            spawn_for_bind(&self.store, &bind.key, &mut tasks, &mut addr_for);
+            if let Some(s) = self.spawn_session(&bind.key) {
+                sessions.insert(bind.key.clone(), s);
+            }
         }
 
         let mut shutdown = pin!(shutdown);
@@ -47,41 +70,40 @@ impl Gateway {
                 () = &mut shutdown => break,
                 evt = rx.recv() => match evt {
                     Ok(BindEvent::Added(k) | BindEvent::Updated(k)) => {
-                        // Look up the current state of this bind.
                         let new_addr = self.store.read().bind(&k)
                             .map(|b| SocketAddr::new(b.address, b.port));
-                        if let Some(new) = new_addr {
-                            let respawn = addr_for.get(&k) != Some(&new);
-                            if respawn {
-                                if let Some(h) = tasks.remove(&k) {
-                                    h.abort();
+                        match new_addr {
+                            Some(new) => {
+                                // Respawn only when the listening address actually
+                                // changed; if only route/backend state under the
+                                // bind changed, the running task re-reads the store
+                                // on its next accept.
+                                let unchanged = sessions.get(&k)
+                                    .is_some_and(|s| s.listening_addr == new);
+                                if !unchanged {
+                                    if let Some(s) = self.spawn_session(&k) {
+                                        sessions.insert(k, s); // drops & aborts the old one if any
+                                    } else {
+                                        sessions.remove(&k);
+                                    }
                                 }
-                                spawn_for_bind(&self.store, &k, &mut tasks, &mut addr_for);
                             }
-                            // If address unchanged, the running accept loop will
-                            // see fresh route/backend state on its next accept.
-                        } else {
-                            if let Some(h) = tasks.remove(&k) {
-                                h.abort();
+                            None => {
+                                sessions.remove(&k);
                             }
-                            addr_for.remove(&k);
                         }
                     }
                     Ok(BindEvent::Removed(k)) => {
-                        if let Some(h) = tasks.remove(&k) {
-                            h.abort();
-                        }
-                        addr_for.remove(&k);
+                        sessions.remove(&k);
                     }
                     Err(RecvError::Lagged(missed)) => {
                         tracing::warn!(missed, "bind event channel lagged; resyncing");
-                        for (_, h) in tasks.drain() {
-                            h.abort();
-                        }
-                        addr_for.clear();
+                        sessions.clear();
                         let snapshot: Vec<_> = self.store.read().binds().collect();
                         for bind in snapshot {
-                            spawn_for_bind(&self.store, &bind.key, &mut tasks, &mut addr_for);
+                            if let Some(s) = self.spawn_session(&bind.key) {
+                                sessions.insert(bind.key.clone(), s);
+                            }
                         }
                     }
                     Err(RecvError::Closed) => break,
@@ -89,28 +111,37 @@ impl Gateway {
             }
         }
 
-        for (_, h) in tasks {
-            h.abort();
-        }
+        // Drop all remaining sessions → all accept tasks aborted.
+        drop(sessions);
         Ok(())
+    }
+
+    fn spawn_session(&self, key: &BindKey) -> Option<BindSession> {
+        let bind = self.store.read().bind(key)?;
+        let addr = SocketAddr::new(bind.address, bind.port);
+        let store = self.store.clone();
+        let lb = Arc::clone(&self.lb);
+        let bind_key = key.clone();
+        let task = tokio::spawn(async move {
+            accept::run_bind(store, bind_key, addr, lb).await;
+        });
+        Some(BindSession {
+            task,
+            listening_addr: addr,
+        })
     }
 }
 
-fn spawn_for_bind(
-    store: &Store,
-    key: &BindKey,
-    tasks: &mut HashMap<BindKey, JoinHandle<()>>,
-    addr_for: &mut HashMap<BindKey, SocketAddr>,
-) {
-    let Some(bind) = store.read().bind(key) else {
-        return;
-    };
-    let addr = SocketAddr::new(bind.address, bind.port);
-    let store = store.clone();
-    let bind_key = key.clone();
-    let handle = tokio::spawn(async move {
-        accept::run_bind(store, bind_key, addr).await;
-    });
-    tasks.insert(key.clone(), handle);
-    addr_for.insert(key.clone(), addr);
+/// A running per-bind accept task, paired with the socket address it's
+/// listening on. Dropping the session aborts the task.
+/// TODO: Handle proper daring of in-flight connections.
+struct BindSession {
+    task: JoinHandle<()>,
+    listening_addr: SocketAddr,
+}
+
+impl Drop for BindSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }

@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Instant;
 
 use gateway_config::backend::Endpoint;
 use gateway_config::filter::TcpFilter;
@@ -6,30 +8,77 @@ use gateway_state::{ActiveListenerKind, BindKey, Store};
 use tokio::net::TcpStream;
 
 use crate::error::ProxyError;
+use crate::lb::{Candidate, EndpointInfo, EndpointKey, LoadBalancer};
 
-/// Resolve the destination endpoint for a connection arriving on `bind_key`.
-///
-/// Walks `bind → listener → route → backend → endpoint` with the read lock
-/// held briefly, clones what's needed, and drops the lock.
+#[derive(Debug)]
+pub(crate) struct Resolved {
+    pub endpoint: Endpoint,
+    pub info: Arc<EndpointInfo>,
+    pub filters: Vec<TcpFilter>,
+    pub route_name: String,
+}
+
+/// Walk `bind → listener → route → backend`, build candidates (filtering
+/// evicted endpoints), and ask the picker. The read lock is released
+/// before the picker runs.
 pub(crate) fn resolve_endpoint(
     store: &Store,
     bind_key: &BindKey,
-) -> Result<(Endpoint, Vec<TcpFilter>, String), ProxyError> {
-    let read = store.read();
-    let bind = read.bind(bind_key).ok_or(ProxyError::BindGone)?;
-    let listener = bind.listeners.first().ok_or(ProxyError::NoListener)?;
-    let ActiveListenerKind::Tcp(tcp) = &listener.kind;
-    let route = &tcp.route;
-    let backend_ref = route.backends.first().ok_or(ProxyError::NoBackend)?;
-    let endpoint = backend_ref
-        .backend
+    lb: &LoadBalancer,
+) -> Result<Resolved, ProxyError> {
+    // Hold the read lock just long enough to clone the backend Arc + route data.
+    let (backend, filters, route_name) = {
+        let read = store.read();
+        let bind = read.bind(bind_key).ok_or(ProxyError::BindGone)?;
+        let listener = bind.listeners.first().ok_or(ProxyError::NoListener)?;
+        let ActiveListenerKind::Tcp(tcp) = &listener.kind;
+        let route = &tcp.route;
+        let backend_ref = route.backends.first().ok_or(ProxyError::NoBackend)?;
+        (
+            Arc::clone(&backend_ref.backend),
+            route.filters.clone(),
+            route.key.name.clone(),
+        )
+    };
+
+    if backend.endpoints.is_empty() {
+        return Err(ProxyError::NoEndpoint);
+    }
+
+    let now = Instant::now();
+    let candidates: Vec<Candidate> = backend
         .endpoints
-        .first()
-        .ok_or(ProxyError::NoEndpoint)?
-        .clone();
-    let filters = route.filters.clone();
-    let route_name = route.key.name.clone();
-    Ok((endpoint, filters, route_name))
+        .iter()
+        .filter_map(|ep| {
+            let key = EndpointKey {
+                backend: backend.key.clone(),
+                endpoint: ep.name.clone(),
+            };
+            let info = lb.endpoint_state.get_or_create(key);
+            if info.is_evicted(now) {
+                tracing::debug!(
+                    endpoint = %ep.name,
+                    backend = %backend.key,
+                    "endpoint is evicted; skipping"
+                );
+                None
+            } else {
+                Some(Candidate { endpoint: ep, info })
+            }
+        })
+        .collect();
+
+    let chosen = lb
+        .picker
+        .pick(&candidates)
+        .ok_or(ProxyError::NoViableEndpoint)?;
+
+    Ok(Resolved {
+        endpoint: chosen.endpoint.clone(),
+        info: Arc::clone(&chosen.info),
+        filters,
+        route_name,
+    })
 }
 
 pub(crate) fn apply_filters(filters: &[TcpFilter], route_name: &str, peer: SocketAddr) {
@@ -47,8 +96,9 @@ pub(crate) async fn handle_tcp_connection(
     bind_key: BindKey,
     mut downstream: TcpStream,
     peer: SocketAddr,
+    lb: Arc<LoadBalancer>,
 ) {
-    let (endpoint, filters, route_name) = match resolve_endpoint(&store, &bind_key) {
+    let resolved = match resolve_endpoint(&store, &bind_key, lb.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(bind = %bind_key, ?e, "no destination; dropping connection");
@@ -56,23 +106,31 @@ pub(crate) async fn handle_tcp_connection(
         }
     };
 
-    apply_filters(&filters, &route_name, peer);
+    apply_filters(&resolved.filters, &resolved.route_name, peer);
 
     tracing::info!(
         bind = %bind_key,
         %peer,
-        endpoint = %endpoint.name,
-        upstream = %format!("{}:{}", endpoint.address, endpoint.port),
+        endpoint = %resolved.endpoint.name,
+        upstream = %format!("{}:{}", resolved.endpoint.address, resolved.endpoint.port),
         "tcp connection accepted"
     );
 
-    let mut upstream = match TcpStream::connect((endpoint.address, endpoint.port)).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "upstream dial failed");
-            return;
-        }
-    };
+    let _active = resolved.info.acquire();
+    let dial_start = Instant::now();
+    let mut upstream =
+        match TcpStream::connect((resolved.endpoint.address, resolved.endpoint.port)).await {
+            Ok(s) => {
+                let dial_ms = dial_start.elapsed().as_secs_f64() * 1000.0;
+                resolved.info.record_success(dial_ms);
+                s
+            }
+            Err(e) => {
+                resolved.info.record_failure();
+                tracing::warn!(error = %e, "upstream dial failed");
+                return;
+            }
+        };
 
     match tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
         Ok((from_client, from_upstream)) => {
@@ -88,6 +146,7 @@ pub(crate) async fn handle_tcp_connection(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
 
     use gateway_config::backend::{Backend, BackendRef, StaticBackend};
     use gateway_config::bind::{Bind, BindProtocol};
@@ -95,11 +154,21 @@ mod tests {
     use gateway_config::route::TcpRoute;
     use gateway_state::{BindKey, Store};
 
+    use crate::lb::{EndpointStateConfig, FirstCandidate, LoadBalancer};
+
+    fn lb() -> LoadBalancer {
+        LoadBalancer::with_picker(Arc::new(FirstCandidate), EndpointStateConfig::default())
+    }
+
+    fn lb_with_state(cfg: EndpointStateConfig) -> LoadBalancer {
+        LoadBalancer::with_picker(Arc::new(FirstCandidate), cfg)
+    }
+
     fn store_with_full_graph() -> Store {
         let store = Store::new();
         store.upsert_backend(Backend::Static(StaticBackend {
             name: "be".into(),
-            endpoints: vec![gateway_config::backend::Endpoint {
+            endpoints: vec![Endpoint {
                 name: "e0".into(),
                 address: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port: 9999,
@@ -130,22 +199,21 @@ mod tests {
     #[test]
     fn resolve_endpoint_happy_path() {
         let store = store_with_full_graph();
-        let (ep, _, route) = resolve_endpoint(&store, &BindKey::new("b")).unwrap();
-        assert_eq!(ep.name, "e0");
-        assert_eq!(ep.port, 9999);
-        assert_eq!(route, "r");
+        let r = resolve_endpoint(&store, &BindKey::new("b"), &lb()).unwrap();
+        assert_eq!(r.endpoint.name, "e0");
+        assert_eq!(r.endpoint.port, 9999);
+        assert_eq!(r.route_name, "r");
     }
 
     #[test]
     fn resolve_endpoint_bind_gone() {
         let store = Store::new();
-        let err = resolve_endpoint(&store, &BindKey::new("nope")).unwrap_err();
+        let err = resolve_endpoint(&store, &BindKey::new("nope"), &lb()).unwrap_err();
         assert!(matches!(err, ProxyError::BindGone));
     }
 
     #[test]
     fn resolve_endpoint_no_listener() {
-        // Bind exists but has no active listener (no route under it).
         let store = Store::new();
         store
             .upsert_bind(Bind {
@@ -156,16 +224,13 @@ mod tests {
                 listeners: vec![],
             })
             .unwrap();
-        let err = resolve_endpoint(&store, &BindKey::new("b")).unwrap_err();
+        let err = resolve_endpoint(&store, &BindKey::new("b"), &lb()).unwrap_err();
         assert!(matches!(err, ProxyError::NoListener));
     }
 
     #[test]
     fn resolve_endpoint_no_endpoint() {
         let store = Store::new();
-        // Backend present but with no endpoints. The schema validate
-        // layer would reject this, but the state crate doesn't, so
-        // we exercise the runtime's defense.
         store.upsert_backend(Backend::Static(StaticBackend {
             name: "be".into(),
             endpoints: vec![],
@@ -189,7 +254,24 @@ mod tests {
                 })],
             })
             .unwrap();
-        let err = resolve_endpoint(&store, &BindKey::new("b")).unwrap_err();
+        let err = resolve_endpoint(&store, &BindKey::new("b"), &lb()).unwrap_err();
         assert!(matches!(err, ProxyError::NoEndpoint));
+    }
+
+    #[test]
+    fn returns_no_viable_when_all_evicted() {
+        let store = store_with_full_graph();
+        let lb = lb_with_state(EndpointStateConfig {
+            ewma_alpha: 1.0,
+            failure_threshold: 1,
+            eviction_duration: Duration::from_mins(1),
+        });
+        let info = lb.endpoint_state.get_or_create(EndpointKey {
+            backend: gateway_state::BackendKey::new("be"),
+            endpoint: "e0".into(),
+        });
+        info.record_failure(); // threshold=1, so this evicts.
+        let err = resolve_endpoint(&store, &BindKey::new("b"), &lb).unwrap_err();
+        assert!(matches!(err, ProxyError::NoViableEndpoint));
     }
 }

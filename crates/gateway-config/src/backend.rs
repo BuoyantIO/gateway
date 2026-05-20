@@ -24,7 +24,6 @@ pub struct Endpoint {
 }
 
 impl Backend {
-    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::Static(b) => &b.name,

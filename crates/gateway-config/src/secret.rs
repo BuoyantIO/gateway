@@ -16,7 +16,6 @@ pub struct TlsSecret {
 }
 
 impl Secret {
-    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::Tls(s) => &s.name,

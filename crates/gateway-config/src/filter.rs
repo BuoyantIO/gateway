@@ -39,7 +39,6 @@ pub struct HeaderPair {
 }
 
 impl HttpFilter {
-    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::RequestHeaderModifier { name, .. } => name,
@@ -48,7 +47,6 @@ impl HttpFilter {
 }
 
 impl TlsFilter {
-    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::TlsClientHelloLog { name } => name,
@@ -57,7 +55,6 @@ impl TlsFilter {
 }
 
 impl TcpFilter {
-    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::TcpConnectionLog { name } => name,

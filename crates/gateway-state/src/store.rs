@@ -113,7 +113,6 @@ struct BindMeta {
 }
 
 impl Store {
-    #[must_use]
     pub fn new() -> Self {
         let (events, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
@@ -122,12 +121,10 @@ impl Store {
         }
     }
 
-    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<BindEvent> {
         self.events.subscribe()
     }
 
-    #[must_use]
     pub fn read(&self) -> StoreRead<'_> {
         StoreRead {
             guard: self.inner.read(),
@@ -181,7 +178,6 @@ impl Store {
         self.dispatch(events);
     }
 
-    #[must_use]
     pub fn apply(&self, cfg: &GatewayConfig) -> ApplyReport {
         let (report, events) = self.inner.write().apply(cfg);
         self.dispatch(events);
@@ -200,7 +196,6 @@ pub struct StoreRead<'a> {
 }
 
 impl StoreRead<'_> {
-    #[must_use]
     pub fn bind(&self, key: &BindKey) -> Option<Arc<ActiveBind>> {
         self.guard.binds.get(key).cloned()
     }
@@ -209,17 +204,14 @@ impl StoreRead<'_> {
         self.guard.binds.values().cloned()
     }
 
-    #[must_use]
     pub fn backend(&self, key: &BackendKey) -> Option<Arc<ActiveBackend>> {
         self.guard.backends.get(key).cloned()
     }
 
-    #[must_use]
     pub fn is_listener_active(&self, key: &ListenerKey) -> bool {
         self.guard.active_listeners.contains_key(key)
     }
 
-    #[must_use]
     pub fn is_route_active(&self, key: &RouteKey) -> bool {
         self.guard.active_routes.contains_key(key)
     }

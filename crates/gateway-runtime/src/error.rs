@@ -16,4 +16,6 @@ pub(crate) enum ProxyError {
     NoBackend,
     #[error("backend has no endpoints")]
     NoEndpoint,
+    #[error("no viable endpoint (all evicted)")]
+    NoViableEndpoint,
 }

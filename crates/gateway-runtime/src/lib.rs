@@ -5,6 +5,7 @@
 mod accept;
 mod error;
 mod gateway;
+pub mod lb;
 mod proxy;
 
 pub use error::RuntimeError;

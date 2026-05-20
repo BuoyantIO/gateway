@@ -71,7 +71,6 @@ pub struct CertRef {
 }
 
 impl Listener {
-    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             Self::Tls(l) => &l.name,
