@@ -1,37 +1,75 @@
+//! P2C-EWMA failover integration test, HTTP edition.
+//!
+//! Spins up two hyper-based counting echo servers, points the gateway
+//! at both via a single HTTP backend with two endpoints, drives traffic
+//! through the gateway, kills one upstream, and asserts traffic shifts
+//! to the survivor after the failure threshold trips eviction. Same
+//! assertion shape as the TCP version that came before; only the
+//! transport changed.
+
+use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
+use gateway_config::GatewayConfig;
 use gateway_config::backend::{Backend, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
-use gateway_config::listener::{Listener, TcpListener as SchemaTcpListener};
-use gateway_config::route::TcpRoute;
+use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
+use gateway_config::route::{HttpMatch, HttpRoute, PathMatch, PathMatchKind};
 use gateway_runtime::Gateway;
 use gateway_runtime::lb::{EndpointStateConfig, LoadBalancer, P2cConfig, P2cEwma};
 use gateway_state::Store;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use http::{Request, StatusCode};
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-/// Echo server that counts received connections. Returns the bound port,
-/// the shared counter, and a handle that can be aborted to "kill" it.
-async fn spawn_counting_echo() -> (u16, Arc<AtomicU64>, JoinHandle<()>) {
+/// HTTP echo server that counts requests it serves. Returns 200 OK
+/// with a tiny body. Aborting the returned `JoinHandle` "kills" the
+/// server — the accept loop exits, the listener is dropped, AND the
+/// currently-being-served connection (if any) is dropped because
+/// `serve_connection` is awaited inline.
+///
+/// Inline-serve serializes accepts (only one connection in flight at
+/// a time). HTTP/1.1 keep-alive means a single client connection can
+/// still pump many requests, which is what the gateway's upstream
+/// pool does. Adequate for this test.
+async fn spawn_counting_http() -> (u16, Arc<AtomicU64>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let counter = Arc::new(AtomicU64::new(0));
     let c = Arc::clone(&counter);
     let h = tokio::spawn(async move {
         loop {
-            let Ok((mut s, _)) = listener.accept().await else {
+            let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            c.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let (mut r, mut w) = s.split();
-                let _ = tokio::io::copy(&mut r, &mut w).await;
+            let c = Arc::clone(&c);
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |_req: Request<Incoming>| {
+                let c = Arc::clone(&c);
+                async move {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Infallible>(
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from_static(b"ok")))
+                            .unwrap(),
+                    )
+                }
             });
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
         }
     });
     (port, counter, h)
@@ -42,19 +80,36 @@ async fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> gateway_config::GatewayConfig {
-    use gateway_config::config::GatewayConfig;
+async fn wait_for_listening(port: u16) {
+    for _ in 0..40 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("gateway did not start listening on port {port}");
+}
+
+fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
     GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
             name: "b".into(),
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: bind_port,
-            bind_protocol: BindProtocol::Tcp,
-            listeners: vec![Listener::Tcp(SchemaTcpListener {
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![Listener::Http(SchemaHttpListener {
                 name: "l".into(),
-                routes: vec![TcpRoute {
+                hostname: None,
+                routes: vec![HttpRoute {
                     name: "r".into(),
+                    matches: vec![HttpMatch {
+                        host: None,
+                        path: PathMatch {
+                            kind: PathMatchKind::PathPrefix,
+                            value: "/".into(),
+                        },
+                    }],
                     backend_refs: vec![BackendRef {
                         name: "be".into(),
                         weight: 1,
@@ -82,34 +137,29 @@ fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> gateway_config::Gatewa
     }
 }
 
-async fn open_connect(bind_port: u16) -> std::io::Result<TcpStream> {
-    let mut retries = 0;
-    loop {
-        match TcpStream::connect(("127.0.0.1", bind_port)).await {
-            Ok(s) => return Ok(s),
-            Err(e) if retries < 20 => {
-                retries += 1;
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                let _ = e;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-async fn round_trip(bind_port: u16) -> std::io::Result<()> {
-    let mut s = open_connect(bind_port).await?;
-    s.write_all(b"hi\n").await?;
-    let mut buf = [0u8; 3];
-    s.read_exact(&mut buf).await?;
-    assert_eq!(&buf, b"hi\n");
-    Ok(())
+/// Drive one GET through the gateway. Returns the response status, or
+/// an error if the *transport* itself failed (which should not happen
+/// — failed upstreams manifest as 502 responses from the gateway,
+/// not as client-side errors).
+async fn round_trip(
+    client: &Client<hyper_util::client::legacy::connect::HttpConnector, Empty<Bytes>>,
+    bind_port: u16,
+) -> StatusCode {
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request to gateway failed");
+    let status = resp.status();
+    // Drain the body so the client connection can be pooled / closed
+    // cleanly rather than left half-read.
+    let _ = resp.into_body().collect().await;
+    status
 }
 
 #[tokio::test]
 async fn p2c_distributes_then_evicts_failing_endpoint() {
-    let (p1, c1, h1) = spawn_counting_echo().await;
-    let (p2, c2, _h2) = spawn_counting_echo().await;
+    let (p1, c1, h1) = spawn_counting_http().await;
+    let (p2, c2, _h2) = spawn_counting_http().await;
     let bind_port = free_port().await;
 
     let cfg = cfg_two_endpoints(bind_port, p1, p2);
@@ -138,10 +188,21 @@ async fn p2c_distributes_then_evicts_failing_endpoint() {
             .unwrap();
     });
 
-    // Phase 1: both endpoints up. Open enough connections that P2C
-    // should sprinkle traffic across both.
+    wait_for_listening(bind_port).await;
+
+    // Build a client that does NOT pool connections to the gateway
+    // — fresh per-request makes each request a fresh picker call
+    // (otherwise hyper might pool the same downstream connection
+    // and serialize requests through the same picked endpoint).
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build_http();
+
+    // Phase 1: both endpoints up. Drive 20 requests; P2C should
+    // sprinkle traffic across both.
     for _ in 0..20 {
-        round_trip(bind_port).await.unwrap();
+        let status = round_trip(&client, bind_port).await;
+        assert_eq!(status, StatusCode::OK, "phase 1 request should succeed");
     }
     let c1_pre = c1.load(Ordering::Relaxed);
     let c2_pre = c2.load(Ordering::Relaxed);
@@ -149,35 +210,36 @@ async fn p2c_distributes_then_evicts_failing_endpoint() {
     assert!(c2_pre > 0, "endpoint 2 saw no traffic in phase 1: {c2_pre}");
     assert_eq!(c1_pre + c2_pre, 20);
 
-    // Phase 2: kill endpoint 1. Open more connections. After
-    // failure_threshold=1, endpoint 1 should be evicted and all
-    // subsequent connections should land on endpoint 2.
+    // Phase 2: kill endpoint 1. After `failure_threshold = 1`,
+    // endpoint 1 should be evicted and subsequent requests should land
+    // on endpoint 2.
     h1.abort();
-
     // Give the abort a moment to actually close the listener.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut failures = 0;
+    let mut bad_gateway = 0;
     for _ in 0..30 {
-        if round_trip(bind_port).await.is_err() {
-            failures += 1;
+        let status = round_trip(&client, bind_port).await;
+        match status {
+            StatusCode::OK => {}
+            StatusCode::BAD_GATEWAY => bad_gateway += 1,
+            other => panic!("unexpected status in phase 2: {other}"),
         }
     }
     let c2_after = c2.load(Ordering::Relaxed) - c2_pre;
     let c1_after = c1.load(Ordering::Relaxed) - c1_pre;
 
-    // Endpoint 1 is dead, so its counter can't increase even if a connection
-    // races onto it (the connection would fail before the echo server's
-    // accept-counter increments). Allow up to a small number of failures
+    // Endpoint 1 is dead, so its counter can't grow. Allow up to a
+    // few 502s while the picker still tries the doomed endpoint
     // before eviction kicks in.
-    assert!(failures <= 3, "too many failed connections: {failures}");
-    assert_eq!(
-        c1_after, 0,
-        "endpoint 1 accepted connections after being killed"
+    assert!(
+        bad_gateway <= 3,
+        "too many 502s before eviction: {bad_gateway}"
     );
+    assert_eq!(c1_after, 0, "endpoint 1 served requests after being killed");
     assert!(
         c2_after >= 25,
-        "endpoint 2 didn't pick up the load: c2_after={c2_after}, failures={failures}"
+        "endpoint 2 didn't pick up the load: c2_after={c2_after}, bad_gateway={bad_gateway}"
     );
 
     let _ = shutdown_tx.send(());

@@ -49,11 +49,7 @@ pub struct Snapshot {
 /// Per-endpoint runtime state — health, latency, load, eviction.
 ///
 /// TODO: optimize the lock granularity. Today everything lives under one
-/// `Mutex<Inner>` for simplicity. The hot path is `acquire`/`Drop` on
-/// every connection plus one `snapshot()` per pick — all per-endpoint
-/// so contention should be low, but if profiling shows hotspots, consider
-/// (a) splitting `in_flight` out to `AtomicU64`, or (b) going fully
-/// lock-free with EWMA stored as `AtomicU64` bits and a CAS update loop.
+/// `Mutex<Inner>` for simplicity.
 #[derive(Debug)]
 pub struct EndpointInfo {
     inner: Mutex<Inner>,

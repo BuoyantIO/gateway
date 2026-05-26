@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
 
-use gateway_config::bind::BindProtocol;
 use gateway_state::{BindEvent, BindKey, Store};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -17,8 +16,7 @@ use crate::proxy::http::HttpClient;
 /// `Store` and manages one accept task per active bind.
 pub struct Gateway {
     /// Configuration store. Source of truth for binds, listeners,
-    /// routes, and backends. Read briefly per dispatch via a `parking_lot`
-    /// read lock; never held across awaits.
+    /// routes, and backends.
     pub(crate) store: Store,
     /// Load-balancer envelope: the picker plus its per-endpoint state.
     /// `Arc`-cloned into every per-connection task.
@@ -80,18 +78,16 @@ impl Gateway {
                 () = &mut shutdown => break,
                 evt = rx.recv() => match evt {
                     Ok(BindEvent::Added(k) | BindEvent::Updated(k)) => {
-                        let snapshot = self.store.read().bind(&k)
-                            .map(|b| (SocketAddr::new(b.address, b.port), b.bind_protocol));
-                        match snapshot {
-                            Some((new_addr, new_proto)) => {
+                        let new_addr = self.store.read().bind(&k)
+                            .map(|b| SocketAddr::new(b.address, b.port));
+                        match new_addr {
+                            Some(new) => {
                                 // Respawn only when the listening
-                                // address OR protocol actually changed;
-                                // if only route/backend state under the
-                                // bind changed, the running task re-reads
-                                // the store on its next accept.
-                                let unchanged = sessions.get(&k).is_some_and(|s| {
-                                    s.listening_addr == new_addr && s.bind_protocol == new_proto
-                                });
+                                // address actually changed; route /
+                                // backend changes are picked up by
+                                // the running task on its next accept.
+                                let unchanged = sessions.get(&k)
+                                    .is_some_and(|s| s.listening_addr == new);
                                 if !unchanged {
                                     if let Some(s) = self.spawn_session(&k) {
                                         sessions.insert(k, s); // drops & aborts the old one if any
@@ -131,30 +127,26 @@ impl Gateway {
     fn spawn_session(&self, key: &BindKey) -> Option<BindSession> {
         let bind = self.store.read().bind(key)?;
         let addr = SocketAddr::new(bind.address, bind.port);
-        let bind_protocol = bind.bind_protocol;
         let store = self.store.clone();
         let lb = Arc::clone(&self.lb);
         let http_client = self.http_client.clone();
         let bind_key = key.clone();
         let task = tokio::spawn(async move {
-            accept::run_bind(store, bind_key, addr, bind_protocol, lb, http_client).await;
+            accept::run_bind(store, bind_key, addr, lb, http_client).await;
         });
         Some(BindSession {
             task,
             listening_addr: addr,
-            bind_protocol,
         })
     }
 }
 
 /// A running per-bind accept task, paired with the socket address it's
-/// listening on and the bind's protocol family. Dropping the session
-/// aborts the task.
-/// TODO: Handle proper draining of in-flight connections.
+/// listening on. Dropping the session aborts the task.
+/// TODO: handle proper draining of in-flight connections.
 struct BindSession {
     task: JoinHandle<()>,
     listening_addr: SocketAddr,
-    bind_protocol: BindProtocol,
 }
 
 impl Drop for BindSession {

@@ -1,0 +1,21 @@
+gatewayConfig:
+  name: example
+  binds:
+    - name: front
+      address: 127.0.0.1
+      port: 7000
+      bindProtocol: HTTP
+      listeners:
+        - name: app
+          listenerProtocol: HTTP
+          hostname: localhost
+          routes:
+            - name: api
+              matches:
+                - path: { type: PathPrefix, value: / }
+              backendRefs: [{ name: upstream }]
+  backends:
+    - name: upstream
+      type: Static
+      endpoints:
+        - { name: e0, address: 127.0.0.1, port: 8080 }

@@ -58,9 +58,7 @@ async fn spawn_http_echo() -> u16 {
                     for (k, v) in echoed {
                         builder = builder.header(k, v);
                     }
-                    let resp = builder
-                        .body(Full::new(Bytes::from(body_text)))
-                        .unwrap();
+                    let resp = builder.body(Full::new(Bytes::from(body_text))).unwrap();
                     Ok::<_, Infallible>(resp)
                 });
                 let _ = auto::Builder::new(TokioExecutor::new())
@@ -189,7 +187,11 @@ async fn http1_round_trip() {
 
     let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let resp = client
-        .get(format!("http://127.0.0.1:{bind_port}/hello").parse().unwrap())
+        .get(
+            format!("http://127.0.0.1:{bind_port}/hello")
+                .parse()
+                .unwrap(),
+        )
         .await
         .expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -351,7 +353,11 @@ async fn path_routing_longest_prefix_wins() {
     assert_eq!(&body[..], b"GET /api/v2/users");
 
     let resp = client
-        .get(format!("http://127.0.0.1:{bind_port}/other").parse().unwrap())
+        .get(
+            format!("http://127.0.0.1:{bind_port}/other")
+                .parse()
+                .unwrap(),
+        )
         .await
         .expect("request failed");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);

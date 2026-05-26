@@ -21,10 +21,7 @@ use bytes::Bytes;
 use gateway_config::backend::Endpoint;
 use gateway_config::filter::{HeaderPair, HttpFilter as HttpFilterConfig, RequestHeaderOps};
 use gateway_config::route::{HttpMatch, PathMatch, PathMatchKind};
-use gateway_state::{
-    ActiveBackend, ActiveHttpListener, ActiveListenerKind, ActiveRoute, ActiveRouteKind, BindKey,
-    Store,
-};
+use gateway_state::{ActiveBackend, ActiveHttpListener, ActiveHttpRoute, BindKey, Store};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
@@ -44,8 +41,7 @@ type ResponseBody = BoxBody<Bytes, BoxError>;
 /// connection pool that is shared across every cloned handle.
 ///
 /// TODO: replace hyper's legacy client pool with our own
-/// destination-keyed pool. Agentgateway's `crates/pool/src/pool.rs`
-/// (sharded mutex keyed by destination) is the obvious reference.
+/// destination-keyed pool.
 /// Hyper's default pool is hostname-keyed, isn't connect-failure-
 /// aware, and gives us no control over idle limits per destination.
 #[derive(Clone)]
@@ -55,9 +51,6 @@ pub struct HttpClient {
 
 impl Default for HttpClient {
     fn default() -> Self {
-        // TODO: replace hyper's legacy client pool with our own
-        // destination-keyed pool. See the doc comment on `HttpClient`
-        // for the full rationale and the agentgateway reference.
         let inner = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
             .build_http::<Incoming>();
         Self { inner }
@@ -75,10 +68,6 @@ impl std::fmt::Debug for HttpClient {
 /// Runtime-side HTTP filter contract. Each
 /// `gateway_config::filter::HttpFilter` variant maps to one impl of
 /// this trait via [`build_http_filter`].
-///
-/// v0 supports only header-phase filters (`apply_request_headers`).
-/// The `HttpFilterDecision` enum is the seam for future short-circuit
-/// behaviour (`Respond(LocalHttpResponse)`).
 pub(crate) trait HttpFilter: Send + Sync {
     fn apply_request_headers(
         &self,
@@ -256,40 +245,34 @@ fn resolve_http_route(
     let chosen =
         pick_http_route(&listener.routes, host_only, path).ok_or(RouteResolveError::NoRoute)?;
 
-    let ActiveRouteKind::Http(hr) = &chosen.kind else {
-        // The store guarantees an `ActiveHttpListener` only carries
-        // HTTP-kind routes; this is a bug-resistant fallback.
-        return Err(RouteResolveError::NoRoute);
-    };
-
-    let backend_ref = hr.backends.first().ok_or(RouteResolveError::NoBackend)?;
+    let backend_ref = chosen
+        .backends
+        .first()
+        .ok_or(RouteResolveError::NoBackend)?;
     if backend_ref.backend.endpoints.is_empty() {
         return Err(RouteResolveError::NoEndpoint);
     }
 
     Ok(ResolvedRoute {
         backend: Arc::clone(&backend_ref.backend),
-        filters: hr.filters.clone(),
+        filters: chosen.filters.clone(),
         route_name: chosen.key.name.clone(),
     })
 }
 
 fn pick_http_listener<'a>(
-    listeners: &'a [Arc<gateway_state::ActiveListener>],
+    listeners: &'a [Arc<ActiveHttpListener>],
     host: Option<&str>,
 ) -> Option<&'a ActiveHttpListener> {
     let mut exact: Option<&ActiveHttpListener> = None;
     let mut catchall: Option<&ActiveHttpListener> = None;
     for l in listeners {
-        let ActiveListenerKind::Http(http) = &l.kind else {
-            continue;
-        };
-        match (&http.hostname, host) {
+        match (&l.hostname, host) {
             (Some(want), Some(got)) if want.eq_ignore_ascii_case(got) && exact.is_none() => {
-                exact = Some(http);
+                exact = Some(l.as_ref());
             }
             (None, _) if catchall.is_none() => {
-                catchall = Some(http);
+                catchall = Some(l.as_ref());
             }
             _ => {}
         }
@@ -298,18 +281,13 @@ fn pick_http_listener<'a>(
 }
 
 fn pick_http_route<'a>(
-    routes: &'a [Arc<ActiveRoute>],
+    routes: &'a [Arc<ActiveHttpRoute>],
     host: Option<&str>,
     path: &str,
-) -> Option<&'a Arc<ActiveRoute>> {
-    let mut best: Option<(usize, &Arc<ActiveRoute>)> = None;
+) -> Option<&'a Arc<ActiveHttpRoute>> {
+    let mut best: Option<(usize, &Arc<ActiveHttpRoute>)> = None;
     for r in routes {
-        let ActiveRouteKind::Http(hr) = &r.kind else {
-            // Skip non-HTTP variants. The store's invariant should
-            // make this branch unreachable in practice.
-            continue;
-        };
-        if let Some(len) = best_match_score(&hr.matches, host, path) {
+        if let Some(len) = best_match_score(&r.matches, host, path) {
             match best {
                 Some((cur, _)) if len <= cur => {}
                 _ => best = Some((len, r)),
