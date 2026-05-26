@@ -10,8 +10,9 @@ pub mod key;
 pub mod store;
 
 pub use active::{
-    ActiveBackend, ActiveBackendRef, ActiveBind, ActiveListener, ActiveListenerKind,
-    ActiveTcpListener, ActiveTcpRoute,
+    ActiveBackend, ActiveBackendRef, ActiveBind, ActiveHttpListener, ActiveHttpRoute,
+    ActiveListener, ActiveListenerKind, ActiveRoute, ActiveRouteKind, ActiveTcpListener,
+    ActiveTcpRoute,
 };
 pub use error::{ApplyReport, StoreError};
 pub use event::BindEvent;

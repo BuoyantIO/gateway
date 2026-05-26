@@ -509,8 +509,7 @@ The core graph is composed of primitives:
   the references that decide where matching traffic should be forwarded.
   Example: a route might carry a host/path match like
   `app.example.com` + `/api`, together with references to one or more
-  backends, inline settings, and an ordered list of filters that execute
-  after the route is selected.
+  backends.
 - `Backend` is the reusable upstream definition. It exists separately so
   routes can refer to named targets instead of embedding destination
   details inline everywhere. Example: a backend might carry a Kubernetes
@@ -548,7 +547,7 @@ and validation path as well as update mechanism.
 | `GatewayConfig` | `name` | `name`, `binds` | Empty global settings use runtime defaults | Owns `Bind`, `Backend`, and `Secret` collections |
 | `Bind` | `name` | `name`, `address`, `port`, `bindProtocol` | `address: 0.0.0.0` if omitted by a higher-level config source | Owns one or more `Listener` objects |
 | `Listener` | `bind.name/listener.name` | `name`, `listenerProtocol`, `hostname`, `tls.mode` for TLS-family listeners | Empty hostname means catch-all listener | Parent `Bind`; may reference `Secret` for TLS termination |
-| `Route` | `listener.key/route.name` | `name`, `matches`, `backendRefs` | Match dimensions are protocol-specific; `filters: []`; empty `settings` | Parent `Listener`; references `Backend` through `BackendRef`; owns inline `Filter` entries and route settings |
+| `Route` | `listener.key/route.name` | `name`, `matches`, `backendRefs` | Match dimensions are protocol-specific; `filters: []` | Parent `Listener`; references `Backend` through `BackendRef`; owns inline `Filter` entries and route settings |
 | `Filter` | Inline within `Route` by `name` | `name`, `type` | No ordering field; list position in `Route.filters[]` is authoritative | Belongs to one `Route` |
 | `BackendRef` | Inline within `Route` by referenced backend name | `name` | `weight: 1` | References one `Backend` |
 | `Backend` | `name` | `name`, `type` | No implicit backend type; empty `settings` | Owns or references concrete `Endpoint` entries and backend settings |
@@ -576,18 +575,32 @@ passthrough, or later protocol handling.
 
 `BindProtocol` is configured once per bind. The model includes:
 
-- `TLS` for connections whose dispatch path reads a TLS ClientHello.
-- `TCP` for opaque TCP connections.
-- `HTTP` for plaintext HTTP connections.
-- `Auto` for a future mixed dispatch mode that sniffs the connection
-  before selecting the HTTP or TLS path.
+- `TLS` for connections whose dispatch path reads a TLS ClientHello. For
+  TLS-terminated listeners (`ListenerProtocol::HTTPS`), the gateway
+  advertises ALPN `["h2", "http/1.1"]` during the handshake. The
+  post-handshake stream is then served by the same HTTP codec selection
+  path used by plaintext `HTTP` listeners.
+- `TCP` for opaque TCP connections. No protocol negotiation.
+- `HTTP` for plaintext HTTP connections. Both HTTP/1.1 and HTTP/2 cleartext
+  are accepted: the HTTP/2 connection preface is detected on the stream
+  and selects the H2 codec; otherwise HTTP/1.1 is used.
 
 `ListenerProtocol` is configured once per listener. The model includes:
 
 - `TLS` for TLS listeners that may terminate TLS or pass it through.
-- `HTTPS` for TLS-terminated HTTP listeners.
+- `HTTPS` for TLS-terminated HTTP listeners. HTTP codec is selected on the
+  post-handshake stream by the same mechanism used for plaintext `HTTP`
+  listeners; the ALPN negotiated during the handshake on the parent bind
+  constrains what the client will transmit to that mechanism.
 - `TCP` for opaque TCP listeners.
-- `HTTP` for plaintext HTTP listeners.
+- `HTTP` for plaintext HTTP listeners. HTTP codec is selected by detecting
+  the HTTP/2 connection preface on the per-connection stream — preface
+  match wires in the H2 codec, otherwise HTTP/1.1.
+
+HTTP version selection on `HTTP` and `HTTPS` listeners is automatic.
+There is no per-listener version knob in v0; the advertised ALPN list and
+any HTTP/2 codec settings are static defaults. See Area 02 for the runtime
+detail.
 
 The dispatch path filters eligible listeners by `ListenerProtocol`. A TLS
 dispatch peeks the ClientHello, extracts SNI, and considers TLS-family
@@ -607,7 +620,6 @@ maps as follows:
 
 | Gateway API `protocol` | `tls.mode` | `BindProtocol` | `ListenerProtocol` |
 | --- | --- | --- | --- |
-| `HTTPS` | `Terminate` | `TLS` | `HTTPS(ServerTLSConfig)` |
 | `TLS` | `Terminate` | `TLS` | `TLS(Some(ServerTLSConfig))` |
 | `TLS` | `Passthrough` | `TLS` | `TLS(None)` |
 
@@ -641,11 +653,6 @@ timeout, or other behavior that is consumed after a route is selected.
 connection pool, backend transport, or backend TLS origination settings.
 `Listener.tls` remains the native place for TLS termination and passthrough
 configuration.
-
-If more than one setting of the same kind can be expressed on the same
-node, that setting type defines the merge or rejection behavior. Source
-adapters may translate external policy models into this shape later, but
-the runtime configuration model receives inline settings.
 
 ##### Example mapping
 
@@ -719,9 +726,8 @@ The independently updated units are:
 - `Backend`
 - `Secret`
 
-Inline `Filter` and `settings` entries are not independently updated
-units. They are validated and activated with their parent `Route` or
-`Backend`.
+Inline `Filter` entries are not independently updated units. They are
+validated and activated with their parent `Route` or `Backend`.
 
 Each object is first validated on its own and then either becomes
 active, is rejected, or is stashed because a required dependency is
@@ -967,32 +973,26 @@ graph even if no endpoints exist of it.
 V0 is the first supported slice of this schema, not the full long-term
 shape. It keeps the current graph model
 `Bind -> Listener -> Route -> BackendRef -> Backend` and focuses on an
-initial TLS/SNI and simple HTTP entrypoint shape.
+initial TLS-oriented entrypoint shape.
 
 V0 should support:
 
 - multiple binds under the same `GatewayConfig`
 - multiple listeners per `Bind`
 - `BindProtocol: TLS` with TLS-family listeners
-- `BindProtocol: HTTP` with HTTP listeners
 - optional `TLS` termination based on listener TLS config
 - route matches on SNI for TLS traffic
-- route matches on host and a simple path prefix for HTTP traffic
 - static backends with multiple endpoints
 - a simple TLS Client Hello log filter in `Route.filters[]`
-- a simple HTTP request-header mutation filter in `Route.filters[]`
 
-In practical terms, this means `Bind` must support `BindProtocol: TLS` and
-`BindProtocol: HTTP`. `Listener` must support TLS-family
-`ListenerProtocol` values, HTTP listeners, and optional termination of the
-TLS session based on listener TLS config. `Route` must support an SNI match
-for TLS traffic, with SNI interpreted from the Client Hello before
-termination, and an HTTP host plus path-prefix match for HTTP traffic.
-`Backend` must support a static form with an explicit list of endpoints.
-`Route.filters[]` must support one initial TLS filter type for Client Hello
-logging and one initial HTTP filter type for request-header mutation.
-Inline settings remain reserved for unordered declarative configuration,
-not filter execution.
+In practical terms, this means `Bind` must support `BindProtocol: TLS`, and
+`Listener` must support TLS-family `ListenerProtocol` values and optional
+termination of the TLS session based on listener TLS config. `Route` must
+support an SNI match for TLS traffic, with SNI interpreted from the Client
+Hello before termination. `Backend` must support a static form with an
+explicit list of endpoints. `Route.filters[]` must support one initial TLS
+filter type for Client Hello logging. Inline settings remain reserved for
+unordered declarative configuration, not filter execution.
 
 V0 does not attempt to cover the full long-term surface. In particular,
 it does not include dynamic endpoint discovery for backends, full
@@ -1384,9 +1384,13 @@ structures: the configuration store and the upstream pool.
    accept task itself does no per-connection work, so a slow handshake or
    upstream dial cannot stall admission on this bind.
 
-3. For an HTTPS bind the per-connection future's first await is the  tls
-   handshake. SNI and ALPN are read off the resulting `ServerConnection`
-   for routing.
+3. For an HTTPS bind the per-connection future's first await is the TLS
+   handshake. The server advertises ALPN `["h2", "http/1.1"]`; the
+   negotiated value (or its absence) constrains what wire protocol the
+   client will transmit next. SNI is read off the resulting
+   `ServerConnection` for listener selection. For an HTTP bind no
+   handshake runs; the per-connection future works with the raw TCP
+   stream.
 
 4. When the future needs route, backend, or TLS-secret state, it reads from
    the shared configuration store. The store. The future holds the lock for
@@ -1474,6 +1478,12 @@ prior art that is relevant.
   add / remove events
 - TLS handshake (terminate) and ClientHello peek (passthrough) run
   on the spawned per-connection future, not the accept task
+- HTTP version selection: hyper's `auto::Builder` performs HTTP/2 preface
+  peek on the per-connection stream regardless of transport, selecting
+  the H1 or H2 codec. On HTTPS the advertised ALPN list `["h2", "http/1.1"]`
+  narrows what the client will transmit to that peek; the codec-selection
+  mechanism itself is identical on `HTTP` and `HTTPS` listeners. Both
+  HTTP/1.1 and HTTP/2 are accepted on both.
 - not so graceful connection draining with a grace period.
 - a single shared upstream connection pool
 
@@ -2127,3 +2137,287 @@ Once a route is selected, the gateway picks one `BackendRef`:
   quickly.
 - Since Bind protocol is not a GatewayAPI concept, it is the control
   plane's job to group listeneres per protocol.
+
+### 05. Endpoint picking and inventory
+
+#### Problem statement
+
+Area 04 stops at "one `BackendRef` is fixed; a `Backend` is resolved." A
+`Backend` is the addressable target - a Kubernetes service, a static
+upstream set, an MCP target, an inference pool. It is not yet one concrete
+IP:port the gateway can dial. This area covers the step that turns a chosen
+`Backend` into one `Endpoint` per request or connection, the inventory the
+endpoints come from, the per-endpoint runtime state the picker scores
+against, the failure model, and the extension seam for protocol- and
+AI-specific picker variants.
+
+#### Goals
+
+- Define the inventory sources the model supports and which one ships in
+  v0.
+- Define one default endpoint picker that covers any multi-endpoint backend
+  regardless of transport.
+- Define per-endpoint runtime state and where it lives relative to the
+  config store.
+- Define the dial-failure model: passive eviction with TTL, no request-time
+  re-pick.
+- Define the extension seam so future picker variants (MCP session
+  affinity, model-aware / inference selection) plug in without changing
+  core types.
+
+#### Non-goals
+
+- Dynamic endpoint discovery. The discovery interface is named in the model
+  but no concrete discoverer ships in v0.
+- The wire protocol by which an external picker talks to the gateway. That
+  belongs to a later inference-extension area.
+- Active health checking. V0 uses passive dial-failure ejection only.
+- Upstream connection pooling, upstream TLS, upstream auth. These live in
+  the backend-origination area, after an endpoint is chosen.
+
+#### Prior Art: Agent Gateway
+
+##### Overview
+
+In Agent Gateway, endpoint picking is the backend's job, not the route's.
+The route picks a backend by weighted random. The backend then carries its
+own endpoint set and its own selection logic. What that logic does depends
+on the backend kind. A Kubernetes service runs P2C over a locality-bucketed
+endpoint set. An opaque target has no pool and gets dialed directly. An MCP
+backend terminates the session at the gateway and binds it to an upstream
+through a session map held by the MCP handler. An inference-pool backend
+calls out to an external endpoint picker before each request.
+
+##### Backend kinds and endpoint inventory
+
+Agent Gateway has several backend kinds. Where the endpoint list comes from
+depends on the kind:
+
+- Services get their endpoints from Kubernetes workload discovery over xDS.
+  The list lives on the service object.
+- Opaque targets carry a single address inline in config. No pool, no
+  refresh.
+- MCP and A2A backends carry a list of MCP targets. Each target resolves to
+  a downstream backend (usually a service).
+- Inference pools are modelled as a synthetic service. Endpoints come from
+  xDS like any other service; what differs is a policy attachment that
+  overrides selection through an external callout.
+
+##### Endpoint storage at runtime
+
+The list of endpoints per service is broken into priority buckets ranked by
+locality. Bucket zero holds the most-local endpoints; bucket one the
+next-most local; and so on. Inside each bucket the endpoints are kept in
+two sets — currently usable and currently rejected — with a sampler
+attached.
+
+##### Per-protocol picker variants
+
+###### HTTP / gRPC service backends — load-balanced picking with locality bucketing
+
+The picker walks the locality ladder, picks the most-local non-empty
+bucket, and runs P2C inside it. Two endpoints are sampled at random,
+scored, and the better one wins. The score is roughly health divided by a
+penalty that combines recent dial latency and outstanding request count. If
+no bucket has a usable endpoint, a deterministic fallback scan visits
+buckets in locality order and returns the best it can find.
+
+###### TCP backends — weighted random at the route layer
+
+A TCP route picks one backend by weighted random. This is selection between
+backends, not between endpoints — the same operation HTTP routes do for
+backend selection. Once the chosen backend is resolved, picking proceeds
+normally: a service backend runs the same locality-bucketed P2C path as
+HTTP; an opaque target gets dialed straight.
+
+###### MCP backends — session-terminating proxy with handler-level stickiness
+
+The gateway terminates the MCP session itself. The client's long-lived
+stream (SSE or streamable HTTP) ends at the gateway, not at an upstream MCP
+server. From the client's view the gateway is the MCP server. The session
+ID the gateway hands back to the client is its own; the upstream's session
+ID is held internally, mapped from the client-facing one.
+
+Two modes:
+
+- **Passthrough** (one MCP target): the session maps 1:1 to that upstream.
+  Every request in the session goes to the same endpoint.
+- **Federation** (multiple MCP targets): one client-facing session composes
+  several per-upstream sub-sessions opened at session creation. The
+  persisted session ID encodes which target hosts each sub-session. Tool
+  calls are routed by name — a `service.tool` prefix splits, and the
+  service component picks the upstream.
+
+In both modes the session-to-upstream binding is sticky. The picker doesn't
+run for in-session requests; the MCP handler holds its own session →
+upstream map and bypasses the picker. The picker only runs at session
+creation, when a new session needs an upstream chosen.
+
+###### InferencePool — external endpoint picker
+
+Inference-pool backends share the regular service endpoint set, but
+selection runs through an external callout. Before each request, an
+inference-routing policy on the backend opens an ext_proc stream to an
+endpoint-picker service and forwards the request. The response
+carries a destination header (`x-gateway-destination-endpoint`) with the
+endpoint's address.
+
+That address gets fed into the regular endpoint-selection path as an
+override. The override skips scoring: the picker scans the endpoint set for
+a matching address and returns it. The scan covers both the usable and
+rejected sets, so an endpoint marked unhealthy by passive dial-failure
+tracking still gets dialed if the external picker returns it. The
+assumption is that the external picker has better information than the
+gateway's connect-failure signals.
+
+###### Decision granularity per protocol
+
+HTTP picks per request. The proxy invokes the picker on every request,
+including each HTTP/2 stream on a single client connection (Hyper hands
+each stream to the request pipeline as its own request). Two requests on
+the same downstream connection can land on different upstream endpoints.
+
+TCP picks once per accepted connection. The picker runs in the accept
+handler and the chosen endpoint serves the connection for its lifetime. If
+the resolved backend is a service, the TCP path runs the same picker as
+HTTP — both go through `build_service_call`. Opaque targets get dialed
+straight.
+
+MCP picks once per session, at session creation. After that the handler
+holds the binding (per-tool for federation) and the picker isn't consulted
+for the session's lifetime.
+
+| Signal | HTTP (per request) | TCP (per connection) |
+| --- | --- | --- |
+| In-flight counter | concurrent requests | concurrent open TCP connections |
+| Latency EWMA | full request roundtrip | forward duration |
+| Health / eviction | request outcomes | connection outcomes |
+
+The in-flight handle lives in the request log and drops when the log drops
+(at response body completion, not at response headers), so it measures
+in-flight work, not in-flight dials. And the latency EWMA is full request
+roundtrip — HTTP upstream connections are pooled per endpoint, and every
+completed request still updates the EWMA. The picker scores service
+latency, not connect latency.
+
+##### Health and eviction
+
+EWMA-smoothed health, EWMA-smoothed latency, and pending counts feed the
+P2C score. Crossing a consecutive-failure threshold moves the endpoint from
+`active` to `rejected`; the eviction worker schedules uneviction after a
+configurable duration and may restore partial health rather than restarting
+from zero.
+
+##### Sources
+
+- [`Backend` enum](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/agent.rs#L1039)
+- [`EndpointGroup<T>`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L100)
+- [`EndpointSet<T>`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L192)
+- [`select_endpoint`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L237)
+- [`select_p2c`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L294)
+- [`LocalityRanker`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L378)
+- [eviction worker](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L499)
+- [`EndpointInfo`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L576)
+- [P2C scoring](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/types/loadbalancer.rs#L610)
+- [`select_tcp_backend`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/proxy/tcpproxy.rs#L411)
+- [MCP `SessionManager`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/mcp/session.rs#L282)
+- [`InferencePoolRouter`](https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/http/ext_proc.rs#L143)
+
+#### Prior Art: linkerd2-proxy
+
+##### Overview
+
+Linkerd doesn't have Agent Gateway's per-backend-kind divergence. Each
+route backend has one of three dispatch variants: balance over an endpoint
+set, forward to a fixed address, or fail. The same three variants apply to
+HTTP, gRPC, and opaque TCP.
+
+##### Inventory: a streaming destination channel
+
+Endpoint inventory comes from the control plane's destination service over
+gRPC. The proxy opens a long-lived stream per destination and the control
+plane keeps it open, pushing updates as endpoints come and go. No polling.
+Updates arrive as one of four event types: add, remove, full reset, or
+"does not exist." Per-endpoint metadata travels with the address: labels,
+weight, optional mTLS identity, a protocol hint, optional authority
+overrides, HTTP/2 parameters, and a zone-locality flag.
+
+##### Endpoint storage: a per-destination service stack
+
+There's no process-wide endpoint registry. Each destination has its own
+service stack — the discovery stream, the balancer it feeds, and the
+per-endpoint services the balancer picks from. A destination-keyed cache
+keeps these stacks alive. As long as traffic keeps coming, the stack stays
+up; when the last consumer drops and the idle timeout elapses the stack
+tears down. Two distinct destinations that resolve to overlapping endpoints
+don't share connections.
+
+##### Picker dispatch: balance, forward, or fail
+
+Each route backend gets one of three dispatch variants. HTTP and opaque TCP
+use the same three:
+
+- **Balance** opens a destination stream and runs the load balancer. The
+  multi-endpoint path.
+- **Forward** dials one fixed address with attached metadata. No balancer.
+- **Fail** returns a service that rejects every request with a configured
+  error - mostly used for policy enforcement.
+
+##### Load metric: peak-EWMA round-trip time (changing)
+
+Today the balancer scores endpoints by recent peak-EWMA RTT. P2C: sample
+two endpoints at random, pick the one with the lower load score. RTT is the
+only signal the picker reads. Pending-request counts are tracked by a
+separate queue layer for back-pressure but don't feed into picking.
+
+This is changing. The current metric has a known limitation: a failing
+endpoint that returns fast errors (HTTP 503s, gRPC UNAVAILABLE) looks fast
+to peak-EWMA, so P2C keeps sending it traffic.
+[linkerd/linkerd2-proxy#4537](https://github.com/linkerd/linkerd2-proxy/pull/4537)
+lands the building blocks for a failure-aware replacement:
+
+- a new `linkerd-ewma` crate with non-mutating time-projected reads that
+  tracks RTT and a penalty dimension
+- a `retry_after` parser for HTTP `Retry-After` (RFC 7231) and gRPC
+  `grpc-retry-pushback-ms` (gRPC A6),
+- a `linkerd-load-biaser` Tower service wrapper that injects a temporary
+  penalty on HTTP 429/503/5xx and gRPC RESOURCE_EXHAUSTED/UNAVAILABLE
+  responses, amplified when a Retry-After hint is present.
+
+The new load metric is `max(rtt * (pending + 1), penalty)`. Pending count
+folds back into the picker's signal, and explicit failure responses become
+first-class quality input. When all endpoints are healthy the metric
+reduces to the same behaviour as PeakEwma.
+
+##### Decision granularity
+
+Each pick is one service call on the balancer. Tower's service model lets
+the surrounding stack decide what one "call" means, so the same balancer
+plugs into different protocol pipelines with different cadences:
+
+- HTTP — per request - Hyper drives one `Service::call` per request on
+  both HTTP/1.1 and HTTP/2.A long-lived downstream H2 connection carrying
+  ten requests across ten streams produces ten balancer picks.
+- Opaque TCP — per accepted connection. The router calls into the inner
+  service once per accepted TCP connection. After the dial, the byte stream
+  is bound to the chosen endpoint for the connection's lifetime.
+
+The per-destination cache keeps the whole stack alive across picks. For
+HTTP that's many request picks against the same destination. For opaque TCP
+that's many connections to the same destination, each producing a fresh
+upstream dial but reusing the cached balancer state. Either way, the picker
+keeps its memory: RTT averages, gate state, failure counts. What changes
+between cadences is just the unit of work each measurement describes.
+
+##### Sources
+
+- [`Resolve<S>`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/proxy/api-resolve/src/resolve.rs#L14)
+- [`Update<T>`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/proxy/core/src/resolve.rs#L30)
+- [`Metadata`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/proxy/api-resolve/src/metadata.rs)
+- [`IdleCache`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/idle-cache/src/lib.rs#L24)
+- [HTTP `Dispatch`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/app/outbound/src/http/concrete.rs#L32)
+- [Opaque `Dispatch`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/app/outbound/src/opaq/concrete.rs#L33)
+- [`P2cPool`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/pool/p2c/src/lib.rs#L28)
+- [`PeakEwma` import](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/proxy/balance/src/lib.rs#L16)
+- [`ConsecutiveFailures`](https://github.com/linkerd/linkerd2-proxy/blob/main/linkerd/app/outbound/src/http/breaker/consecutive_failures.rs#L5)
+- [PR 4537 — failure-aware P2C building blocks](https://github.com/linkerd/linkerd2-proxy/pull/4537)

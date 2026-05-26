@@ -8,8 +8,10 @@ pub mod p2c;
 pub mod state;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use gateway_config::backend::Endpoint;
+use gateway_state::ActiveBackend;
 
 pub use p2c::{P2cConfig, P2cEwma};
 pub use state::{
@@ -54,5 +56,48 @@ impl LoadBalancer {
             picker,
             endpoint_state: EndpointStateMap::new(state_config),
         }
+    }
+
+    /// Build candidates from `backend.endpoints` (looking up
+    /// `EndpointInfo` per endpoint and skipping evicted entries) and
+    /// ask the picker. Returns the chosen endpoint paired with its
+    /// runtime info, or `None` if no viable candidate exists.
+    ///
+    /// The caller decides what to do with `None`:
+    /// - TCP maps it to `ProxyError::NoViableEndpoint`.
+    /// - HTTP synthesizes a `503 Service Unavailable`.
+    ///
+    /// The "backend has zero endpoints" case is the caller's concern
+    /// — TCP differentiates it as `ProxyError::NoEndpoint`; HTTP
+    /// catches it during route resolution. Both paths therefore call
+    /// this only when at least one endpoint exists.
+    pub fn pick_endpoint(
+        &self,
+        backend: &Arc<ActiveBackend>,
+    ) -> Option<(Endpoint, Arc<EndpointInfo>)> {
+        let now = Instant::now();
+        let candidates: Vec<Candidate<'_>> = backend
+            .endpoints
+            .iter()
+            .filter_map(|ep| {
+                let key = EndpointKey {
+                    backend: backend.key.clone(),
+                    endpoint: ep.name.clone(),
+                };
+                let info = self.endpoint_state.get_or_create(key);
+                if info.is_evicted(now) {
+                    tracing::debug!(
+                        endpoint = %ep.name,
+                        backend = %backend.key,
+                        "endpoint is evicted; skipping"
+                    );
+                    None
+                } else {
+                    Some(Candidate { endpoint: ep, info })
+                }
+            })
+            .collect();
+        let chosen = self.picker.pick(&candidates)?;
+        Some((chosen.endpoint.clone(), Arc::clone(&chosen.info)))
     }
 }

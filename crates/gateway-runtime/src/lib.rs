@@ -10,3 +10,4 @@ mod proxy;
 
 pub use error::RuntimeError;
 pub use gateway::Gateway;
+pub use proxy::http::HttpClient;
