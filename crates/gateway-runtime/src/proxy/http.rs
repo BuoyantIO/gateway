@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use gateway_config::backend::Endpoint;
+use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::filter::{HeaderPair, HttpFilter as HttpFilterConfig, RequestHeaderOps};
 use gateway_config::route::{HttpMatch, PathMatch, PathMatchKind};
 use gateway_state::{ActiveBackend, ActiveHttpListener, ActiveHttpRoute, BindKey, Store};
@@ -40,20 +40,47 @@ type ResponseBody = BoxBody<Bytes, BoxError>;
 /// `hyper_util::client::legacy::Client` — internally it owns a
 /// connection pool that is shared across every cloned handle.
 ///
-/// TODO: replace hyper's legacy client pool with our own
-/// destination-keyed pool.
-/// Hyper's default pool is hostname-keyed, isn't connect-failure-
-/// aware, and gives us no control over idle limits per destination.
+/// Process-wide upstream HTTP client. Holds one HTTP/1.1 client and
+/// one HTTP/2-only client; `forward()` selects between them by the
+/// backend's `BackendProtocol`. The H2 client over a plaintext
+/// connector speaks h2c (prior-knowledge) — that's how we reach a
+/// plaintext gRPC backend.
+///
+/// TODO: replace these two hyper legacy clients with one
+/// destination-keyed pool that picks the protocol per connection
+/// (via `hyper::client::conn::{http1,http2}`), removing the
+/// two-pool split. Hyper's default pool is hostname-keyed, isn't
+/// connect-failure-aware, and gives us no per-destination knobs.
 #[derive(Clone)]
 pub struct HttpClient {
-    inner: hyper_util::client::legacy::Client<HttpConnector, Incoming>,
+    h1: hyper_util::client::legacy::Client<HttpConnector, Incoming>,
+    h2: hyper_util::client::legacy::Client<HttpConnector, Incoming>,
+}
+
+impl HttpClient {
+    /// Pick the client + outgoing wire version for a backend protocol.
+    fn select(
+        &self,
+        protocol: BackendProtocol,
+    ) -> (
+        &hyper_util::client::legacy::Client<HttpConnector, Incoming>,
+        http::Version,
+    ) {
+        match protocol {
+            BackendProtocol::Http1 => (&self.h1, http::Version::HTTP_11),
+            BackendProtocol::Http2 => (&self.h2, http::Version::HTTP_2),
+        }
+    }
 }
 
 impl Default for HttpClient {
     fn default() -> Self {
-        let inner = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        let h1 = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
             .build_http::<Incoming>();
-        Self { inner }
+        let h2 = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http::<Incoming>();
+        Self { h1, h2 }
     }
 }
 
@@ -211,7 +238,7 @@ async fn serve_request(
         "http request routed"
     );
 
-    forward(&client, req, &endpoint, &info).await
+    forward(&client, resolved.backend.protocol, req, &endpoint, &info).await
 }
 
 // =================== route resolution ===================
@@ -350,13 +377,57 @@ fn host_from_request<B>(req: &Request<B>) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
+// =================== header hygiene ===================
+
+/// Standard hop-by-hop headers (RFC 7230 §6.1) that an intermediary
+/// must not forward across a proxy hop.
+const HOP_BY_HOP: [&str; 8] = [
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Remove hop-by-hop headers before forwarding across the proxy hop:
+/// the standard set above, every header named in a `Connection`
+/// header value, and `Connection` itself. Applied to both the
+/// upstream request and the downstream response.
+fn strip_hop_by_hop_headers(headers: &mut http::HeaderMap) {
+    // Headers named inside a `Connection` value are also hop-by-hop.
+    let connection_named: Vec<http::HeaderName> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|tok| http::HeaderName::try_from(tok.trim()).ok())
+        .collect();
+
+    headers.remove(http::header::CONNECTION);
+    for name in &HOP_BY_HOP {
+        headers.remove(*name);
+    }
+    for name in connection_named {
+        headers.remove(name);
+    }
+}
+
 // =================== upstream forward ===================
 
-/// Rewrite `req` to target `endpoint` and forward it via the shared
-/// hyper client. On dial failure the endpoint's failure counter is
-/// incremented and a 502 is returned downstream.
+/// Rewrite `req` to target `endpoint`, set the server-side wire
+/// version from the backend's `protocol`, strip hop-by-hop headers,
+/// and forward via the matching client. On dial failure the
+/// endpoint's failure counter is incremented and a 502 is returned.
+///
+/// The server-side protocol is fully independent of the client-side
+/// version the gateway served: an `Http2` backend gets h2c
+/// origination whether the client spoke H1 or H2.
 async fn forward(
     client: &HttpClient,
+    protocol: BackendProtocol,
     mut req: Request<Incoming>,
     endpoint: &Endpoint,
     info: &Arc<EndpointInfo>,
@@ -379,15 +450,21 @@ async fn forward(
         }
     };
     *req.uri_mut() = upstream_uri;
-    // Force the outgoing request to HTTP/1.1: the upstream client is
-    // configured for HTTP/1.1 only in v0. The incoming version (which
-    // may be HTTP/2 when the downstream codec was H2) is independent
-    // of the upstream wire protocol. Per-backend HTTPS / scheme
-    // negotiation is deferred.
-    *req.version_mut() = http::Version::HTTP_11;
+
+    // Pick the client + wire version for this backend's protocol. The
+    // client-side version (which may be H2 when the downstream codec
+    // was H2) does not constrain the server side.
+    let (upstream_client, version) = client.select(protocol);
+    *req.version_mut() = version;
+
+    // Strip hop-by-hop headers before crossing the proxy hop. This is
+    // load-bearing for H2: a stale `Connection` / `Transfer-Encoding`
+    // carried from a downstream H1 request is illegal on an H2
+    // upstream and would be rejected.
+    strip_hop_by_hop_headers(req.headers_mut());
 
     let dial_start = Instant::now();
-    let upstream_resp = match client.inner.request(req).await {
+    let upstream_resp = match upstream_client.request(req).await {
         Ok(r) => {
             let dial_ms = dial_start.elapsed().as_secs_f64() * 1000.0;
             info.record_success(dial_ms);
@@ -400,7 +477,10 @@ async fn forward(
         }
     };
 
-    let (parts, body) = upstream_resp.into_parts();
+    let (mut parts, body) = upstream_resp.into_parts();
+    // Strip hop-by-hop headers from the upstream response too, before
+    // handing it back to the downstream client.
+    strip_hop_by_hop_headers(&mut parts.headers);
     let boxed: ResponseBody = body.map_err(|e| Box::new(e) as BoxError).boxed();
     Response::from_parts(parts, boxed)
 }
@@ -455,6 +535,70 @@ mod tests {
             kind: PathMatchKind::PathPrefix,
             value: v.into(),
         }
+    }
+
+    // --- hop-by-hop header stripping ---
+
+    #[test]
+    fn strip_removes_standard_hop_by_hop() {
+        let mut h = http::HeaderMap::new();
+        h.insert("connection", "keep-alive".parse().unwrap());
+        h.insert("keep-alive", "timeout=5".parse().unwrap());
+        h.insert("proxy-connection", "keep-alive".parse().unwrap());
+        h.insert("proxy-authenticate", "Basic".parse().unwrap());
+        h.insert("proxy-authorization", "Basic xyz".parse().unwrap());
+        h.insert("te", "trailers".parse().unwrap());
+        h.insert("trailer", "x-trace".parse().unwrap());
+        h.insert("transfer-encoding", "chunked".parse().unwrap());
+        h.insert("upgrade", "h2c".parse().unwrap());
+        h.insert("content-type", "text/plain".parse().unwrap());
+
+        strip_hop_by_hop_headers(&mut h);
+
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert!(!h.contains_key(name), "{name} should be stripped");
+        }
+        assert_eq!(h.get("content-type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn strip_removes_connection_named_headers() {
+        let mut h = http::HeaderMap::new();
+        h.insert("connection", "x-foo, x-bar".parse().unwrap());
+        h.insert("x-foo", "1".parse().unwrap());
+        h.insert("x-bar", "2".parse().unwrap());
+        h.insert("x-keep", "3".parse().unwrap());
+
+        strip_hop_by_hop_headers(&mut h);
+
+        assert!(!h.contains_key("connection"));
+        assert!(!h.contains_key("x-foo"));
+        assert!(!h.contains_key("x-bar"));
+        assert_eq!(h.get("x-keep").unwrap(), "3");
+    }
+
+    #[test]
+    fn strip_keeps_end_to_end_headers() {
+        let mut h = http::HeaderMap::new();
+        h.insert("content-type", "application/grpc".parse().unwrap());
+        h.insert("x-custom", "v".parse().unwrap());
+        h.insert("authorization", "Bearer t".parse().unwrap());
+
+        strip_hop_by_hop_headers(&mut h);
+
+        assert_eq!(h.get("content-type").unwrap(), "application/grpc");
+        assert_eq!(h.get("x-custom").unwrap(), "v");
+        assert_eq!(h.get("authorization").unwrap(), "Bearer t");
     }
 
     #[test]

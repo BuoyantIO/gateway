@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gateway_config::GatewayConfig;
-use gateway_config::backend::{Backend, BackendRef, Endpoint, StaticBackend};
+use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch, PathMatchKind};
@@ -132,6 +132,7 @@ fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
                     port: p2,
                 },
             ],
+            protocol: BackendProtocol::Http1,
         })],
         secrets: vec![],
     }

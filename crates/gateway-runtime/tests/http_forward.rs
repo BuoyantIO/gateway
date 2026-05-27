@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use bytes::Bytes;
-use gateway_config::backend::{Backend, BackendRef, Endpoint, StaticBackend};
+use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
 use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
@@ -44,6 +44,9 @@ async fn spawn_http_echo() -> u16 {
                 let svc = service_fn(|req: Request<Incoming>| async move {
                     let method = req.method().to_string();
                     let path = req.uri().path().to_string();
+                    // Reflect the wire version the gateway spoke to us
+                    // (the server side) so tests can assert it.
+                    let server_version = format!("{:?}", req.version());
                     let mut echoed: Vec<(String, String)> = Vec::new();
                     for (k, v) in req.headers() {
                         let name = k.as_str().to_ascii_lowercase();
@@ -54,7 +57,9 @@ async fn spawn_http_echo() -> u16 {
                         }
                     }
                     let body_text = format!("{method} {path}");
-                    let mut builder = http::Response::builder().status(StatusCode::OK);
+                    let mut builder = http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-server-version", server_version);
                     for (k, v) in echoed {
                         builder = builder.header(k, v);
                     }
@@ -116,6 +121,10 @@ fn http_listener(name: &str, hostname: Option<&str>, routes: Vec<HttpRoute>) -> 
 }
 
 fn static_backend(name: &str, port: u16) -> Backend {
+    static_backend_proto(name, port, BackendProtocol::Http1)
+}
+
+fn static_backend_proto(name: &str, port: u16, protocol: BackendProtocol) -> Backend {
     Backend::Static(StaticBackend {
         name: name.into(),
         endpoints: vec![Endpoint {
@@ -123,6 +132,7 @@ fn static_backend(name: &str, port: u16) -> Backend {
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
         }],
+        protocol,
     })
 }
 
@@ -130,6 +140,20 @@ fn http_config_one_listener(
     bind_port: u16,
     upstream_port: u16,
     path_prefix: &str,
+) -> GatewayConfig {
+    http_config_proto(
+        bind_port,
+        upstream_port,
+        path_prefix,
+        BackendProtocol::Http1,
+    )
+}
+
+fn http_config_proto(
+    bind_port: u16,
+    upstream_port: u16,
+    path_prefix: &str,
+    protocol: BackendProtocol,
 ) -> GatewayConfig {
     GatewayConfig {
         name: "test".into(),
@@ -144,7 +168,7 @@ fn http_config_one_listener(
                 vec![http_route("r", path_prefix, "be")],
             )],
         }],
-        backends: vec![static_backend("be", upstream_port)],
+        backends: vec![static_backend_proto("be", upstream_port, protocol)],
         secrets: vec![],
     }
 }
@@ -448,4 +472,156 @@ async fn unreachable_backend_returns_502() {
         .await
         .expect("gateway did not shut down")
         .unwrap();
+}
+
+// =================== version matrix (client side × server side) ===================
+//
+// "client side"  = client ↔ gateway (version the client speaks).
+// "server side"  = gateway ↔ backend (version the gateway originates,
+//                  set by the backend's `protocol`).
+// The echo backend reflects the version it received as `x-server-version`.
+
+/// Spawn an echo backend that returns the request body verbatim and
+/// reflects the received wire version as `x-server-version`. Used for
+/// the gRPC body round-trip.
+async fn spawn_body_echo() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    let server_version = format!("{:?}", req.version());
+                    let body = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(http_body_util::Collected::to_bytes)
+                        .unwrap_or_default();
+                    let resp = http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-server-version", server_version)
+                        .body(Full::new(body))
+                        .unwrap();
+                    Ok::<_, Infallible>(resp)
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+/// Run one matrix cell: server-side protocol = `server_proto`; client
+/// speaks H2 iff `client_h2`. Returns (status, x-server-version).
+async fn run_version_case(server_proto: BackendProtocol, client_h2: bool) -> (StatusCode, String) {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = http_config_proto(bind_port, upstream, "/", server_proto);
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let uri = format!("http://127.0.0.1:{bind_port}/");
+    let resp = if client_h2 {
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http();
+        client
+            .get(uri.parse().unwrap())
+            .await
+            .expect("request failed")
+    } else {
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        client
+            .get(uri.parse().unwrap())
+            .await
+            .expect("request failed")
+    };
+    let status = resp.status();
+    let server_version = resp
+        .headers()
+        .get("x-server-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+    (status, server_version)
+}
+
+#[tokio::test]
+async fn client_h1_server_h1() {
+    let (status, server_version) = run_version_case(BackendProtocol::Http1, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(server_version, "HTTP/1.1");
+}
+
+#[tokio::test]
+async fn client_h2_server_h1() {
+    let (status, server_version) = run_version_case(BackendProtocol::Http1, true).await;
+    assert_eq!(status, StatusCode::OK);
+    // Gateway downgrades H2 (client) → H1 (server).
+    assert_eq!(server_version, "HTTP/1.1");
+}
+
+#[tokio::test]
+async fn client_h1_server_h2() {
+    let (status, server_version) = run_version_case(BackendProtocol::Http2, false).await;
+    assert_eq!(status, StatusCode::OK);
+    // h2c origination: server side is H2 even though the client spoke H1.
+    assert_eq!(server_version, "HTTP/2.0");
+}
+
+#[tokio::test]
+async fn client_h2_server_h2() {
+    let (status, server_version) = run_version_case(BackendProtocol::Http2, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(server_version, "HTTP/2.0");
+}
+
+#[tokio::test]
+async fn grpc_shaped_round_trip() {
+    let upstream = spawn_body_echo().await;
+    let bind_port = free_port().await;
+    let cfg = http_config_proto(bind_port, upstream, "/", BackendProtocol::Http2);
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    // gRPC: H2 client → gateway → h2c to the (Http2) backend. Body is a
+    // length-prefixed gRPC frame; assert it round-trips byte-for-byte.
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build_http();
+    let payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{bind_port}/svc.Service/Method"))
+        .header("content-type", "application/grpc")
+        .body(Full::new(payload.clone()))
+        .unwrap();
+    let resp = client.request(req).await.expect("grpc request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-server-version")
+            .and_then(|v| v.to_str().ok()),
+        Some("HTTP/2.0"),
+        "gateway must speak HTTP/2 to a gRPC (Http2) backend"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, payload);
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
 }

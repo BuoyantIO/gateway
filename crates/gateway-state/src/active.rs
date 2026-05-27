@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use gateway_config::backend::Endpoint;
+use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::bind::BindProtocol;
 use gateway_config::filter::HttpFilter;
 use gateway_config::route::HttpMatch;
@@ -56,4 +56,8 @@ pub struct ActiveBackendRef {
 pub struct ActiveBackend {
     pub key: BackendKey,
     pub endpoints: Vec<Endpoint>,
+    /// Application protocol the gateway speaks to this backend
+    /// (`Http1` default, `Http2` = h2c origination). Independent of
+    /// the client-side protocol served downstream.
+    pub protocol: BackendProtocol,
 }

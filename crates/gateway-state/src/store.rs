@@ -426,6 +426,7 @@ impl Inner {
         let new = Arc::new(ActiveBackend {
             key: key.clone(),
             endpoints: s.endpoints,
+            protocol: s.protocol,
         });
         self.backends.insert(key.clone(), new);
         self.cascade_routes_by_backend(&key)
@@ -701,7 +702,7 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use gateway_config::backend::{Backend, BackendRef, Endpoint, StaticBackend};
+    use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
     use gateway_config::bind::{Bind, BindProtocol};
     use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
     use gateway_config::listener::{
@@ -808,7 +809,14 @@ mod tests {
                     port: *p,
                 })
                 .collect(),
+            protocol: BackendProtocol::default(),
         })
+    }
+
+    fn static_backend_h2(name: &str, endpoints: &[(&str, &str, u16)]) -> Backend {
+        let Backend::Static(mut s) = static_backend(name, endpoints);
+        s.protocol = BackendProtocol::Http2;
+        Backend::Static(s)
     }
 
     fn bkey(s: &str) -> BindKey {
@@ -1097,6 +1105,23 @@ mod tests {
 
         let bind = store.read().bind(&bkey("b")).unwrap();
         assert_eq!(bind.listeners[0].routes[0].backends.len(), 2);
+    }
+
+    #[test]
+    fn backend_protocol_round_trips() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("h1be", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_backend(static_backend_h2("h2be", &[("e0", "10.0.0.2", 8080)]));
+
+        let read = store.read();
+        assert_eq!(
+            read.backend(&backendkey("h1be")).unwrap().protocol,
+            BackendProtocol::Http1
+        );
+        assert_eq!(
+            read.backend(&backendkey("h2be")).unwrap().protocol,
+            BackendProtocol::Http2
+        );
     }
 
     #[test]

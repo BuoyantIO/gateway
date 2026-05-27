@@ -13,6 +13,25 @@ pub enum Backend {
 pub struct StaticBackend {
     pub name: String,
     pub endpoints: Vec<Endpoint>,
+    /// Application protocol the gateway speaks to this backend's
+    /// endpoints. `Http1` (default) forwards over HTTP/1.1; `Http2`
+    /// originates cleartext HTTP/2 (h2c, prior-knowledge) — required
+    /// to reach a gRPC backend. Independent of the client-side
+    /// protocol the gateway served downstream.
+    #[serde(default)]
+    pub protocol: BackendProtocol,
+}
+
+/// Upstream (gateway → backend) application protocol. Explicit and
+/// per-backend, mirroring Envoy's per-cluster `HttpProtocolOptions`
+/// and agent gateway's per-backend version policy. `Http2` over a
+/// plaintext endpoint is h2c prior-knowledge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum BackendProtocol {
+    #[default]
+    Http1,
+    Http2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
