@@ -1,70 +1,103 @@
-//! Apply a `ConfigUpdate` batch to a `gateway_state::Store`. The thin
-//! layer between proto-level deltas and the Store's existing
-//! incremental API — no caching, no diff, no network.
-//!
-//! Upserts that fail conversion or are rejected by the Store return
-//! `Err`; the caller (the stream loop in `client.rs`) decides whether
-//! to log-and-continue or close the stream. Removes that arrive with
-//! a `None` key are silently skipped — proto3 oneof can encode a
-//! "kind: None" Remove and that's not actionable.
+//! Apply a `ConfigUpdate` batch to `gateway_state::Store`. Pure
+//! translation; no caching, no network.
 
 use gateway_cp_proto::v1 as pb;
-use gateway_state::Store;
+use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, Store};
 
 use crate::convert;
 use crate::error::Error;
 
-/// Apply one batched `ConfigUpdate` to the store. Upserts are applied
-/// first, then removes — matches the within-batch ordering convention
-/// the CP emits and keeps the Store's stashing model converging.
-///
-/// # Errors
-/// Returns the first conversion or Store error encountered. Subsequent
-/// items in the batch are not applied. v0 callers log and move on; the
-/// next CP push retries.
-pub fn apply_update(store: &Store, update: pb::ConfigUpdate) -> Result<(), Error> {
-    for upsert in update.upserts {
-        apply_upsert(store, upsert)?;
-    }
-    for remove in update.removes {
-        apply_remove(store, remove);
-    }
-    Ok(())
+/// Keys touched by one [`apply_update`] call. The stream loop uses
+/// it to maintain its known-set without re-walking the proto.
+#[derive(Debug, Default, Clone)]
+pub struct ApplyOutcome {
+    pub upserted: Affected,
+    pub removed: Affected,
 }
 
-fn apply_upsert(store: &Store, upsert: pb::Upsert) -> Result<(), Error> {
+#[derive(Debug, Default, Clone)]
+pub struct Affected {
+    pub binds: Vec<BindKey>,
+    pub listeners: Vec<ListenerKey>,
+    pub routes: Vec<RouteKey>,
+    pub backends: Vec<BackendKey>,
+}
+
+/// Apply one batched `ConfigUpdate`. Upserts first, then removes.
+///
+/// # Errors
+/// First conversion or Store error; remaining items in the batch are
+/// skipped. The outcome reflects only what landed before the error.
+pub fn apply_update(store: &Store, update: pb::ConfigUpdate) -> Result<ApplyOutcome, Error> {
+    let mut outcome = ApplyOutcome::default();
+    for upsert in update.upserts {
+        apply_upsert(store, upsert, &mut outcome.upserted)?;
+    }
+    for remove in update.removes {
+        apply_remove(store, remove, &mut outcome.removed);
+    }
+    Ok(outcome)
+}
+
+fn apply_upsert(store: &Store, upsert: pb::Upsert, out: &mut Affected) -> Result<(), Error> {
     let body = upsert.body.ok_or(Error::MissingField("Upsert.body"))?;
     match body {
         pb::upsert::Body::Bind(b) => {
             let bind = convert::bind(b)?;
+            let key = BindKey::new(bind.name.clone());
             store.upsert_bind(bind)?;
+            out.binds.push(key);
         }
         pb::upsert::Body::Listener(l) => {
             let (parent, listener) = convert::listener(l)?;
+            let key = ListenerKey::new(parent.clone(), listener.name().to_string());
             store.upsert_listener(&parent, listener)?;
+            out.listeners.push(key);
         }
         pb::upsert::Body::HttpRoute(r) => {
             let (parent, route) = convert::http_route(r)?;
+            let key = RouteKey::new(parent.clone(), route.name.clone());
             store.upsert_http_route(&parent, route);
+            out.routes.push(key);
         }
         pb::upsert::Body::Backend(b) => {
             let backend = convert::backend(b)?;
+            let name = match &backend {
+                gateway_config::backend::Backend::Static(s) => s.name.clone(),
+            };
             store.upsert_backend(backend);
+            out.backends.push(BackendKey::new(name));
         }
     }
     Ok(())
 }
 
-fn apply_remove(store: &Store, remove: pb::Remove) {
+fn apply_remove(store: &Store, remove: pb::Remove, out: &mut Affected) {
     let Some(key) = remove.key else {
         tracing::warn!("Remove with no key field; skipping");
         return;
     };
     match key {
-        pb::remove::Key::Bind(k) => store.remove_bind(&convert::bind_key(k)),
-        pb::remove::Key::Listener(k) => store.remove_listener(&convert::listener_key(k)),
-        pb::remove::Key::HttpRoute(k) => store.remove_http_route(&convert::route_key(k)),
-        pb::remove::Key::Backend(k) => store.remove_backend(&convert::backend_key(k)),
+        pb::remove::Key::Bind(k) => {
+            let k = convert::bind_key(k);
+            store.remove_bind(&k);
+            out.binds.push(k);
+        }
+        pb::remove::Key::Listener(k) => {
+            let k = convert::listener_key(k);
+            store.remove_listener(&k);
+            out.listeners.push(k);
+        }
+        pb::remove::Key::HttpRoute(k) => {
+            let k = convert::route_key(k);
+            store.remove_http_route(&k);
+            out.routes.push(k);
+        }
+        pb::remove::Key::Backend(k) => {
+            let k = convert::backend_key(k);
+            store.remove_backend(&k);
+            out.backends.push(k);
+        }
     }
 }
 

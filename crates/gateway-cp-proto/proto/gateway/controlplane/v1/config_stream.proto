@@ -8,7 +8,7 @@ service ConfigStream {
   // One stream per connected data plane. The DP opens the stream and
   // immediately sends Hello; the CP then pushes ConfigUpdate batches
   // until either side closes.
-  rpc Stream(stream ConfigRequest) returns (stream ConfigUpdate);
+  rpc Watch(stream ConfigRequest) returns (stream ConfigUpdate);
 }
 
 // -------- DP -> CP --------

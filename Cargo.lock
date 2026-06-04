@@ -298,7 +298,11 @@ dependencies = [
  "gateway-config",
  "gateway-cp-proto",
  "gateway-state",
+ "rand",
  "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
 ]
 

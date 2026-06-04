@@ -2,12 +2,7 @@
 
 use thiserror::Error;
 
-/// Failure modes for translating a proto `ConfigUpdate` into Store
-/// mutations. Conversion failures (`MissingField`, `InvalidValue`,
-/// `UnsupportedEnum`) surface translator-side bugs — the CP should
-/// never emit a message that the DP can't construct. The `Store`
-/// variant wraps the data-plane-side rejection (only
-/// `UnsupportedProtocol` today).
+/// Conversion / Store / gRPC errors surfaced by this crate.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("missing required field `{0}`")]
@@ -21,4 +16,10 @@ pub enum Error {
 
     #[error(transparent)]
     Store(#[from] gateway_state::StoreError),
+
+    #[error("control-plane transport error: {0}")]
+    Transport(#[from] tonic::transport::Error),
+
+    #[error("control-plane stream error: {0}")]
+    Stream(#[from] tonic::Status),
 }

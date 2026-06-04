@@ -12,5 +12,12 @@ workspace = true
 gateway-config = { path = "../gateway-config" }
 gateway-cp-proto = { path = "../gateway-cp-proto" }
 gateway-state = { path = "../gateway-state" }
+rand = "0.9"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.14"
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
