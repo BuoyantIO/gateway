@@ -1,0 +1,164 @@
+// Control-plane <-> data-plane streaming protocol for the gateway.
+
+syntax = "proto3";
+
+package gateway.controlplane.v1;
+
+service ConfigStream {
+  // One stream per connected data plane. The DP opens the stream and
+  // immediately sends Hello; the CP then pushes ConfigUpdate batches
+  // until either side closes.
+  rpc Stream(stream ConfigRequest) returns (stream ConfigUpdate);
+}
+
+// -------- DP -> CP --------
+
+// Wrapped in a oneof so we can add Ack / Subscribe / Unsubscribe etc.
+// later without a proto break. v0 carries only Hello.
+message ConfigRequest {
+  oneof kind {
+    Hello hello = 1;
+    // Reserved: Ack, Subscribe, Unsubscribe.
+  }
+}
+
+// Sent once by the DP immediately after opening the stream. The CP uses
+// `client_id` as the routing key to filter ConfigUpdates to resources
+// attached to one specific Gateway.
+message Hello {
+  // K8s reference of the Gateway this DP serves:
+  // "{namespace}/{gateway-name}". If the Gateway doesn't exist yet,
+  // the DP receives an empty initial snapshot (just `sync_complete = true`
+  // with no upserts) and is fed once the Gateway resource is created.
+  string client_id = 1;
+}
+
+// -------- CP -> DP --------
+
+message ConfigUpdate {
+  repeated Upsert upserts = 1;
+  repeated Remove removes = 2;
+
+  // True on the final batch of the initial bootstrap stream. Subsequent
+  // live deltas never set this. Triggers the DP's reconnect-purge diff.
+  bool sync_complete = 3;
+}
+
+message Upsert {
+  oneof body {
+    BindUpsert      bind       = 10;
+    ListenerUpsert  listener   = 11;
+    HttpRouteUpsert http_route = 12;
+    BackendUpsert   backend    = 13;
+  }
+}
+
+message Remove {
+  oneof key {
+    BindKey     bind       = 10;
+    ListenerKey listener   = 11;
+    RouteKey    http_route = 12;
+    BackendKey  backend    = 13;
+  }
+}
+
+// -------- Identity keys --------
+
+message BindKey     { string name = 1; }
+message ListenerKey { string bind = 1; string name = 2; }
+message RouteKey    { string bind = 1; string listener = 2; string name = 3; }
+message BackendKey  { string name = 1; }
+
+// -------- Bind (HTTP only in v0) --------
+
+enum BindProtocol {
+  BIND_PROTOCOL_UNSPECIFIED = 0;
+  BIND_PROTOCOL_HTTP        = 1;
+}
+
+message BindUpsert {
+  string       name          = 1;
+  string       address       = 2;  // textual IP, parsed to IpAddr on the DP
+  uint32       port          = 3;  // u16
+  BindProtocol bind_protocol = 4;
+}
+
+// -------- HTTP Listener --------
+
+message ListenerUpsert {
+  ListenerKey key          = 1;
+  string      hostname     = 2;
+  bool        has_hostname = 3;    // proto3 Option<String> workaround
+}
+
+// -------- HttpRoute --------
+
+message HttpRouteUpsert {
+  RouteKey            key          = 1;
+  repeated HttpMatch  matches      = 2;
+  repeated BackendRef backend_refs = 3;
+  repeated HttpFilter filters      = 4;
+}
+
+message HttpMatch {
+  string    host     = 1;
+  bool      has_host = 2;
+  PathMatch path     = 3;
+}
+
+message PathMatch {
+  PathMatchKind kind  = 1;
+  string        value = 2;
+}
+
+enum PathMatchKind {
+  PATH_MATCH_KIND_UNSPECIFIED = 0;
+  PATH_MATCH_KIND_PATH_PREFIX = 1;
+}
+
+message BackendRef {
+  string name   = 1;
+  uint32 weight = 2;
+}
+
+message HttpFilter {
+  oneof kind {
+    RequestHeaderModifier request_header_modifier = 1;
+  }
+}
+
+message RequestHeaderModifier {
+  string           name            = 1;
+  RequestHeaderOps request_headers = 2;
+}
+
+message RequestHeaderOps {
+  repeated HeaderPair add    = 1;
+  repeated HeaderPair set    = 2;
+  repeated string     remove = 3;
+}
+
+message HeaderPair {
+  string name  = 1;
+  string value = 2;
+}
+
+// -------- Backend --------
+
+enum BackendProtocol {
+  BACKEND_PROTOCOL_UNSPECIFIED = 0;
+  BACKEND_PROTOCOL_HTTP1       = 1;
+  BACKEND_PROTOCOL_HTTP2       = 2;
+}
+
+message BackendUpsert {
+  string            name      = 1;
+  repeated Endpoint endpoints = 2;
+  BackendProtocol   protocol  = 3;
+}
+
+message Endpoint {
+  string name    = 1;
+  string address = 2;  // textual IP
+  uint32 port    = 3;
+}

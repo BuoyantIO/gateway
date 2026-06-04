@@ -5,6 +5,7 @@ members = [
   "crates/gateway-state",
   "crates/gateway-runtime",
   "crates/gatewayd",
+  "crates/gateway-cp-proto",
 ]
 
 [workspace.package]
