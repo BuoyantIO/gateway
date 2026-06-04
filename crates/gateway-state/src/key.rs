@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -70,4 +71,13 @@ impl fmt::Display for BackendKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// Keep-set for [`crate::Store::retain`].
+#[derive(Debug, Default, Clone)]
+pub struct RegisteredKeys {
+    pub binds: HashSet<BindKey>,
+    pub listeners: HashSet<ListenerKey>,
+    pub routes: HashSet<RouteKey>,
+    pub backends: HashSet<BackendKey>,
 }

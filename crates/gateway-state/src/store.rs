@@ -16,7 +16,7 @@ use crate::active::{
 };
 use crate::error::{ApplyReport, StoreError};
 use crate::event::BindEvent;
-use crate::key::{BackendKey, BindKey, ListenerKey, RouteKey};
+use crate::key::{BackendKey, BindKey, ListenerKey, RegisteredKeys, RouteKey};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -163,6 +163,40 @@ impl Store {
         report
     }
 
+    /// Drop every registered key not in `keep`. Leaves-up: routes,
+    /// backends, listeners, binds.
+    pub fn retain(&self, keep: &RegisteredKeys) {
+        let (stale_routes, stale_backends, stale_listeners, stale_binds) = {
+            let read = self.read();
+            (
+                read.registered_route_keys()
+                    .filter(|k| !keep.routes.contains(k))
+                    .collect::<Vec<_>>(),
+                read.registered_backend_keys()
+                    .filter(|k| !keep.backends.contains(k))
+                    .collect::<Vec<_>>(),
+                read.registered_listener_keys()
+                    .filter(|k| !keep.listeners.contains(k))
+                    .collect::<Vec<_>>(),
+                read.registered_bind_keys()
+                    .filter(|k| !keep.binds.contains(k))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for k in &stale_routes {
+            self.remove_http_route(k);
+        }
+        for k in &stale_backends {
+            self.remove_backend(k);
+        }
+        for k in &stale_listeners {
+            self.remove_listener(k);
+        }
+        for k in &stale_binds {
+            self.remove_bind(k);
+        }
+    }
+
     fn dispatch(&self, events: Vec<BindEvent>) {
         for evt in events {
             let _ = self.events.send(evt);
@@ -193,6 +227,39 @@ impl StoreRead<'_> {
 
     pub fn is_route_active(&self, key: &RouteKey) -> bool {
         self.guard.active_routes.contains_key(key)
+    }
+
+    /// Every bind currently upserted into the store. Binds have no
+    /// preconditions, so "registered" and "active" coincide.
+    pub fn registered_bind_keys(&self) -> impl Iterator<Item = BindKey> + '_ {
+        self.guard.bind_meta.keys().cloned()
+    }
+
+    /// Every listener currently upserted, active or pending. Pending
+    /// listeners are stashed when their parent bind is missing or
+    /// they have no active routes; both states are valid Store
+    /// residency and need to appear here so a consumer computing a
+    /// snapshot diff can find them.
+    pub fn registered_listener_keys(&self) -> impl Iterator<Item = ListenerKey> + '_ {
+        self.guard
+            .pending_listeners
+            .keys()
+            .chain(self.guard.active_listeners.keys())
+            .cloned()
+    }
+
+    /// Every route currently upserted, active or pending.
+    pub fn registered_route_keys(&self) -> impl Iterator<Item = RouteKey> + '_ {
+        self.guard
+            .pending_routes
+            .keys()
+            .chain(self.guard.active_routes.keys())
+            .cloned()
+    }
+
+    /// Every backend currently upserted.
+    pub fn registered_backend_keys(&self) -> impl Iterator<Item = BackendKey> + '_ {
+        self.guard.backends.keys().cloned()
     }
 }
 
@@ -1305,5 +1372,189 @@ gatewayConfig:
         let s2 = s1.clone();
         s1.upsert_bind(http_bind("b", 80)).unwrap();
         assert!(s2.read().bind(&bkey("b")).is_some());
+    }
+
+    // --- registered_*_keys ---
+
+    #[test]
+    fn registered_bind_keys_lists_upserted_binds() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("a", 80)).unwrap();
+        store.upsert_bind(http_bind("b", 81)).unwrap();
+        let read = store.read();
+        let keys: HashSet<BindKey> = read.registered_bind_keys().collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&bkey("a")));
+        assert!(keys.contains(&bkey("b")));
+    }
+
+    #[test]
+    fn registered_listener_keys_includes_pending_and_active() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        // Active: parent bind exists, has an active route.
+        store
+            .upsert_listener(&bkey("b"), http_listener("active"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "active"), http_route("r", "/", &["be"]));
+        // Pending: no parent bind.
+        store
+            .upsert_listener(&bkey("no-bind"), http_listener("pending"))
+            .unwrap();
+
+        let read = store.read();
+        let keys: HashSet<ListenerKey> = read.registered_listener_keys().collect();
+        assert!(keys.contains(&lkey("b", "active")));
+        assert!(keys.contains(&lkey("no-bind", "pending")));
+    }
+
+    #[test]
+    fn registered_route_keys_includes_pending_and_active() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("active", "/", &["be"]));
+        // Pending: backend doesn't exist.
+        store.upsert_http_route(
+            &lkey("b", "l"),
+            http_route("pending", "/", &["nonexistent"]),
+        );
+
+        let read = store.read();
+        let keys: HashSet<RouteKey> = read.registered_route_keys().collect();
+        assert!(keys.contains(&rkey("b", "l", "active")));
+        assert!(keys.contains(&rkey("b", "l", "pending")));
+    }
+
+    #[test]
+    fn registered_backend_keys_lists_upserted_backends() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("a", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_backend(static_backend("b", &[("e0", "10.0.0.2", 8080)]));
+        let read = store.read();
+        let keys: HashSet<BackendKey> = read.registered_backend_keys().collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&backendkey("a")));
+        assert!(keys.contains(&backendkey("b")));
+    }
+
+    #[test]
+    fn registered_keys_reflect_removes() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("a", 80)).unwrap();
+        store.upsert_bind(http_bind("b", 81)).unwrap();
+        store.remove_bind(&bkey("a"));
+        let read = store.read();
+        let keys: HashSet<BindKey> = read.registered_bind_keys().collect();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&bkey("b")));
+    }
+
+    // --- retain ---
+
+    #[test]
+    fn retain_empty_keep_drops_everything() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+
+        store.retain(&RegisteredKeys::default());
+
+        let read = store.read();
+        assert_eq!(read.registered_bind_keys().count(), 0);
+        assert_eq!(read.registered_listener_keys().count(), 0);
+        assert_eq!(read.registered_route_keys().count(), 0);
+        assert_eq!(read.registered_backend_keys().count(), 0);
+    }
+
+    #[test]
+    fn retain_keeps_named_entities_drops_others() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("be0", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_backend(static_backend("be1", &[("e0", "10.0.0.2", 8080)]));
+        store.upsert_bind(http_bind("b0", 80)).unwrap();
+        store.upsert_bind(http_bind("b1", 81)).unwrap();
+        store
+            .upsert_listener(&bkey("b0"), http_listener("l0"))
+            .unwrap();
+        store
+            .upsert_listener(&bkey("b1"), http_listener("l1"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b0", "l0"), http_route("r0", "/", &["be0"]));
+        store.upsert_http_route(&lkey("b1", "l1"), http_route("r1", "/", &["be1"]));
+
+        let mut keep = RegisteredKeys::default();
+        keep.binds.insert(bkey("b0"));
+        keep.listeners.insert(lkey("b0", "l0"));
+        keep.routes.insert(rkey("b0", "l0", "r0"));
+        keep.backends.insert(backendkey("be0"));
+
+        store.retain(&keep);
+
+        let read = store.read();
+        let binds: HashSet<BindKey> = read.registered_bind_keys().collect();
+        assert_eq!(binds, [bkey("b0")].into_iter().collect());
+        let listeners: HashSet<ListenerKey> = read.registered_listener_keys().collect();
+        assert_eq!(listeners, [lkey("b0", "l0")].into_iter().collect());
+        let routes: HashSet<RouteKey> = read.registered_route_keys().collect();
+        assert_eq!(routes, [rkey("b0", "l0", "r0")].into_iter().collect());
+        let backends: HashSet<BackendKey> = read.registered_backend_keys().collect();
+        assert_eq!(backends, [backendkey("be0")].into_iter().collect());
+    }
+
+    #[test]
+    fn retain_with_everything_kept_is_noop() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+
+        let keep = RegisteredKeys {
+            binds: [bkey("b")].into_iter().collect(),
+            listeners: [lkey("b", "l")].into_iter().collect(),
+            routes: [rkey("b", "l", "r")].into_iter().collect(),
+            backends: [backendkey("be")].into_iter().collect(),
+        };
+        store.retain(&keep);
+
+        let read = store.read();
+        assert!(read.is_route_active(&rkey("b", "l", "r")));
+        assert!(read.bind(&bkey("b")).is_some());
+        assert!(read.backend(&backendkey("be")).is_some());
+    }
+
+    #[test]
+    fn retain_handles_pending_entities() {
+        // Pending route (backend missing) survives if it's in keep.
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["nobody"]));
+        assert!(!store.read().is_route_active(&rkey("b", "l", "r")));
+
+        let keep = RegisteredKeys {
+            binds: [bkey("b")].into_iter().collect(),
+            listeners: [lkey("b", "l")].into_iter().collect(),
+            routes: [rkey("b", "l", "r")].into_iter().collect(),
+            backends: HashSet::default(),
+        };
+        store.retain(&keep);
+
+        let read = store.read();
+        let routes: HashSet<RouteKey> = read.registered_route_keys().collect();
+        assert!(routes.contains(&rkey("b", "l", "r")));
     }
 }
