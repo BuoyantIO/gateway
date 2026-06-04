@@ -351,9 +351,11 @@ dependencies = [
  "anyhow",
  "clap",
  "gateway-config",
+ "gateway-cp-client",
  "gateway-runtime",
  "gateway-state",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

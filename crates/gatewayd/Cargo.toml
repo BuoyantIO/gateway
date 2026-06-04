@@ -10,10 +10,12 @@ workspace = true
 
 [dependencies]
 gateway-config = { path = "../gateway-config" }
-gateway-state = { path = "../gateway-state" }
+gateway-cp-client = { path = "../gateway-cp-client" }
 gateway-runtime = { path = "../gateway-runtime" }
+gateway-state = { path = "../gateway-state" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tonic = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
