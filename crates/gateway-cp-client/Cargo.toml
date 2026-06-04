@@ -1,0 +1,16 @@
+[package]
+name = "gateway-cp-client"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gateway-config = { path = "../gateway-config" }
+gateway-cp-proto = { path = "../gateway-cp-proto" }
+gateway-state = { path = "../gateway-state" }
+thiserror = "2"
+tracing = "0.1"

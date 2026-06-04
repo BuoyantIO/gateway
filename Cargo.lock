@@ -292,6 +292,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-cp-client"
+version = "0.0.0"
+dependencies = [
+ "gateway-config",
+ "gateway-cp-proto",
+ "gateway-state",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "gateway-cp-proto"
 version = "0.0.0"
 dependencies = [

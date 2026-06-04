@@ -1,0 +1,509 @@
+//! Apply a `ConfigUpdate` batch to a `gateway_state::Store`. The thin
+//! layer between proto-level deltas and the Store's existing
+//! incremental API — no caching, no diff, no network.
+//!
+//! Upserts that fail conversion or are rejected by the Store return
+//! `Err`; the caller (the stream loop in `client.rs`) decides whether
+//! to log-and-continue or close the stream. Removes that arrive with
+//! a `None` key are silently skipped — proto3 oneof can encode a
+//! "kind: None" Remove and that's not actionable.
+
+use gateway_cp_proto::v1 as pb;
+use gateway_state::Store;
+
+use crate::convert;
+use crate::error::Error;
+
+/// Apply one batched `ConfigUpdate` to the store. Upserts are applied
+/// first, then removes — matches the within-batch ordering convention
+/// the CP emits and keeps the Store's stashing model converging.
+///
+/// # Errors
+/// Returns the first conversion or Store error encountered. Subsequent
+/// items in the batch are not applied. v0 callers log and move on; the
+/// next CP push retries.
+pub fn apply_update(store: &Store, update: pb::ConfigUpdate) -> Result<(), Error> {
+    for upsert in update.upserts {
+        apply_upsert(store, upsert)?;
+    }
+    for remove in update.removes {
+        apply_remove(store, remove);
+    }
+    Ok(())
+}
+
+fn apply_upsert(store: &Store, upsert: pb::Upsert) -> Result<(), Error> {
+    let body = upsert.body.ok_or(Error::MissingField("Upsert.body"))?;
+    match body {
+        pb::upsert::Body::Bind(b) => {
+            let bind = convert::bind(b)?;
+            store.upsert_bind(bind)?;
+        }
+        pb::upsert::Body::Listener(l) => {
+            let (parent, listener) = convert::listener(l)?;
+            store.upsert_listener(&parent, listener)?;
+        }
+        pb::upsert::Body::HttpRoute(r) => {
+            let (parent, route) = convert::http_route(r)?;
+            store.upsert_http_route(&parent, route);
+        }
+        pb::upsert::Body::Backend(b) => {
+            let backend = convert::backend(b)?;
+            store.upsert_backend(backend);
+        }
+    }
+    Ok(())
+}
+
+fn apply_remove(store: &Store, remove: pb::Remove) {
+    let Some(key) = remove.key else {
+        tracing::warn!("Remove with no key field; skipping");
+        return;
+    };
+    match key {
+        pb::remove::Key::Bind(k) => store.remove_bind(&convert::bind_key(k)),
+        pb::remove::Key::Listener(k) => store.remove_listener(&convert::listener_key(k)),
+        pb::remove::Key::HttpRoute(k) => store.remove_http_route(&convert::route_key(k)),
+        pb::remove::Key::Backend(k) => store.remove_backend(&convert::backend_key(k)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
+
+    // ----- fixture builders -----
+
+    fn bind_upsert(name: &str, port: u32) -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Bind(pb::BindUpsert {
+                name: name.into(),
+                address: "0.0.0.0".into(),
+                port,
+                bind_protocol: pb::BindProtocol::Http as i32,
+            })),
+        }
+    }
+
+    fn listener_upsert(bind: &str, name: &str, hostname: Option<&str>) -> pb::Upsert {
+        let (has_hostname, hostname) = match hostname {
+            Some(h) => (true, h.to_string()),
+            None => (false, String::new()),
+        };
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Listener(pb::ListenerUpsert {
+                key: Some(pb::ListenerKey {
+                    bind: bind.into(),
+                    name: name.into(),
+                }),
+                hostname,
+                has_hostname,
+            })),
+        }
+    }
+
+    fn route_upsert(bind: &str, listener: &str, name: &str, backend: &str) -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::HttpRoute(pb::HttpRouteUpsert {
+                key: Some(pb::RouteKey {
+                    bind: bind.into(),
+                    listener: listener.into(),
+                    name: name.into(),
+                }),
+                matches: vec![pb::HttpMatch {
+                    host: String::new(),
+                    has_host: false,
+                    path: Some(pb::PathMatch {
+                        kind: pb::PathMatchKind::PathPrefix as i32,
+                        value: "/".into(),
+                    }),
+                }],
+                backend_refs: vec![pb::BackendRef {
+                    name: backend.into(),
+                    weight: 1,
+                }],
+                filters: vec![],
+            })),
+        }
+    }
+
+    fn backend_upsert(name: &str, ip: &str, port: u32) -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Backend(pb::BackendUpsert {
+                name: name.into(),
+                endpoints: vec![pb::Endpoint {
+                    name: format!("{name}/0"),
+                    address: ip.into(),
+                    port,
+                }],
+                protocol: pb::BackendProtocol::Http1 as i32,
+            })),
+        }
+    }
+
+    fn batch(upserts: Vec<pb::Upsert>, removes: Vec<pb::Remove>) -> pb::ConfigUpdate {
+        pb::ConfigUpdate {
+            upserts,
+            removes,
+            sync_complete: true,
+        }
+    }
+
+    // ----- happy path -----
+
+    #[test]
+    fn bind_listener_route_backend_all_in_one_batch() {
+        let store = Store::new();
+        let update = batch(
+            vec![
+                bind_upsert("b", 80),
+                listener_upsert("b", "l", Some("app.example.com")),
+                route_upsert("b", "l", "r", "be"),
+                backend_upsert("be", "10.0.0.1", 8080),
+            ],
+            vec![],
+        );
+
+        apply_update(&store, update).expect("apply ok");
+
+        let read = store.read();
+        let bind = read.bind(&BindKey::new("b")).expect("bind active");
+        assert_eq!(bind.port, 80);
+        assert_eq!(bind.listeners.len(), 1);
+        let listener = &bind.listeners[0];
+        assert_eq!(listener.hostname.as_deref(), Some("app.example.com"));
+        assert_eq!(listener.routes.len(), 1);
+        let route = &listener.routes[0];
+        assert_eq!(route.backends.len(), 1);
+        assert_eq!(route.backends[0].backend.endpoints[0].port, 8080);
+        assert_eq!(
+            route.backends[0].backend.endpoints[0].address.to_string(),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn out_of_order_upserts_converge_via_store_stashing() {
+        // Route arrives before its listener and backend; Store stashes
+        // it, then promotes once both deps land.
+        let store = Store::new();
+        let update = batch(
+            vec![
+                route_upsert("b", "l", "r", "be"),
+                listener_upsert("b", "l", None),
+                bind_upsert("b", 80),
+                backend_upsert("be", "10.0.0.1", 8080),
+            ],
+            vec![],
+        );
+        apply_update(&store, update).expect("apply ok");
+
+        let read = store.read();
+        let bind = read.bind(&BindKey::new("b")).unwrap();
+        assert_eq!(bind.listeners.len(), 1);
+        assert_eq!(bind.listeners[0].routes.len(), 1);
+    }
+
+    #[test]
+    fn route_without_backend_stays_pending() {
+        let store = Store::new();
+        let update = batch(
+            vec![
+                bind_upsert("b", 80),
+                listener_upsert("b", "l", None),
+                route_upsert("b", "l", "r", "missing-be"),
+            ],
+            vec![],
+        );
+        apply_update(&store, update).expect("apply ok");
+
+        let read = store.read();
+        assert!(!read.is_route_active(&RouteKey::new(
+            ListenerKey::new(BindKey::new("b"), "l"),
+            "r"
+        )));
+        // Bind is still active but listener has no active routes yet,
+        // so the bind's listener list is empty.
+        let bind = read.bind(&BindKey::new("b")).unwrap();
+        assert!(bind.listeners.is_empty());
+    }
+
+    // ----- removes -----
+
+    #[test]
+    fn remove_bind_via_batch() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(
+                vec![
+                    bind_upsert("b", 80),
+                    listener_upsert("b", "l", None),
+                    route_upsert("b", "l", "r", "be"),
+                    backend_upsert("be", "10.0.0.1", 8080),
+                ],
+                vec![],
+            ),
+        )
+        .unwrap();
+        assert!(store.read().bind(&BindKey::new("b")).is_some());
+
+        let removal = pb::ConfigUpdate {
+            upserts: vec![],
+            removes: vec![pb::Remove {
+                key: Some(pb::remove::Key::Bind(pb::BindKey { name: "b".into() })),
+            }],
+            sync_complete: false,
+        };
+        apply_update(&store, removal).unwrap();
+
+        assert!(store.read().bind(&BindKey::new("b")).is_none());
+    }
+
+    #[test]
+    fn remove_backend_demotes_dependent_routes() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(
+                vec![
+                    bind_upsert("b", 80),
+                    listener_upsert("b", "l", None),
+                    route_upsert("b", "l", "r", "be"),
+                    backend_upsert("be", "10.0.0.1", 8080),
+                ],
+                vec![],
+            ),
+        )
+        .unwrap();
+        let rk = RouteKey::new(ListenerKey::new(BindKey::new("b"), "l"), "r");
+        assert!(store.read().is_route_active(&rk));
+
+        apply_update(
+            &store,
+            pb::ConfigUpdate {
+                upserts: vec![],
+                removes: vec![pb::Remove {
+                    key: Some(pb::remove::Key::Backend(pb::BackendKey {
+                        name: "be".into(),
+                    })),
+                }],
+                sync_complete: false,
+            },
+        )
+        .unwrap();
+
+        assert!(!store.read().is_route_active(&rk));
+        assert!(store.read().backend(&BackendKey::new("be")).is_none());
+    }
+
+    #[test]
+    fn remove_with_no_key_field_is_skipped() {
+        let store = Store::new();
+        let update = pb::ConfigUpdate {
+            upserts: vec![bind_upsert("b", 80)],
+            removes: vec![pb::Remove { key: None }],
+            sync_complete: true,
+        };
+        apply_update(&store, update).expect("apply ok despite empty Remove");
+        assert!(store.read().bind(&BindKey::new("b")).is_some());
+    }
+
+    // ----- conversion failures -----
+
+    #[test]
+    fn invalid_address_rejected() {
+        let store = Store::new();
+        let update = batch(
+            vec![pb::Upsert {
+                body: Some(pb::upsert::Body::Bind(pb::BindUpsert {
+                    name: "b".into(),
+                    address: "not-an-ip".into(),
+                    port: 80,
+                    bind_protocol: pb::BindProtocol::Http as i32,
+                })),
+            }],
+            vec![],
+        );
+        let err = apply_update(&store, update).expect_err("must fail");
+        assert!(matches!(err, Error::InvalidValue { field, .. } if field == "BindUpsert.address"));
+    }
+
+    #[test]
+    fn port_overflow_rejected() {
+        let store = Store::new();
+        let update = batch(
+            vec![pb::Upsert {
+                body: Some(pb::upsert::Body::Bind(pb::BindUpsert {
+                    name: "b".into(),
+                    address: "0.0.0.0".into(),
+                    port: 70_000,
+                    bind_protocol: pb::BindProtocol::Http as i32,
+                })),
+            }],
+            vec![],
+        );
+        let err = apply_update(&store, update).expect_err("must fail");
+        assert!(matches!(err, Error::InvalidValue { field, .. } if field == "BindUpsert.port"));
+    }
+
+    #[test]
+    fn unspecified_bind_protocol_rejected() {
+        let store = Store::new();
+        let update = batch(
+            vec![pb::Upsert {
+                body: Some(pb::upsert::Body::Bind(pb::BindUpsert {
+                    name: "b".into(),
+                    address: "0.0.0.0".into(),
+                    port: 80,
+                    bind_protocol: pb::BindProtocol::Unspecified as i32,
+                })),
+            }],
+            vec![],
+        );
+        let err = apply_update(&store, update).expect_err("must fail");
+        assert!(matches!(err, Error::UnsupportedEnum { kind, .. } if kind == "BindProtocol"));
+    }
+
+    #[test]
+    fn missing_route_key_rejected() {
+        let store = Store::new();
+        let update = batch(
+            vec![pb::Upsert {
+                body: Some(pb::upsert::Body::HttpRoute(pb::HttpRouteUpsert {
+                    key: None,
+                    matches: vec![],
+                    backend_refs: vec![],
+                    filters: vec![],
+                })),
+            }],
+            vec![],
+        );
+        let err = apply_update(&store, update).expect_err("must fail");
+        assert!(matches!(err, Error::MissingField(s) if s == "HttpRouteUpsert.key"));
+    }
+
+    #[test]
+    fn upsert_with_no_body_rejected() {
+        let store = Store::new();
+        let update = batch(vec![pb::Upsert { body: None }], vec![]);
+        let err = apply_update(&store, update).expect_err("must fail");
+        assert!(matches!(err, Error::MissingField(s) if s == "Upsert.body"));
+    }
+
+    // ----- filters -----
+
+    #[test]
+    fn request_header_modifier_filter_round_trips() {
+        let store = Store::new();
+        let route = pb::Upsert {
+            body: Some(pb::upsert::Body::HttpRoute(pb::HttpRouteUpsert {
+                key: Some(pb::RouteKey {
+                    bind: "b".into(),
+                    listener: "l".into(),
+                    name: "r".into(),
+                }),
+                matches: vec![pb::HttpMatch {
+                    host: String::new(),
+                    has_host: false,
+                    path: Some(pb::PathMatch {
+                        kind: pb::PathMatchKind::PathPrefix as i32,
+                        value: "/".into(),
+                    }),
+                }],
+                backend_refs: vec![pb::BackendRef {
+                    name: "be".into(),
+                    weight: 1,
+                }],
+                filters: vec![pb::HttpFilter {
+                    kind: Some(pb::http_filter::Kind::RequestHeaderModifier(
+                        pb::RequestHeaderModifier {
+                            name: "add-x".into(),
+                            request_headers: Some(pb::RequestHeaderOps {
+                                add: vec![pb::HeaderPair {
+                                    name: "x-test".into(),
+                                    value: "yes".into(),
+                                }],
+                                set: vec![],
+                                remove: vec![],
+                            }),
+                        },
+                    )),
+                }],
+            })),
+        };
+        let update = batch(
+            vec![
+                bind_upsert("b", 80),
+                listener_upsert("b", "l", None),
+                route,
+                backend_upsert("be", "10.0.0.1", 8080),
+            ],
+            vec![],
+        );
+        apply_update(&store, update).unwrap();
+
+        let bind = store.read().bind(&BindKey::new("b")).unwrap();
+        let r = &bind.listeners[0].routes[0];
+        assert_eq!(r.filters.len(), 1);
+    }
+
+    #[test]
+    fn http_filter_with_no_kind_is_dropped() {
+        let store = Store::new();
+        let route = pb::Upsert {
+            body: Some(pb::upsert::Body::HttpRoute(pb::HttpRouteUpsert {
+                key: Some(pb::RouteKey {
+                    bind: "b".into(),
+                    listener: "l".into(),
+                    name: "r".into(),
+                }),
+                matches: vec![pb::HttpMatch {
+                    host: String::new(),
+                    has_host: false,
+                    path: Some(pb::PathMatch {
+                        kind: pb::PathMatchKind::PathPrefix as i32,
+                        value: "/".into(),
+                    }),
+                }],
+                backend_refs: vec![pb::BackendRef {
+                    name: "be".into(),
+                    weight: 1,
+                }],
+                // Unknown / future filter variant — proto would set kind = None
+                // from the DP's perspective.
+                filters: vec![pb::HttpFilter { kind: None }],
+            })),
+        };
+        let update = batch(
+            vec![
+                bind_upsert("b", 80),
+                listener_upsert("b", "l", None),
+                route,
+                backend_upsert("be", "10.0.0.1", 8080),
+            ],
+            vec![],
+        );
+        apply_update(&store, update).unwrap();
+
+        let bind = store.read().bind(&BindKey::new("b")).unwrap();
+        let r = &bind.listeners[0].routes[0];
+        assert!(r.filters.is_empty());
+    }
+
+    // ----- empty sync -----
+
+    #[test]
+    fn empty_sync_complete_is_noop() {
+        let store = Store::new();
+        let update = pb::ConfigUpdate {
+            upserts: vec![],
+            removes: vec![],
+            sync_complete: true,
+        };
+        apply_update(&store, update).unwrap();
+        assert_eq!(store.read().binds().count(), 0);
+    }
+}
