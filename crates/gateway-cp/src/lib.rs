@@ -9,8 +9,10 @@ pub mod diff;
 pub mod server;
 pub mod snapshot;
 pub mod translator;
+pub mod watch;
 
 pub use diff::diff;
 pub use server::{ConfigStreamService, ServerState};
 pub use snapshot::{GatewayId, Snapshot};
 pub use translator::{K8sState, translate};
+pub use watch::{WatchError, run as run_watch};

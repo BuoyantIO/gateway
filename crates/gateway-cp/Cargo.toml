@@ -11,14 +11,19 @@ workspace = true
 [dependencies]
 gateway-cp-proto = { path = "../gateway-cp-proto" }
 gateway-state = { path = "../gateway-state" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
 gateway-api = "0.21"
 k8s-openapi = { version = "0.27", features = ["v1_33"] }
+kube = { version = "3.1", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
 parking_lot = "0.12"
 thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tonic = "0.14"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
