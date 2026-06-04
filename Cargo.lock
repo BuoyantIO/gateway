@@ -497,7 +497,11 @@ dependencies = [
  "gateway-cp-proto",
  "gateway-state",
  "k8s-openapi",
+ "parking_lot",
  "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
  "tracing",
 ]
 

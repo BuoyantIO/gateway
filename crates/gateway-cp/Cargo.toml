@@ -13,5 +13,12 @@ gateway-cp-proto = { path = "../gateway-cp-proto" }
 gateway-state = { path = "../gateway-state" }
 gateway-api = "0.21"
 k8s-openapi = { version = "0.27", features = ["v1_33"] }
+parking_lot = "0.12"
 thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tokio-stream = "0.1"
+tonic = "0.14"
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
