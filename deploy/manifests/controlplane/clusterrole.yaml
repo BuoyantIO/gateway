@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gateway-cp
+rules:
+  # Gateway API resources we translate from. Read-only — v0 does no
+  # status writeback.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  # Services back HTTPRoute backendRefs. v0 resolves backends via
+  # Service.spec.clusterIP; no EndpointSlice watching yet.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]

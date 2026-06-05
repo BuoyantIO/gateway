@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-cp
+  namespace: gateway-system
+  labels:
+    app: gateway-cp
+spec:
+  # Headless: DPs resolve directly to the CP pod's IP. With one
+  # replica this is equivalent to ClusterIP; with multiple replicas
+  # in v1, this lets DPs do their own connection distribution.
+  clusterIP: None
+  selector:
+    app: gateway-cp
+  ports:
+    - name: grpc
+      port: 8443
+      targetPort: grpc

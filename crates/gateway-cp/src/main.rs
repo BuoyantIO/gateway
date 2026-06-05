@@ -20,7 +20,7 @@ struct Args {
     /// Controller name we claim. Gateways referencing a
     /// `GatewayClass` with this `spec.controllerName` are considered
     /// ours.
-    #[arg(long, default_value = "gateway.zaharidichev.io/controller")]
+    #[arg(long, default_value = "gateway.buoyant.io/controller")]
     controller_name: String,
 }
 
