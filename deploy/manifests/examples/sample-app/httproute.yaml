@@ -6,6 +6,8 @@ metadata:
 spec:
   parentRefs:
     - name: api-gateway
+  hostnames:
+    - app.example.com
   rules:
     - matches:
         - path:

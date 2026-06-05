@@ -211,6 +211,20 @@ fn emit_routes_under_listener(
     if listener.protocol != "HTTP" {
         return;
     }
+
+    // Intersect listener.hostname with route.spec.hostnames. If the
+    // intersection is empty, the route doesn't attach to this
+    // listener and we emit nothing.
+    let route_hostnames = hr.spec.hostnames.as_deref().unwrap_or(&[]);
+    let Some(effective) = effective_hostnames(listener.hostname.as_deref(), route_hostnames) else {
+        tracing::debug!(
+            route = route_name,
+            listener = %listener.name,
+            "route hostnames don't intersect listener hostname; skipping"
+        );
+        return;
+    };
+
     let bind_name = bind_name(gw_ns, gw_name, &listener.name);
     let listener_key = ListenerKey::new(BindKey::new(&bind_name), &bind_name);
 
@@ -218,13 +232,31 @@ fn emit_routes_under_listener(
         let route_full_name = format!("{route_ns}/{route_name}/rule{rule_idx}");
         let route_key = RouteKey::new(listener_key.clone(), &route_full_name);
 
-        let matches = rule
+        let base_matches: Vec<pb::HttpMatch> = rule
             .matches
             .as_deref()
             .unwrap_or(&[])
             .iter()
             .filter_map(translate_match)
             .collect();
+
+        // Fan-out: one HttpMatch per (effective hostname × user
+        // match). Empty `effective` means catch-all — keep the base
+        // matches with `has_host: false`.
+        let matches: Vec<pb::HttpMatch> = if effective.is_empty() {
+            base_matches
+        } else {
+            effective
+                .iter()
+                .flat_map(|host| {
+                    base_matches.iter().map(|m| pb::HttpMatch {
+                        host: host.clone(),
+                        has_host: true,
+                        path: m.path.clone(),
+                    })
+                })
+                .collect()
+        };
 
         let backend_refs = rule
             .backend_refs
@@ -256,6 +288,72 @@ fn emit_routes_under_listener(
             },
         );
     }
+}
+
+/// Intersect a listener's hostname with an `HTTPRoute`'s hostnames
+/// per the Gateway API. Returns:
+/// * `Some(vec![])` — no host constraint (both sides empty);
+///   `HttpMatch.has_host` stays false.
+/// * `Some(non-empty)` — the set of effective hostnames; the route
+///   fans out across them.
+/// * `None` — the listener has a hostname and none of the route's
+///   hostnames overlap; the attachment is dropped.
+fn effective_hostnames(listener: Option<&str>, route: &[String]) -> Option<Vec<String>> {
+    match (listener, route.is_empty()) {
+        (None, true) => Some(Vec::new()),
+        (None, false) => Some(route.to_vec()),
+        (Some(l), true) => Some(vec![l.to_string()]),
+        (Some(l), false) => {
+            let kept: Vec<String> = route
+                .iter()
+                .filter(|r| hostnames_overlap(l, r))
+                .cloned()
+                .collect();
+            if kept.is_empty() { None } else { Some(kept) }
+        }
+    }
+}
+
+/// Two hostnames overlap if they're equal (case-insensitive) or one
+/// is a wildcard pattern that covers the other.
+fn hostnames_overlap(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    if let Some(suffix) = a.strip_prefix("*.")
+        && wildcard_covers(suffix, b)
+    {
+        return true;
+    }
+    if let Some(suffix) = b.strip_prefix("*.")
+        && wildcard_covers(suffix, a)
+    {
+        return true;
+    }
+    false
+}
+
+/// Per Gateway API: `*.example.com` is a **suffix match** — it
+/// covers `app.example.com`, `foo.bar.example.com`, and any other
+/// hostname ending in `.example.com`. It does NOT cover
+/// `example.com` itself (the wildcard requires at least one label
+/// before the suffix). Case-insensitive.
+///
+/// `host` may itself be a wildcard pattern — `*.sub.example.com`
+/// is covered by `*.example.com` because `foo.sub.example.com` is in
+/// both their concrete sets.
+fn wildcard_covers(pattern_suffix: &str, host: &str) -> bool {
+    if host.len() <= pattern_suffix.len() {
+        return false;
+    }
+    let (head, tail) = host.split_at(host.len() - pattern_suffix.len());
+    if !tail.eq_ignore_ascii_case(pattern_suffix) {
+        return false;
+    }
+    let Some(prefix) = head.strip_suffix('.') else {
+        return false;
+    };
+    !prefix.is_empty()
 }
 
 /// v0: path only. `Exact` / `RegularExpression` matches and
@@ -809,5 +907,230 @@ mod tests {
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let route = s.routes.values().next().unwrap();
         assert_eq!(route.filters.len(), 1);
+    }
+
+    // ---------- hostname helpers ----------
+
+    #[test]
+    fn wildcard_covers_suffix_match() {
+        // Per Gateway API: wildcards are suffix matches, multi-label
+        // prefixes accepted.
+        assert!(wildcard_covers("example.com", "app.example.com"));
+        assert!(wildcard_covers("example.com", "a.b.example.com"));
+        // Bare suffix not covered — needs at least one extra label.
+        assert!(!wildcard_covers("example.com", "example.com"));
+        // Different domain.
+        assert!(!wildcard_covers("example.com", "other.com"));
+        // Case-insensitive.
+        assert!(wildcard_covers("example.com", "APP.Example.COM"));
+    }
+
+    #[test]
+    fn hostnames_overlap_cases() {
+        // equal
+        assert!(hostnames_overlap("a.com", "a.com"));
+        assert!(hostnames_overlap("A.com", "a.COM")); // case-insensitive
+        // not equal
+        assert!(!hostnames_overlap("a.com", "b.com"));
+        // wildcard vs concrete
+        assert!(hostnames_overlap("*.example.com", "app.example.com"));
+        assert!(hostnames_overlap("app.example.com", "*.example.com"));
+        assert!(hostnames_overlap("*.example.com", "foo.bar.example.com"));
+        assert!(!hostnames_overlap("*.example.com", "example.com"));
+        // Two wildcards overlap if one suffix covers the other's
+        // concrete set. `*.example.com` and `*.sub.example.com`
+        // share `foo.sub.example.com`, so they overlap.
+        assert!(hostnames_overlap("*.example.com", "*.sub.example.com"));
+        assert!(hostnames_overlap("*.sub.example.com", "*.example.com"));
+        // Disjoint domains.
+        assert!(!hostnames_overlap("*.example.com", "*.foo.com"));
+        // Identical wildcards overlap.
+        assert!(hostnames_overlap("*.example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn effective_hostnames_catch_all() {
+        // listener: none, route: none -> empty Vec (catch-all)
+        let got = effective_hostnames(None, &[]).unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn effective_hostnames_listener_only() {
+        let got = effective_hostnames(Some("a.example.com"), &[]).unwrap();
+        assert_eq!(got, vec!["a.example.com"]);
+    }
+
+    #[test]
+    fn effective_hostnames_route_only() {
+        let got =
+            effective_hostnames(None, &["a.example.com".into(), "b.example.com".into()]).unwrap();
+        assert_eq!(got, vec!["a.example.com", "b.example.com"]);
+    }
+
+    #[test]
+    fn effective_hostnames_exact_intersect_singleton() {
+        let got = effective_hostnames(
+            Some("a.example.com"),
+            &["a.example.com".into(), "b.example.com".into()],
+        )
+        .unwrap();
+        assert_eq!(got, vec!["a.example.com"]);
+    }
+
+    #[test]
+    fn effective_hostnames_exact_intersect_empty_drops() {
+        assert!(effective_hostnames(Some("x.example.com"), &["a.example.com".into()]).is_none());
+    }
+
+    #[test]
+    fn effective_hostnames_wildcard_listener_covers_route() {
+        let got = effective_hostnames(
+            Some("*.example.com"),
+            &["a.example.com".into(), "b.other.com".into()],
+        )
+        .unwrap();
+        assert_eq!(got, vec!["a.example.com"]);
+    }
+
+    #[test]
+    fn effective_hostnames_wildcard_route_covers_listener() {
+        let got = effective_hostnames(Some("api.example.com"), &["*.example.com".into()]).unwrap();
+        assert_eq!(got, vec!["*.example.com"]);
+    }
+
+    // ---------- emit_routes_under_listener with hostnames ----------
+
+    fn http_route_with_hostnames(
+        ns: &str,
+        name: &str,
+        parents: Vec<HttpRouteParentRefs>,
+        rules: Vec<HttpRouteRules>,
+        hostnames: Vec<String>,
+    ) -> HTTPRoute {
+        let mut hr = http_route(ns, name, parents, rules);
+        hr.spec.hostnames = Some(hostnames);
+        hr
+    }
+
+    #[test]
+    fn route_hostnames_fan_out_across_matches() {
+        // Listener has no hostname; route has two hostnames.
+        // Expect: one HttpRouteUpsert with 2 HttpMatches (one per host).
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route_with_hostnames(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+                vec!["a.example.com".into(), "b.example.com".into()],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().expect("one route");
+        assert_eq!(route.matches.len(), 2, "fan-out across 2 hostnames");
+        let mut hosts: Vec<&str> = route.matches.iter().map(|m| m.host.as_str()).collect();
+        hosts.sort_unstable();
+        assert_eq!(hosts, vec!["a.example.com", "b.example.com"]);
+        for m in &route.matches {
+            assert!(m.has_host);
+        }
+    }
+
+    #[test]
+    fn route_with_non_overlapping_hostnames_is_dropped() {
+        // Listener hostname: a.example.com. Route hostnames don't overlap.
+        // Expect: nothing emitted for routes (snapshot may not even
+        // have the slice if no other resources contribute, but the
+        // Gateway's Bind + Listener still come from the Gateway pass).
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, Some("a.example.com"))],
+            )],
+            http_routes: vec![http_route_with_hostnames(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+                vec!["other.example.com".into()],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        assert!(
+            s.routes.is_empty(),
+            "no routes when hostnames don't overlap"
+        );
+    }
+
+    #[test]
+    fn listener_hostname_propagates_when_route_has_none() {
+        // Listener hostname: a.example.com. Route has no hostnames.
+        // Expect: one HttpMatch with host = a.example.com.
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, Some("a.example.com"))],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        assert_eq!(route.matches.len(), 1);
+        assert!(route.matches[0].has_host);
+        assert_eq!(route.matches[0].host, "a.example.com");
+    }
+
+    #[test]
+    fn wildcard_route_hostname_passes_through_to_match() {
+        // Route hostname "*.example.com" travels as-is into HttpMatch.host
+        // for the resolver to wildcard-match at request time.
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route_with_hostnames(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+                vec!["*.example.com".into()],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        assert_eq!(route.matches.len(), 1);
+        assert!(route.matches[0].has_host);
+        assert_eq!(route.matches[0].host, "*.example.com");
     }
 }

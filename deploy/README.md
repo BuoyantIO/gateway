@@ -53,8 +53,13 @@ kubectl apply -f deploy/manifests/examples/sample-app/
 
 ```sh
 kubectl -n demo port-forward svc/api-gateway 8080:80
-curl http://localhost:8080/   # -> "hello from echo"
+curl -H 'Host: app.example.com' http://localhost:8080/   # -> "hello from echo"
+curl -H 'Host: other.example.com' http://localhost:8080/ # -> 404 (hostname not matched)
 ```
+
+The sample `HTTPRoute` is scoped to `app.example.com` via
+`spec.hostnames`. Drop that field (or use a wildcard like
+`*.example.com`) to broaden it.
 
 ## Notes
 

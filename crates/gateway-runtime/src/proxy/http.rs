@@ -287,12 +287,12 @@ fn pick_http_listener<'a>(
     listeners: &'a [Arc<ActiveHttpListener>],
     host: Option<&str>,
 ) -> Option<&'a ActiveHttpListener> {
-    let mut exact: Option<&ActiveHttpListener> = None;
+    let mut hostname_match: Option<&ActiveHttpListener> = None;
     let mut catchall: Option<&ActiveHttpListener> = None;
     for l in listeners {
         match (&l.hostname, host) {
-            (Some(want), Some(got)) if want.eq_ignore_ascii_case(got) && exact.is_none() => {
-                exact = Some(l.as_ref());
+            (Some(want), Some(got)) if hostname_match.is_none() && hostname_matches(want, got) => {
+                hostname_match = Some(l.as_ref());
             }
             (None, _) if catchall.is_none() => {
                 catchall = Some(l.as_ref());
@@ -300,7 +300,7 @@ fn pick_http_listener<'a>(
             _ => {}
         }
     }
-    exact.or(catchall)
+    hostname_match.or(catchall)
 }
 
 fn pick_http_route<'a>(
@@ -327,7 +327,7 @@ fn best_match_score(matches: &[HttpMatch], host: Option<&str>, path: &str) -> Op
     for m in matches {
         if let Some(want) = m.host.as_deref() {
             match host {
-                Some(got) if want.eq_ignore_ascii_case(got) => {}
+                Some(got) if hostname_matches(want, got) => {}
                 _ => continue,
             }
         }
@@ -336,6 +336,30 @@ fn best_match_score(matches: &[HttpMatch], host: Option<&str>, path: &str) -> Op
         }
     }
     best
+}
+
+/// Whether `pattern` covers the concrete `host`. Case-insensitive.
+///
+/// Per Gateway API, wildcards are **suffix match**: `*.example.com`
+/// covers `app.example.com`, `foo.bar.example.com`, and any other
+/// hostname ending in `.example.com` (with at least one extra
+/// label). It does NOT cover `example.com` itself.
+fn hostname_matches(pattern: &str, host: &str) -> bool {
+    let Some(suffix) = pattern.strip_prefix("*.") else {
+        return pattern.eq_ignore_ascii_case(host);
+    };
+    // host must be `<prefix>.<suffix>` with non-empty prefix.
+    if host.len() <= suffix.len() {
+        return false;
+    }
+    let (head, tail) = host.split_at(host.len() - suffix.len());
+    if !tail.eq_ignore_ascii_case(suffix) {
+        return false;
+    }
+    let Some(prefix) = head.strip_suffix('.') else {
+        return false;
+    };
+    !prefix.is_empty()
 }
 
 fn score_path(pm: &PathMatch, path: &str) -> Option<usize> {
@@ -658,5 +682,58 @@ mod tests {
             best_match_score(&matches, Some("a.example.com"), "/"),
             Some(1)
         );
+    }
+
+    // --- hostname_matches ---
+
+    #[test]
+    fn hostname_matches_exact() {
+        assert!(hostname_matches("a.example.com", "a.example.com"));
+        assert!(!hostname_matches("a.example.com", "b.example.com"));
+    }
+
+    #[test]
+    fn hostname_matches_is_case_insensitive() {
+        assert!(hostname_matches("A.Example.COM", "a.example.com"));
+        assert!(hostname_matches("*.Example.COM", "App.EXAMPLE.com"));
+    }
+
+    #[test]
+    fn hostname_matches_wildcard_suffix_match() {
+        // Per Gateway API: suffix match — covers single AND multi-label
+        // prefixes alike.
+        assert!(hostname_matches("*.example.com", "app.example.com"));
+        assert!(hostname_matches("*.example.com", "a.b.example.com"));
+        assert!(hostname_matches("*.example.com", "foo.bar.baz.example.com"));
+    }
+
+    #[test]
+    fn hostname_matches_wildcard_rejects_bare_suffix() {
+        // wildcard requires at least one extra label before the suffix
+        assert!(!hostname_matches("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn hostname_matches_wildcard_unrelated_domain() {
+        assert!(!hostname_matches("*.example.com", "app.other.com"));
+    }
+
+    #[test]
+    fn best_match_with_wildcard_host() {
+        let matches = vec![HttpMatch {
+            host: Some("*.example.com".into()),
+            path: pm("/"),
+        }];
+        assert_eq!(
+            best_match_score(&matches, Some("foo.example.com"), "/"),
+            Some(1)
+        );
+        // multi-label suffix also matches
+        assert_eq!(
+            best_match_score(&matches, Some("a.b.example.com"), "/"),
+            Some(1)
+        );
+        // bare suffix does NOT match — wildcard needs extra label
+        assert!(best_match_score(&matches, Some("example.com"), "/").is_none());
     }
 }
