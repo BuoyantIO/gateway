@@ -2,16 +2,17 @@
 //!
 //! Four `kube_runtime::reflector` instances keep an in-memory view of
 //! `GatewayClass`, `Gateway`, `HTTPRoute`, and `core/v1 Service`. A
-//! single `tokio::select!` over the four watcher streams marks state
-//! dirty on any event and starts a debounce timer; when the timer
-//! fires, the loop collects the four stores, calls `translate()`,
-//! and hands the result to `ServerState::publish` which fans
-//! per-Gateway diffs out to connected DPs.
+//! single `tokio::select!` over the four watcher streams drives the
+//! loop: every event triggers a `translate` + `ServerState::publish`.
+//!
+//! v0 publishes on every event. `diff` returns `None` when nothing
+//! changed, so spurious publishes are no-ops at the broadcast layer
+//! and never reach the data planes. Add debouncing back when
+//! translate cost during config bursts becomes measurable.
 
-use std::future::{Future, pending};
-use std::pin::{Pin, pin};
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
@@ -22,17 +23,9 @@ use kube::Api;
 use kube::runtime::reflector::{self, Store as ReflectorStore};
 use kube::runtime::watcher::{self, Config};
 use thiserror::Error;
-use tokio::time::{Sleep, sleep};
 
 use crate::server::ServerState;
-use crate::snapshot::Snapshot;
 use crate::translator::{K8sState, translate};
-
-/// Debounce window between the first event in a burst and the
-/// translate-and-publish pass. 50ms is short enough that propagation
-/// stays bench-friendly and long enough to coalesce typical
-/// kubectl-apply / controller bursts.
-const DEBOUNCE: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -45,10 +38,9 @@ pub enum WatchError {
 /// `select!`.
 ///
 /// # Errors
-/// Returns `WatchError::Kube` only for setup failures (the kube
-/// client can't construct the API handles). Watcher-stream errors
-/// are transient and handled by `kube_runtime::watcher` internally;
-/// we log and continue.
+/// Returns `WatchError::Kube` only for setup failures. Per-event
+/// watcher errors are transient and handled by `kube_runtime::watcher`
+/// internally; we log and continue.
 #[allow(clippy::similar_names)] // gc/gw/hr/svc bindings are intentionally parallel
 pub async fn run(
     client: kube::Client,
@@ -78,46 +70,19 @@ pub async fn run(
     let mut svc_stream =
         reflector::reflector(svc_writer, watcher::watcher(svc_api, Config::default())).boxed();
 
-    // `pending_debounce` is Some only while a debounce timer is
-    // armed. Each new event re-arms it, so a burst of events fires
-    // exactly one publish after `DEBOUNCE` of quiet.
-    let mut pending_debounce: Option<Pin<Box<Sleep>>> = None;
-
     loop {
-        // Yield from the debounce timer if armed; otherwise hand
-        // `select!` a future that never resolves so only the stream
-        // arms can fire.
-        let mut wait: Pin<Box<dyn Future<Output = ()> + Send>> = match pending_debounce.take() {
-            Some(s) => s,
-            None => Box::pin(pending::<()>()),
-        };
-
-        let mut got_event = false;
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-
-            // Debounce fired: collect and publish. Do NOT re-arm.
-            () = &mut wait => {
-                let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store);
-                let world: std::collections::HashMap<_, Snapshot> =
-                    translate(&k8s, &controller_name);
-                state.publish(&world);
-            }
-
-            // Any event from any kind: log errors, then re-arm the
-            // debounce timer below.
-            ev = gc_stream.next() => { log_event_err("GatewayClass", ev.as_ref()); got_event = true; }
-            ev = gw_stream.next() => { log_event_err("Gateway", ev.as_ref()); got_event = true; }
-            ev = hr_stream.next() => { log_event_err("HTTPRoute", ev.as_ref()); got_event = true; }
-            ev = svc_stream.next() => { log_event_err("Service", ev.as_ref()); got_event = true; }
+            ev = gc_stream.next() => log_event_err("GatewayClass", ev.as_ref()),
+            ev = gw_stream.next() => log_event_err("Gateway", ev.as_ref()),
+            ev = hr_stream.next() => log_event_err("HTTPRoute", ev.as_ref()),
+            ev = svc_stream.next() => log_event_err("Service", ev.as_ref()),
         }
 
-        // Only rearm on event; the publish branch finishes a burst,
-        // and we stay idle until the next event arrives.
-        if got_event {
-            pending_debounce = Some(Box::pin(sleep(DEBOUNCE)));
-        }
+        let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store);
+        let world = translate(&k8s, &controller_name);
+        state.publish(&world);
     }
 
     Ok(())

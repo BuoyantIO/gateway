@@ -46,11 +46,7 @@ type ResponseBody = BoxBody<Bytes, BoxError>;
 /// connector speaks h2c (prior-knowledge) — that's how we reach a
 /// plaintext gRPC backend.
 ///
-/// TODO: replace these two hyper legacy clients with one
-/// destination-keyed pool that picks the protocol per connection
-/// (via `hyper::client::conn::{http1,http2}`), removing the
-/// two-pool split. Hyper's default pool is hostname-keyed, isn't
-/// connect-failure-aware, and gives us no per-destination knobs.
+/// TODO: replace these two hyper legacy clients
 #[derive(Clone)]
 pub struct HttpClient {
     h1: hyper_util::client::legacy::Client<HttpConnector, Incoming>,

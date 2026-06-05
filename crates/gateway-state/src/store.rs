@@ -163,8 +163,7 @@ impl Store {
         report
     }
 
-    /// Drop every registered key not in `keep`. Leaves-up: routes,
-    /// backends, listeners, binds.
+    /// Drop every registered key not in `keep`.
     pub fn retain(&self, keep: &RegisteredKeys) {
         let (stale_routes, stale_backends, stale_listeners, stale_binds) = {
             let read = self.read();
