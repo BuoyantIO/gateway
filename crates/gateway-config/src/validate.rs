@@ -30,8 +30,8 @@ pub enum RejectionReason {
         bind: BindProtocol,
         listener: &'static str,
     },
-    #[error("path prefix `{0}` must start with `/`")]
-    PathPrefixNotSlash(String),
+    #[error("path `{0}` must start with `/`")]
+    PathNotSlash(String),
     #[error("RequestHeaderModifier filter has no add/set/remove operations")]
     EmptyHeaderModifier,
     #[error("header `{0}` appears in more than one RequestHeaderModifier operation")]
@@ -221,11 +221,13 @@ fn validate_tcp_route(key: &str, route: &TcpRoute, out: &mut Vec<Rejection>) {
 fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
     for (i, m) in route.matches.iter().enumerate() {
         match m.path.kind {
-            PathMatchKind::PathPrefix => {
+            // Both PathPrefix and Exact require an absolute path per
+            // Gateway API.
+            PathMatchKind::PathPrefix | PathMatchKind::Exact => {
                 if !m.path.value.starts_with('/') {
                     out.push(Rejection {
                         key: format!("{key}/matches[{i}]/path"),
-                        reason: RejectionReason::PathPrefixNotSlash(m.path.value.clone()),
+                        reason: RejectionReason::PathNotSlash(m.path.value.clone()),
                     });
                 }
             }
@@ -528,7 +530,7 @@ gatewayConfig:
         let errs = validate(&cfg).unwrap_err();
         assert!(
             errs.iter()
-                .any(|r| matches!(r.reason, RejectionReason::PathPrefixNotSlash(_)))
+                .any(|r| matches!(r.reason, RejectionReason::PathNotSlash(_)))
         );
     }
 

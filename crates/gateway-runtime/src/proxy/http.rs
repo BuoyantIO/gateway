@@ -379,6 +379,11 @@ fn score_path(pm: &PathMatch, path: &str) -> Option<usize> {
             }
             None
         }
+        // TODO(issue #5): replace usize::MAX with proper precedence
+        // ranking (exact > prefix > catch-all, then path length).
+        // Until then, Exact unconditionally outscores any PathPrefix
+        // at the same path.
+        PathMatchKind::Exact => (pm.value == path).then_some(usize::MAX),
     }
 }
 
@@ -557,6 +562,13 @@ mod tests {
         }
     }
 
+    fn pm_exact(v: &str) -> PathMatch {
+        PathMatch {
+            kind: PathMatchKind::Exact,
+            value: v.into(),
+        }
+    }
+
     // --- hop-by-hop header stripping ---
 
     #[test]
@@ -644,6 +656,47 @@ mod tests {
     #[test]
     fn score_root_matches_anything() {
         assert_eq!(score_path(&pm("/"), "/foo/bar"), Some(1));
+    }
+
+    // --- Exact path match ---
+
+    #[test]
+    fn score_exact_equal() {
+        assert_eq!(score_path(&pm_exact("/foo"), "/foo"), Some(usize::MAX));
+        assert_eq!(
+            score_path(&pm_exact("/healthz"), "/healthz"),
+            Some(usize::MAX)
+        );
+    }
+
+    #[test]
+    fn score_exact_unequal_rejected() {
+        // Critical: Exact must not prefix-match. `/foo/bar` is NOT `/foo`.
+        assert_eq!(score_path(&pm_exact("/foo"), "/foo/bar"), None);
+        // `/healthzz` is not `/healthz` — pure string inequality.
+        assert_eq!(score_path(&pm_exact("/healthz"), "/healthzz"), None);
+        // Trailing slash matters: `/foo` and `/foo/` are different.
+        assert_eq!(score_path(&pm_exact("/foo"), "/foo/"), None);
+        assert_eq!(score_path(&pm_exact("/foo/"), "/foo"), None);
+    }
+
+    #[test]
+    fn best_match_exact_beats_prefix() {
+        // Two routes, one Exact and one PathPrefix, both targeting /foo.
+        let exact = vec![HttpMatch {
+            host: None,
+            path: pm_exact("/foo"),
+        }];
+        let prefix = vec![HttpMatch {
+            host: None,
+            path: pm("/foo"),
+        }];
+        let exact_score = best_match_score(&exact, None, "/foo").unwrap();
+        let prefix_score = best_match_score(&prefix, None, "/foo").unwrap();
+        assert!(
+            exact_score > prefix_score,
+            "exact ({exact_score}) should beat prefix ({prefix_score}) at the same path"
+        );
     }
 
     #[test]

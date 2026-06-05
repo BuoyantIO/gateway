@@ -34,6 +34,18 @@ mod tests {
     }
 
     #[test]
+    fn path_match_kind_variants_construct() {
+        let _ = v1::PathMatch {
+            kind: v1::PathMatchKind::PathPrefix as i32,
+            value: "/".into(),
+        };
+        let _ = v1::PathMatch {
+            kind: v1::PathMatchKind::Exact as i32,
+            value: "/healthz".into(),
+        };
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // sanity test that constructs every variant
     fn config_update_with_upserts_and_removes_constructs() {
         let bind_upsert = v1::BindUpsert {

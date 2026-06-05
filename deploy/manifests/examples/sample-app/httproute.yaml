@@ -9,6 +9,16 @@ spec:
   hostnames:
     - app.example.com
   rules:
+    # Exact `/healthz` — wins over the PathPrefix `/` rule when the
+    # request path equals `/healthz` exactly.
+    - matches:
+        - path:
+            type: Exact
+            value: /healthz
+      backendRefs:
+        - name: echo
+          port: 8080
+    # Catch-all prefix.
     - matches:
         - path:
             type: PathPrefix

@@ -53,13 +53,20 @@ kubectl apply -f deploy/manifests/examples/sample-app/
 
 ```sh
 kubectl -n demo port-forward svc/api-gateway 8080:80
-curl -H 'Host: app.example.com' http://localhost:8080/   # -> "hello from echo"
-curl -H 'Host: other.example.com' http://localhost:8080/ # -> 404 (hostname not matched)
+curl -H 'Host: app.example.com'   http://localhost:8080/         # -> "hello from echo" (catch-all PathPrefix `/`)
+curl -H 'Host: app.example.com'   http://localhost:8080/healthz  # -> "hello from echo" (Exact `/healthz`)
+curl -H 'Host: app.example.com'   http://localhost:8080/healthzz # -> "hello from echo" (falls back to PathPrefix, NOT Exact)
+curl -H 'Host: other.example.com' http://localhost:8080/         # -> 404 (hostname not matched)
 ```
 
 The sample `HTTPRoute` is scoped to `app.example.com` via
-`spec.hostnames`. Drop that field (or use a wildcard like
-`*.example.com`) to broaden it.
+`spec.hostnames` and declares two rules:
+
+- `Exact /healthz` — wins over the catch-all for that one path.
+- `PathPrefix /` — catch-all.
+
+`/healthzz` is the critical case: it confirms `Exact` doesn't
+prefix-match (it falls through to the PathPrefix instead).
 
 ## Notes
 

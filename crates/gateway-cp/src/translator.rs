@@ -11,6 +11,7 @@ use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesMatches,
+    HttpRouteRulesMatchesPathType,
 };
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
@@ -36,9 +37,9 @@ pub struct K8sState {
 ///    plus a `BackendUpsert` for every referenced Service.
 ///
 /// Skips (with a warn log, no error): non-HTTP listeners, foreign
-/// `GatewayClass`es, unknown filter types, path matches other than
-/// `PathPrefix`, cross-namespace backendRefs, headless / missing
-/// Services.
+/// `GatewayClass`es, unknown filter types, `RegularExpression` path
+/// matches (issue #3), cross-namespace backendRefs, headless /
+/// missing Services.
 pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, Snapshot> {
     // Index everything keyed by lookup paths the passes need.
     let owned_classes = collect_owned_classes(state, controller_name);
@@ -356,10 +357,9 @@ fn wildcard_covers(pattern_suffix: &str, host: &str) -> bool {
     !prefix.is_empty()
 }
 
-/// v0: path only. `Exact` / `RegularExpression` matches and
-/// `method` / `headers` / `queryParams` matches are dropped with a
-/// warn — the parent route still ships, just with reduced
-/// specificity.
+/// v0: path only. `method` / `headers` / `queryParams` matches are
+/// dropped with a warn — the parent route still ships, just with
+/// reduced specificity.
 fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
     // Path defaults to `PathPrefix /` if unset, per Gateway API spec.
     let path = m.path.as_ref();
@@ -369,22 +369,23 @@ fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
             value: "/".into(),
         },
         Some(p) => {
-            // p.r#type defaults to PathPrefix per Gateway API.
-            let kind = p.r#type.as_ref();
             let value = p.value.clone().unwrap_or_else(|| "/".into());
-            match kind {
-                Some(t) if format!("{t:?}").contains("PathPrefix") => pb::PathMatch {
-                    kind: pb::PathMatchKind::PathPrefix as i32,
-                    value,
-                },
-                None => pb::PathMatch {
-                    kind: pb::PathMatchKind::PathPrefix as i32,
-                    value,
-                },
-                Some(other) => {
-                    tracing::warn!(?other, "skipping path match: only PathPrefix supported");
+            // p.r#type defaults to PathPrefix per Gateway API.
+            let kind = match p.r#type {
+                None | Some(HttpRouteRulesMatchesPathType::PathPrefix) => {
+                    pb::PathMatchKind::PathPrefix
+                }
+                Some(HttpRouteRulesMatchesPathType::Exact) => pb::PathMatchKind::Exact,
+                // TODO(issue #3): support RegularExpression behind a
+                // Cargo feature flag once broader match-type work lands.
+                Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
+                    tracing::warn!("skipping RegularExpression path match: not yet supported");
                     return None;
                 }
+            };
+            pb::PathMatch {
+                kind: kind as i32,
+                value,
             }
         }
     };
@@ -595,6 +596,13 @@ mod tests {
     fn path_prefix(value: &str) -> HttpRouteRulesMatchesPath {
         HttpRouteRulesMatchesPath {
             r#type: None, // default = PathPrefix
+            value: Some(value.into()),
+        }
+    }
+
+    fn path_exact(value: &str) -> HttpRouteRulesMatchesPath {
+        HttpRouteRulesMatchesPath {
+            r#type: Some(HttpRouteRulesMatchesPathType::Exact),
             value: Some(value.into()),
         }
     }
@@ -1132,5 +1140,45 @@ mod tests {
         assert_eq!(route.matches.len(), 1);
         assert!(route.matches[0].has_host);
         assert_eq!(route.matches[0].host, "*.example.com");
+    }
+
+    // ---------- Exact path match ----------
+
+    #[test]
+    fn exact_path_match_translates_to_exact_kind() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(path_exact("/manifest.json")),
+                        headers: None,
+                        query_params: None,
+                        method: None,
+                    }]),
+                    backend_refs: Some(vec![backend_ref("svc", 8080)]),
+                    filters: Some(vec![]),
+                    name: None,
+                    timeouts: None,
+                }],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().expect("one route");
+        assert_eq!(route.matches.len(), 1);
+        let path = route.matches[0].path.as_ref().expect("path set");
+        assert_eq!(path.kind, pb::PathMatchKind::Exact as i32);
+        assert_eq!(path.value, "/manifest.json");
     }
 }

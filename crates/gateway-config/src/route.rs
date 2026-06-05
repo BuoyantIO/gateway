@@ -54,4 +54,5 @@ pub struct PathMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathMatchKind {
     PathPrefix,
+    Exact,
 }

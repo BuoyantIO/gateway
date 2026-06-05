@@ -133,6 +133,7 @@ fn http_match(msg: pb::HttpMatch) -> Result<HttpMatch, Error> {
 fn path_match(msg: pb::PathMatch) -> Result<PathMatch, Error> {
     let kind = match pb::PathMatchKind::try_from(msg.kind) {
         Ok(pb::PathMatchKind::PathPrefix) => PathMatchKind::PathPrefix,
+        Ok(pb::PathMatchKind::Exact) => PathMatchKind::Exact,
         Ok(pb::PathMatchKind::Unspecified) | Err(_) => {
             return Err(Error::UnsupportedEnum {
                 kind: "PathMatchKind",
@@ -214,5 +215,48 @@ fn backend_protocol(value: i32) -> Result<BackendProtocol, Error> {
             kind: "BackendProtocol",
             value,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_match_round_trips_path_prefix() {
+        let out = path_match(pb::PathMatch {
+            kind: pb::PathMatchKind::PathPrefix as i32,
+            value: "/api".into(),
+        })
+        .expect("round-trip");
+        assert_eq!(out.kind, PathMatchKind::PathPrefix);
+        assert_eq!(out.value, "/api");
+    }
+
+    #[test]
+    fn path_match_round_trips_exact() {
+        let out = path_match(pb::PathMatch {
+            kind: pb::PathMatchKind::Exact as i32,
+            value: "/healthz".into(),
+        })
+        .expect("round-trip");
+        assert_eq!(out.kind, PathMatchKind::Exact);
+        assert_eq!(out.value, "/healthz");
+    }
+
+    #[test]
+    fn path_match_rejects_unspecified_kind() {
+        let err = path_match(pb::PathMatch {
+            kind: pb::PathMatchKind::Unspecified as i32,
+            value: "/".into(),
+        })
+        .expect_err("unspecified should fail");
+        assert!(matches!(
+            err,
+            Error::UnsupportedEnum {
+                kind: "PathMatchKind",
+                ..
+            }
+        ));
     }
 }

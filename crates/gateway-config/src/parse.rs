@@ -363,8 +363,8 @@ gatewayConfig:
     }
 
     #[test]
-    fn non_path_prefix_match_kind_fails() {
-        let err = parse_yaml(
+    fn exact_path_match_kind_parses() {
+        let cfg = parse_yaml(
             r"
 gatewayConfig:
   name: g
@@ -380,11 +380,36 @@ gatewayConfig:
               matches: [{ path: { type: Exact, value: /api } }]
               backendRefs: [{ name: be }]
 ",
+        )
+        .expect("Exact path match kind should parse");
+        let Listener::Http(http) = &cfg.binds[0].listeners[0] else {
+            panic!("expected HTTP listener");
+        };
+        let m = &http.routes[0].matches[0];
+        assert_eq!(m.path.kind, PathMatchKind::Exact);
+        assert_eq!(m.path.value, "/api");
+    }
+
+    #[test]
+    fn unknown_path_match_kind_fails() {
+        let err = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches: [{ path: { type: Wibble, value: /api } }]
+              backendRefs: [{ name: be }]
+",
         );
-        assert!(
-            err.is_err(),
-            "non-PathPrefix path kind should fail to parse"
-        );
+        assert!(err.is_err(), "unknown path kind should fail to parse");
     }
 
     #[test]
