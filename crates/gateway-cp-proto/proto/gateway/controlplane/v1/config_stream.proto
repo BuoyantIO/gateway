@@ -118,6 +118,7 @@ enum PathMatchKind {
   PATH_MATCH_KIND_UNSPECIFIED = 0;
   PATH_MATCH_KIND_PATH_PREFIX = 1;
   PATH_MATCH_KIND_EXACT       = 2;
+  PATH_MATCH_KIND_REGEX       = 3;
 }
 
 // Mirrors Gateway API's closed set of HTTP methods.

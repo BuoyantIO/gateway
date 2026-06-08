@@ -13,7 +13,7 @@ use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
 use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
-use gateway_config::route::{HttpMatch, HttpRoute, PathMatch, PathMatchKind};
+use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::Gateway;
 use gateway_state::Store;
 use http::{Request, StatusCode};
@@ -88,8 +88,7 @@ fn http_route(name: &str, path_prefix: &str, backend: &str) -> HttpRoute {
         name: name.into(),
         matches: vec![HttpMatch {
             host: None,
-            path: PathMatch {
-                kind: PathMatchKind::PathPrefix,
+            path: PathMatch::PathPrefix {
                 value: path_prefix.into(),
             },
             method: None,
@@ -472,14 +471,8 @@ async fn header_routing_picks_header_rule_over_catchall() {
             name: "r-header".into(),
             matches: vec![HttpMatch {
                 host: None,
-                path: PathMatch {
-                    kind: PathMatchKind::PathPrefix,
-                    value: "/".into(),
-                },
+                path: PathMatch::PathPrefix { value: "/".into() },
                 method: None,
-                // header-match field is on the **config-side**
-                // HttpMatch; the Store compiles it into an
-                // ActiveHttpMatch at apply time.
                 headers: vec![gateway_config::route::HeaderMatch {
                     name: http::HeaderName::from_static("x-feature"),
                     value: gateway_config::route::HeaderValueMatch::Exact {
@@ -604,6 +597,124 @@ async fn header_routing_picks_header_rule_over_catchall() {
         served, "B",
         "wrong header value should fall through to catchall"
     );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// A regex `path` match routes to its backend when the request
+/// path matches the (anchored) pattern, and falls through to a
+/// sibling catchall when it doesn't.
+#[tokio::test]
+async fn regex_path_routes_matching_request() {
+    let upstream_match = spawn_http_echo().await;
+    let upstream_catchall = spawn_http_echo().await;
+    let bind_port = free_port().await;
+
+    // Route A: matches `^/api/v\d+/.*` — anchored regex.
+    let regex_route = HttpRoute {
+        name: "r-regex".into(),
+        matches: vec![HttpMatch {
+            host: None,
+            path: PathMatch::Regex {
+                value: regex::Regex::new(r"^/api/v\d+/.*").unwrap(),
+            },
+            method: None,
+            headers: vec![],
+            query_params: vec![],
+        }],
+        backend_refs: vec![BackendRef {
+            name: "be-regex".into(),
+            weight: 1,
+        }],
+        filters: vec![HttpFilter::RequestHeaderModifier {
+            name: "tag-regex".into(),
+            request_headers: RequestHeaderOps {
+                add: vec![HeaderPair {
+                    name: "x-test-served-by".into(),
+                    value: "REGEX".into(),
+                }],
+                set: vec![],
+                remove: vec![],
+            },
+        }],
+    };
+    // Route B: plain `/` catchall.
+    let catchall_route = http_route_with_filter(
+        "r-catchall",
+        "/",
+        "be-catchall",
+        HttpFilter::RequestHeaderModifier {
+            name: "tag-catchall".into(),
+            request_headers: RequestHeaderOps {
+                add: vec![HeaderPair {
+                    name: "x-test-served-by".into(),
+                    value: "CATCHALL".into(),
+                }],
+                set: vec![],
+                remove: vec![],
+            },
+        },
+    );
+
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![regex_route, catchall_route])],
+        }],
+        backends: vec![
+            static_backend("be-regex", upstream_match),
+            static_backend("be-catchall", upstream_catchall),
+        ],
+        secrets: vec![],
+    };
+
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+
+    // 1: path matches the regex → route A wins (Regex outranks Prefix).
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/api/v1/users"))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = resp
+        .headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        served, "REGEX",
+        "regex-matching path should hit the regex route"
+    );
+
+    // 2: path doesn't match the regex → falls through to catchall.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/healthz"))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = resp
+        .headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(served, "CATCHALL", "non-matching path should fall through");
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(2), gw_handle)

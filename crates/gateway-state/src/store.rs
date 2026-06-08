@@ -777,7 +777,7 @@ mod tests {
     use gateway_config::listener::{
         HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
     };
-    use gateway_config::route::{HttpMatch, HttpRoute, PathMatch, PathMatchKind};
+    use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 
     // --- fixture builders ---
 
@@ -851,8 +851,7 @@ mod tests {
             name: name.into(),
             matches: vec![HttpMatch {
                 host: None,
-                path: PathMatch {
-                    kind: PathMatchKind::PathPrefix,
+                path: PathMatch::PathPrefix {
                     value: path_prefix.into(),
                 },
                 method: None,
@@ -1240,10 +1239,7 @@ mod tests {
             name: "r".into(),
             matches: vec![HttpMatch {
                 host: None,
-                path: PathMatch {
-                    kind: PathMatchKind::PathPrefix,
-                    value: "/".into(),
-                },
+                path: PathMatch::PathPrefix { value: "/".into() },
                 method: None,
                 headers: vec![],
                 query_params: vec![],

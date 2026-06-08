@@ -21,8 +21,7 @@ use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::filter::{HeaderPair, HttpFilter as HttpFilterConfig, RequestHeaderOps};
 use gateway_config::route::{
-    HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, PathMatchKind, QueryParamMatch,
-    QueryValueMatch,
+    HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
 use gateway_state::{ActiveBackend, ActiveHttpListener, ActiveHttpRoute, BindKey, Store};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -292,12 +291,13 @@ pub(crate) struct RequestMatch {
     query_params: usize,
 }
 
-/// Summarized path match. Order: `Prefix(_) < Exact(_)` regardless of
-/// length; within a variant, longer wins. Fixes the `usize::MAX`
-/// hack from issue #2.
+/// Summarized path match. Order: `Prefix(_) < Regex(_) < Exact(_)`
+/// regardless of length; within a variant, longer wins. Encodes
+/// Gateway API path precedence directly through variant order.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PathSummary {
     Prefix(usize),
+    Regex(usize),
     Exact(usize),
 }
 
@@ -306,9 +306,10 @@ impl PathSummary {
     /// no path entry matched.
     fn from_match(pm: &PathMatch, path: &str) -> Option<Self> {
         let len = score_path(pm, path)?;
-        match pm.kind {
-            PathMatchKind::PathPrefix => Some(Self::Prefix(len)),
-            PathMatchKind::Exact => Some(Self::Exact(len)),
+        match pm {
+            PathMatch::PathPrefix { .. } => Some(Self::Prefix(len)),
+            PathMatch::Regex { .. } => Some(Self::Regex(len)),
+            PathMatch::Exact { .. } => Some(Self::Exact(len)),
         }
     }
 }
@@ -463,9 +464,9 @@ fn hostname_matches(pattern: &str, host: &str) -> bool {
 }
 
 fn score_path(pm: &PathMatch, path: &str) -> Option<usize> {
-    match pm.kind {
-        PathMatchKind::PathPrefix => {
-            let prefix = pm.value.as_str();
+    match pm {
+        PathMatch::PathPrefix { value } => {
+            let prefix = value.as_str();
             if prefix.is_empty() {
                 return Some(0);
             }
@@ -479,11 +480,15 @@ fn score_path(pm: &PathMatch, path: &str) -> Option<usize> {
             }
             None
         }
-        // Exact-vs-prefix precedence is now expressed by the
-        // `PathSummary` `Ord` impl: `Prefix(_) < Exact(_)`. This
-        // function returns raw path length; the variant tagging
-        // happens in `PathSummary::from_match`.
-        PathMatchKind::Exact => (pm.value == path).then_some(pm.value.len()),
+        // Variant precedence (`Prefix < Regex < Exact`) is encoded
+        // in `PathSummary`'s variant order; this function returns
+        // raw match length only.
+        PathMatch::Exact { value } => (value == path).then_some(value.len()),
+        // Anchored at both ends: regex must match the whole path,
+        // not just a substring. Mirrors the header/query helper.
+        PathMatch::Regex { value: re } => re
+            .find(path)
+            .and_then(|m| (m.start() == 0 && m.end() == path.len()).then_some(path.len())),
     }
 }
 
@@ -712,16 +717,16 @@ mod tests {
     use super::*;
 
     fn pm(v: &str) -> PathMatch {
-        PathMatch {
-            kind: PathMatchKind::PathPrefix,
-            value: v.into(),
-        }
+        PathMatch::PathPrefix { value: v.into() }
     }
 
     fn pm_exact(v: &str) -> PathMatch {
-        PathMatch {
-            kind: PathMatchKind::Exact,
-            value: v.into(),
+        PathMatch::Exact { value: v.into() }
+    }
+
+    fn pm_regex(pattern: &str) -> PathMatch {
+        PathMatch::Regex {
+            value: regex::Regex::new(pattern).unwrap(),
         }
     }
 
@@ -851,6 +856,51 @@ mod tests {
     #[test]
     fn path_summary_longer_exact_beats_shorter_exact() {
         assert!(PathSummary::Exact(9) > PathSummary::Exact(5));
+    }
+
+    // --- regex path match ---
+
+    #[test]
+    fn score_regex_matches_whole_path() {
+        // Regex matches `/api/v1` exactly when anchored.
+        assert_eq!(score_path(&pm_regex(r"^/api/v\d+$"), "/api/v1"), Some(7));
+        assert_eq!(score_path(&pm_regex(r"^/api/v\d+$"), "/api/v42"), Some(8));
+    }
+
+    #[test]
+    fn score_regex_substring_rejected() {
+        // Without anchoring, `/api` would match `/foo/api/bar`; we
+        // anchor both ends explicitly, so substring matches are
+        // rejected.
+        assert_eq!(score_path(&pm_regex(r"/api"), "/foo/api/bar"), None);
+        // A regex that lacks anchors still must match the whole
+        // path under our enforcement; `bar` doesn't match
+        // `/foo/bar`.
+        assert_eq!(score_path(&pm_regex(r"bar"), "/foo/bar"), None);
+    }
+
+    #[test]
+    fn score_regex_partial_path_rejected() {
+        // Regex matches `/api` but request is `/api/v1` — anchoring
+        // forces whole-path match, so this is None.
+        assert_eq!(score_path(&pm_regex(r"^/api$"), "/api/v1"), None);
+    }
+
+    #[test]
+    fn path_summary_regex_beats_prefix() {
+        // Regex outranks Prefix even when prefix is much longer.
+        assert!(PathSummary::Regex(5) > PathSummary::Prefix(99));
+    }
+
+    #[test]
+    fn path_summary_exact_beats_regex() {
+        // Exact still outranks Regex unconditionally.
+        assert!(PathSummary::Exact(3) > PathSummary::Regex(99));
+    }
+
+    #[test]
+    fn path_summary_longer_regex_beats_shorter_regex() {
+        assert!(PathSummary::Regex(8) > PathSummary::Regex(3));
     }
 
     // --- strip_port ---

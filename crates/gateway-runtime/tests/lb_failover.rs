@@ -18,7 +18,7 @@ use gateway_config::GatewayConfig;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
-use gateway_config::route::{HttpMatch, HttpRoute, PathMatch, PathMatchKind};
+use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::Gateway;
 use gateway_runtime::lb::{EndpointStateConfig, LoadBalancer, P2cConfig, P2cEwma};
 use gateway_state::Store;
@@ -105,10 +105,7 @@ fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
                     name: "r".into(),
                     matches: vec![HttpMatch {
                         host: None,
-                        path: PathMatch {
-                            kind: PathMatchKind::PathPrefix,
-                            value: "/".into(),
-                        },
+                        path: PathMatch::PathPrefix { value: "/".into() },
                         method: None,
                         headers: vec![],
                         query_params: vec![],

@@ -14,7 +14,7 @@ use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
 use gateway_config::listener::{HttpListener, Listener};
 use gateway_config::route::{
-    HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, PathMatchKind, QueryParamMatch,
+    HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, QueryParamMatch,
     QueryValueMatch,
 };
 use gateway_cp_proto::v1 as pb;
@@ -219,20 +219,21 @@ fn query_param_match(msg: pb::QueryParamMatch) -> Result<QueryParamMatch, Error>
 }
 
 fn path_match(msg: pb::PathMatch) -> Result<PathMatch, Error> {
-    let kind = match pb::PathMatchKind::try_from(msg.kind) {
-        Ok(pb::PathMatchKind::PathPrefix) => PathMatchKind::PathPrefix,
-        Ok(pb::PathMatchKind::Exact) => PathMatchKind::Exact,
-        Ok(pb::PathMatchKind::Unspecified) | Err(_) => {
-            return Err(Error::UnsupportedEnum {
-                kind: "PathMatchKind",
-                value: msg.kind,
-            });
+    match pb::PathMatchKind::try_from(msg.kind) {
+        Ok(pb::PathMatchKind::PathPrefix) => Ok(PathMatch::PathPrefix { value: msg.value }),
+        Ok(pb::PathMatchKind::Exact) => Ok(PathMatch::Exact { value: msg.value }),
+        Ok(pb::PathMatchKind::Regex) => {
+            let re = regex::Regex::new(&msg.value).map_err(|source| Error::InvalidRegex {
+                pattern: msg.value.clone(),
+                source,
+            })?;
+            Ok(PathMatch::Regex { value: re })
         }
-    };
-    Ok(PathMatch {
-        kind,
-        value: msg.value,
-    })
+        Ok(pb::PathMatchKind::Unspecified) | Err(_) => Err(Error::UnsupportedEnum {
+            kind: "PathMatchKind",
+            value: msg.kind,
+        }),
+    }
 }
 
 fn backend_ref(msg: pb::BackendRef) -> BackendRef {
@@ -317,8 +318,10 @@ mod tests {
             value: "/api".into(),
         })
         .expect("round-trip");
-        assert_eq!(out.kind, PathMatchKind::PathPrefix);
-        assert_eq!(out.value, "/api");
+        match out {
+            PathMatch::PathPrefix { value } => assert_eq!(value, "/api"),
+            other => panic!("expected PathPrefix, got {other:?}"),
+        }
     }
 
     #[test]
@@ -328,8 +331,33 @@ mod tests {
             value: "/healthz".into(),
         })
         .expect("round-trip");
-        assert_eq!(out.kind, PathMatchKind::Exact);
-        assert_eq!(out.value, "/healthz");
+        match out {
+            PathMatch::Exact { value } => assert_eq!(value, "/healthz"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_match_round_trips_regex() {
+        let out = path_match(pb::PathMatch {
+            kind: pb::PathMatchKind::Regex as i32,
+            value: r"^/api/v\d+$".into(),
+        })
+        .expect("round-trip");
+        match out {
+            PathMatch::Regex { value } => assert_eq!(value.as_str(), r"^/api/v\d+$"),
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_match_regex_invalid_pattern_rejected() {
+        let err = path_match(pb::PathMatch {
+            kind: pb::PathMatchKind::Regex as i32,
+            value: "[".into(),
+        })
+        .expect_err("invalid regex should fail");
+        assert!(matches!(err, Error::InvalidRegex { .. }));
     }
 
     #[test]

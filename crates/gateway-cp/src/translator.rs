@@ -39,9 +39,8 @@ pub struct K8sState {
 ///    plus a `BackendUpsert` for every referenced Service.
 ///
 /// Skips (with a warn log, no error): non-HTTP listeners, foreign
-/// `GatewayClass`es, unknown filter types, `RegularExpression` path
-/// matches (issue #3), cross-namespace backendRefs, headless /
-/// missing Services.
+/// `GatewayClass`es, unknown filter types, cross-namespace
+/// backendRefs, headless / missing Services.
 pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, Snapshot> {
     // Index everything keyed by lookup paths the passes need.
     let owned_classes = collect_owned_classes(state, controller_name);
@@ -240,7 +239,7 @@ fn emit_routes_under_listener(
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter_map(translate_match)
+            .map(translate_match)
             .collect();
 
         // Fan-out: one HttpMatch per (effective hostname × user
@@ -363,12 +362,12 @@ fn wildcard_covers(pattern_suffix: &str, host: &str) -> bool {
 }
 
 /// Translate one `HttpRouteRulesMatches` to the proto. Path,
-/// method, headers, and queryParams are all carried; `RegularExpression`
-/// path is not yet implemented and drops the entire match with a
-/// warn. Header names are deduplicated case-insensitively (first
-/// occurrence wins) and query keys case-sensitively, per Gateway
-/// API spec.
-fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
+/// method, headers, and queryParams are all carried. Header names
+/// are deduplicated case-insensitively (first occurrence wins) and
+/// query keys case-sensitively, per Gateway API spec. Regex
+/// patterns are passed through as strings; compilation happens
+/// downstream in `gateway-cp-client::convert`.
+fn translate_match(m: &HttpRouteRulesMatches) -> pb::HttpMatch {
     // Path defaults to `PathPrefix /` if unset, per Gateway API spec.
     let path = m.path.as_ref();
     let path_msg = match path {
@@ -384,10 +383,7 @@ fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
                     pb::PathMatchKind::PathPrefix
                 }
                 Some(HttpRouteRulesMatchesPathType::Exact) => pb::PathMatchKind::Exact,
-                Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
-                    tracing::warn!("skipping RegularExpression path match: not yet supported");
-                    return None;
-                }
+                Some(HttpRouteRulesMatchesPathType::RegularExpression) => pb::PathMatchKind::Regex,
             };
             pb::PathMatch {
                 kind: kind as i32,
@@ -406,14 +402,14 @@ fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
         .as_deref()
         .map(translate_query_param_matches)
         .unwrap_or_default();
-    Some(pb::HttpMatch {
+    pb::HttpMatch {
         host: String::new(),
         has_host: false,
         path: Some(path_msg),
         method: method as i32,
         header_matches,
         query_param_matches,
-    })
+    }
 }
 
 fn translate_method(m: Option<&HttpRouteRulesMatchesMethod>) -> pb::HttpMethod {
@@ -725,6 +721,13 @@ mod tests {
     fn path_exact(value: &str) -> HttpRouteRulesMatchesPath {
         HttpRouteRulesMatchesPath {
             r#type: Some(HttpRouteRulesMatchesPathType::Exact),
+            value: Some(value.into()),
+        }
+    }
+
+    fn path_regex(value: &str) -> HttpRouteRulesMatchesPath {
+        HttpRouteRulesMatchesPath {
+            r#type: Some(HttpRouteRulesMatchesPathType::RegularExpression),
             value: Some(value.into()),
         }
     }
@@ -1336,6 +1339,52 @@ mod tests {
         let path = route.matches[0].path.as_ref().expect("path set");
         assert_eq!(path.kind, pb::PathMatchKind::Exact as i32);
         assert_eq!(path.value, "/manifest.json");
+    }
+
+    // ---------- Regex path match ----------
+
+    #[test]
+    fn regex_path_match_translates_to_regex_kind() {
+        // Previously dropped with a warn; this asserts that a
+        // RegularExpression path now round-trips to the proto as
+        // `PATH_MATCH_KIND_REGEX` with the pattern preserved as a
+        // string. Compilation happens at the data plane via
+        // `gateway-cp-client::convert::path_match`.
+        let pattern = r"^/api/v\d+$";
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![HttpRouteRules {
+                    matches: Some(vec![HttpRouteRulesMatches {
+                        path: Some(path_regex(pattern)),
+                        headers: None,
+                        query_params: None,
+                        method: None,
+                    }]),
+                    backend_refs: Some(vec![backend_ref("svc", 8080)]),
+                    filters: Some(vec![]),
+                    name: None,
+                    timeouts: None,
+                }],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().expect("one route");
+        assert_eq!(route.matches.len(), 1, "regex match must not drop the rule");
+        let path = route.matches[0].path.as_ref().expect("path set");
+        assert_eq!(path.kind, pb::PathMatchKind::Regex as i32);
+        assert_eq!(path.value, pattern);
     }
 
     // ---------- method / headers / queryParams ----------

@@ -30,7 +30,7 @@ mod tests {
     use crate::bind::BindProtocol;
     use crate::filter::{HttpFilter, TcpFilter, TlsFilter};
     use crate::listener::{Listener, TlsMode};
-    use crate::route::PathMatchKind;
+    use crate::route::PathMatch;
 
     #[test]
     fn multiple_binds() {
@@ -207,8 +207,10 @@ gatewayConfig:
         };
         let m = &l.routes[0].matches[0];
         assert_eq!(m.host.as_deref(), Some("app.example.com"));
-        assert_eq!(m.path.kind, PathMatchKind::PathPrefix);
-        assert_eq!(m.path.value, "/api");
+        match &m.path {
+            PathMatch::PathPrefix { value } => assert_eq!(value, "/api"),
+            other => panic!("expected PathPrefix, got {other:?}"),
+        }
     }
 
     #[test]
@@ -386,8 +388,10 @@ gatewayConfig:
             panic!("expected HTTP listener");
         };
         let m = &http.routes[0].matches[0];
-        assert_eq!(m.path.kind, PathMatchKind::Exact);
-        assert_eq!(m.path.value, "/api");
+        match &m.path {
+            PathMatch::Exact { value } => assert_eq!(value, "/api"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
     }
 
     #[test]

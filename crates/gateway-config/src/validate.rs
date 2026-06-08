@@ -8,7 +8,7 @@ use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::filter::{HttpFilter, RequestHeaderOps};
 use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
-use crate::route::{HttpMatch, HttpRoute, PathMatchKind, QueryParamMatch, TcpRoute, TlsRoute};
+use crate::route::{HttpMatch, HttpRoute, PathMatch, QueryParamMatch, TcpRoute, TlsRoute};
 
 #[derive(Debug, Error)]
 #[error("{key}: {reason}")]
@@ -244,17 +244,20 @@ fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
 }
 
 fn validate_http_match(key: &str, m: &HttpMatch, out: &mut Vec<Rejection>) {
-    match m.path.kind {
-        // Both PathPrefix and Exact require an absolute path per
-        // Gateway API.
-        PathMatchKind::PathPrefix | PathMatchKind::Exact => {
-            if !m.path.value.starts_with('/') {
+    match &m.path {
+        // `PathPrefix` and `Exact` require an absolute path per
+        // Gateway API. `Regex` patterns are validated by
+        // `serde_regex` at deserialization time; no slash
+        // constraint applies.
+        PathMatch::PathPrefix { value } | PathMatch::Exact { value } => {
+            if !value.starts_with('/') {
                 out.push(Rejection {
                     key: format!("{key}/path"),
-                    reason: RejectionReason::PathNotSlash(m.path.value.clone()),
+                    reason: RejectionReason::PathNotSlash(value.clone()),
                 });
             }
         }
+        PathMatch::Regex { .. } => {}
     }
     // Header name/value and regex validity are enforced at
     // deserialization time by the typed match shapes — nothing to
@@ -557,6 +560,56 @@ gatewayConfig:
             errs.iter()
                 .any(|r| matches!(r.reason, RejectionReason::PathNotSlash(_)))
         );
+    }
+
+    #[test]
+    fn regex_path_match_accepted() {
+        // Regex patterns are not subject to the `starts_with('/')`
+        // rule (their `value` is a `regex::Regex`, not a path
+        // string). A well-formed regex passes validate.
+        let cfg = parse(
+            r#"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches: [{ path: { type: Regex, value: "^/api/v\\d+$" } }]
+              backendRefs: [{ name: be }]
+"#,
+        );
+        validate(&cfg).expect("valid regex path should pass validation");
+    }
+
+    #[test]
+    fn regex_path_invalid_pattern_rejected_at_parse_time() {
+        // Malformed regex patterns are rejected by `serde_regex`
+        // during YAML deserialization, before `validate()` ever runs.
+        let err = crate::parse_yaml(
+            r#"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches: [{ path: { type: Regex, value: "[" } }]
+              backendRefs: [{ name: be }]
+"#,
+        )
+        .expect_err("invalid regex pattern should fail YAML parse");
+        let _ = format!("{err}"); // shape varies; existence is the assertion
     }
 
     #[test]
