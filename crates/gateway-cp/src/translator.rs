@@ -545,6 +545,12 @@ fn translate_filter(f: &HttpRouteRulesFilters) -> Option<pb::HttpFilter> {
 /// only produces one entry per slice. Missing or headless Services
 /// emit nothing; the DP-side Store stashes any dependent route until
 /// the backend lands.
+///
+/// Protocol is derived from `Service.spec.ports[*].appProtocol` for
+/// the port matching `backendRef.port`. Port names are intentionally
+/// not inspected — the K8s API treats name as an operator-facing
+/// label only; `appProtocol` is the standard hint. See
+/// [`map_app_protocol`] for recognized values.
 fn emit_backend(
     snapshot: &mut Snapshot,
     route_ns: &str,
@@ -571,6 +577,14 @@ fn emit_backend(
     if cluster_ip.is_empty() || cluster_ip == "None" {
         return; // headless / unassigned
     }
+    let port_app_protocol = spec
+        .ports
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|p| p.port == port)
+        .and_then(|p| p.app_protocol.as_deref());
+    let protocol = map_app_protocol(port_app_protocol);
     snapshot.backends.insert(
         bk,
         pb::BackendUpsert {
@@ -580,9 +594,27 @@ fn emit_backend(
                 address: cluster_ip.to_string(),
                 port: port.unsigned_abs(),
             }],
-            protocol: pb::BackendProtocol::Http1 as i32,
+            protocol: protocol as i32,
         },
     );
+}
+
+/// Recognized HTTP/2 indicators on `Service.spec.ports[*].appProtocol`.
+///
+/// `kubernetes.io/h2c` is the Kubernetes-registered value;
+/// `h2c` and `grpc` are de-facto conventions used by NGINX, Envoy,
+/// and agent gateway. Any other value — including the websocket
+/// variants `kubernetes.io/ws` / `kubernetes.io/wss` or any custom
+/// `mycompany.com/...` string — maps to HTTP/1.1.
+///
+/// Port `name` is **not** inspected. K8s defines it as a `DNS_LABEL`
+/// with no protocol semantics; if an operator names a port `grpc`
+/// but doesn't set `appProtocol`, we treat it as HTTP/1.1.
+fn map_app_protocol(app_protocol: Option<&str>) -> pb::BackendProtocol {
+    match app_protocol {
+        Some("kubernetes.io/h2c" | "h2c" | "grpc") => pb::BackendProtocol::Http2,
+        _ => pb::BackendProtocol::Http1,
+    }
 }
 
 // ==================== name helpers ====================
@@ -746,6 +778,40 @@ mod tests {
             },
             spec: Some(ServiceSpec {
                 cluster_ip: cluster_ip.map(String::from),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    /// Like `service`, but with explicit ports + per-port appProtocol.
+    /// Used by the `appProtocol` translation tests; pass each port as
+    /// `(port_number, Some("grpc"))` or `(port_number, None)`.
+    fn service_with_ports(
+        ns: &str,
+        name: &str,
+        cluster_ip: Option<&str>,
+        ports: &[(i32, Option<&str>)],
+    ) -> Service {
+        use k8s_openapi::api::core::v1::ServicePort;
+        Service {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                cluster_ip: cluster_ip.map(String::from),
+                ports: Some(
+                    ports
+                        .iter()
+                        .map(|(p, ap)| ServicePort {
+                            port: *p,
+                            app_protocol: ap.map(String::from),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
                 ..Default::default()
             }),
             status: None,
@@ -1467,5 +1533,128 @@ mod tests {
         assert_eq!(m.query_param_matches.len(), 2);
         assert_eq!(m.query_param_matches[0].name, "k");
         assert_eq!(m.query_param_matches[1].name, "K");
+    }
+
+    // ---------- appProtocol → BackendProtocol ----------
+
+    /// Build a state with one route → one backend on `port`,
+    /// where the Service declares `port` with the given
+    /// `app_protocol`. Returns the emitted `BackendUpsert.protocol`
+    /// for assertion.
+    fn translate_app_protocol(app_protocol: Option<&str>, port: i32) -> pb::BackendProtocol {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", port)], vec![])],
+            )],
+            services: vec![service_with_ports(
+                "demo",
+                "svc",
+                Some("10.0.0.1"),
+                &[(port, app_protocol)],
+            )],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let be = s.backends.values().next().expect("one backend emitted");
+        pb::BackendProtocol::try_from(be.protocol).expect("known proto enum")
+    }
+
+    #[test]
+    fn app_protocol_grpc_yields_http2() {
+        assert_eq!(
+            translate_app_protocol(Some("grpc"), 8080),
+            pb::BackendProtocol::Http2
+        );
+    }
+
+    #[test]
+    fn app_protocol_h2c_yields_http2() {
+        assert_eq!(
+            translate_app_protocol(Some("h2c"), 8080),
+            pb::BackendProtocol::Http2
+        );
+    }
+
+    #[test]
+    fn app_protocol_kubernetes_io_h2c_yields_http2() {
+        assert_eq!(
+            translate_app_protocol(Some("kubernetes.io/h2c"), 8080),
+            pb::BackendProtocol::Http2
+        );
+    }
+
+    #[test]
+    fn app_protocol_kubernetes_io_ws_yields_http1() {
+        // Websocket variant is not an HTTP/2 indicator.
+        assert_eq!(
+            translate_app_protocol(Some("kubernetes.io/ws"), 8080),
+            pb::BackendProtocol::Http1
+        );
+    }
+
+    #[test]
+    fn app_protocol_unknown_yields_http1() {
+        assert_eq!(
+            translate_app_protocol(Some("mycompany.com/something"), 8080),
+            pb::BackendProtocol::Http1
+        );
+    }
+
+    #[test]
+    fn no_app_protocol_yields_http1() {
+        // Regression guard: the pre-issue-#4 default behaviour.
+        assert_eq!(
+            translate_app_protocol(None, 8080),
+            pb::BackendProtocol::Http1
+        );
+    }
+
+    #[test]
+    fn route_port_not_declared_on_service_yields_http1_fallback() {
+        // BackendRef references port 9999 but the Service only
+        // declares port 8080. Backend still emits (via ClusterIP);
+        // protocol falls back to HTTP/1.1.
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 9999)], vec![])],
+            )],
+            // Only port 8080 declared, with appProtocol grpc — but
+            // the route points at 9999, so the appProtocol does not
+            // apply.
+            services: vec![service_with_ports(
+                "demo",
+                "svc",
+                Some("10.0.0.1"),
+                &[(8080, Some("grpc"))],
+            )],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let be = s.backends.values().next().expect("backend emitted");
+        assert_eq!(
+            pb::BackendProtocol::try_from(be.protocol).unwrap(),
+            pb::BackendProtocol::Http1,
+            "unmatched port must fall back to H1"
+        );
     }
 }
