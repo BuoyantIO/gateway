@@ -110,3 +110,44 @@ probably misorganized; move the `impl` next to its type.
 - Don't add features, fallbacks, or validation beyond what the master
   doc requires.
 - do not add references in the code that target the architecture file
+
+## Commit policy
+
+- Author is the operator (me). Sign off via `git commit -s`. Never
+  add a `Co-Authored-By` trailer.
+- Commit message is a short imperative subject. No body unless I
+  explicitly ask for one. Match the style of recent commits
+  (`git log --oneline -5`).
+- **Never include any path under `docs/` in a commit.** Docs
+  (issues.md, production-readiness.md, bcloud-readiness.md, plans/,
+  v0-review.md, etc.) evolve out-of-band. Stage code only.
+- Stage files by name. Never use `git add -A` or `git add .`.
+- Never use `--no-verify` or bypass GPG signing
+  (`--no-gpg-sign`, `-c commit.gpgsign=false` is OK only because
+  the repo isn't configured for signing).
+- **Never commit unprompted.** Wait for an explicit "commit"
+  signal — usually `/commit-it`. Implementation steps end with
+  a STOP, not a commit.
+
+## Issue workflow
+
+The issue queue lives in three parallel docs:
+
+- `docs/issues.md` — the lean GitHub-issue-shaped list. Each item
+  is one section starting `## N. <title>`.
+- `docs/production-readiness.md` — detailed scope, acceptance
+  criteria, prior-art notes, list of tests added. Heading shape
+  `### N. <title>`.
+- `docs/bcloud-readiness.md` — same items, bcloud-grounded.
+
+When an issue ships, mark it DONE in all three (use the existing
+DONE entries for #3, #4, #5 as the template).
+
+Trigger phrases:
+
+- `/issue N` — plan + implement + test + sync docs for item N,
+  then STOP.
+- `/commit-it` — commit per the policy above.
+
+For S-sized issues, skip `TaskCreate`. For L-sized issues, use it
+to track multi-step work.
