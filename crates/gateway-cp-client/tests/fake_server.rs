@@ -148,6 +148,9 @@ fn route_upsert(bind: &str, listener: &str, name: &str, backend: &str) -> pb::Up
                     kind: pb::PathMatchKind::PathPrefix as i32,
                     value: "/".into(),
                 }),
+                method: pb::HttpMethod::Unspecified as i32,
+                header_matches: vec![],
+                query_param_matches: vec![],
             }],
             backend_refs: vec![pb::BackendRef {
                 name: backend.into(),

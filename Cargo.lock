@@ -652,7 +652,10 @@ dependencies = [
 name = "gateway-config"
 version = "0.0.0"
 dependencies = [
+ "http",
+ "regex",
  "serde",
+ "serde_regex",
  "serde_yaml",
  "thiserror",
 ]
@@ -685,7 +688,9 @@ dependencies = [
  "gateway-config",
  "gateway-cp-proto",
  "gateway-state",
+ "http",
  "rand",
+ "regex",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -708,6 +713,7 @@ name = "gateway-runtime"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "form_urlencoded",
  "gateway-config",
  "gateway-state",
  "http",
@@ -716,6 +722,7 @@ dependencies = [
  "hyper-util",
  "parking_lot",
  "rand",
+ "regex",
  "thiserror",
  "tokio",
  "tracing",
@@ -729,6 +736,7 @@ dependencies = [
  "parking_lot",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1906,6 +1914,16 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_regex"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bafc8d0c5330cecff10f16b459b479fd9acaa5b4acd7167301414e21b0057012"
+dependencies = [
+ "regex",
+ "serde",
 ]
 
 [[package]]

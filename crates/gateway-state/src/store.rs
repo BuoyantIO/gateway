@@ -66,6 +66,9 @@ struct Inner {
     /// HTTP listeners whose preconditions are NOT currently met.
     pending_listeners: HashMap<ListenerKey, HttpListener>,
     /// HTTP routes whose preconditions are NOT currently met.
+    /// The route's matches are already typed and pre-compiled — the
+    /// values inside `HttpRoute` are parsed at YAML/proto
+    /// deserialization time, no per-apply or per-request compile.
     pending_routes: HashMap<RouteKey, HttpRoute>,
 
     /// Resolved bind graph that readers walk.
@@ -852,6 +855,9 @@ mod tests {
                     kind: PathMatchKind::PathPrefix,
                     value: path_prefix.into(),
                 },
+                method: None,
+                headers: vec![],
+                query_params: vec![],
             }],
             backend_refs: backends
                 .iter()
@@ -1066,6 +1072,8 @@ mod tests {
         b.listeners.push(Listener::Http(HttpListener {
             name: "l".into(),
             hostname: Some("svc.local".into()),
+            // Same shape as the public API now — config and store
+            // share `HttpRoute`.
             routes: vec![http_route("r", "/", &["be"])],
         }));
         store.upsert_bind(b).unwrap();
@@ -1236,6 +1244,9 @@ mod tests {
                     kind: PathMatchKind::PathPrefix,
                     value: "/".into(),
                 },
+                method: None,
+                headers: vec![],
+                query_params: vec![],
             }],
             backend_refs: vec![BackendRef {
                 name: "be".into(),

@@ -13,7 +13,10 @@ use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, St
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
 use gateway_config::listener::{HttpListener, Listener};
-use gateway_config::route::{HttpMatch, HttpRoute, PathMatch, PathMatchKind};
+use gateway_config::route::{
+    HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, PathMatchKind, QueryParamMatch,
+    QueryValueMatch,
+};
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
 
@@ -67,8 +70,10 @@ pub fn listener(msg: pb::ListenerUpsert) -> Result<(BindKey, Listener), Error> {
 
 /// # Errors
 /// Returns [`Error::MissingField`] if `key` or any match's `path` is
-/// unset, or [`Error::UnsupportedEnum`] if a path match `kind` is not
-/// `PATH_PREFIX`.
+/// unset, [`Error::UnsupportedEnum`] for an unrecognized path match
+/// kind or HTTP method, [`Error::InvalidHeaderName`] /
+/// [`Error::InvalidHeaderValue`] / [`Error::InvalidRegex`] if a
+/// match value fails to parse / compile.
 pub fn http_route(msg: pb::HttpRouteUpsert) -> Result<(ListenerKey, HttpRoute), Error> {
     let key = msg.key.ok_or(Error::MissingField("HttpRouteUpsert.key"))?;
     let parent = ListenerKey::new(BindKey::new(key.bind), key.listener);
@@ -77,13 +82,15 @@ pub fn http_route(msg: pb::HttpRouteUpsert) -> Result<(ListenerKey, HttpRoute), 
     let backend_refs: Vec<BackendRef> = msg.backend_refs.into_iter().map(backend_ref).collect();
     let filters: Vec<HttpFilter> = msg.filters.into_iter().filter_map(http_filter).collect();
 
-    let route = HttpRoute {
-        name: key.name,
-        matches: matches?,
-        backend_refs,
-        filters,
-    };
-    Ok((parent, route))
+    Ok((
+        parent,
+        HttpRoute {
+            name: key.name,
+            matches: matches?,
+            backend_refs,
+            filters,
+        },
+    ))
 }
 
 /// # Errors
@@ -127,7 +134,88 @@ fn http_match(msg: pb::HttpMatch) -> Result<HttpMatch, Error> {
     let host = if msg.has_host { Some(msg.host) } else { None };
     let path_msg = msg.path.ok_or(Error::MissingField("HttpMatch.path"))?;
     let path = path_match(path_msg)?;
-    Ok(HttpMatch { host, path })
+    let method = http_method(msg.method)?;
+    let headers: Result<Vec<HeaderMatch>, Error> =
+        msg.header_matches.into_iter().map(header_match).collect();
+    let query_params: Result<Vec<QueryParamMatch>, Error> = msg
+        .query_param_matches
+        .into_iter()
+        .map(query_param_match)
+        .collect();
+    Ok(HttpMatch {
+        host,
+        path,
+        method,
+        headers: headers?,
+        query_params: query_params?,
+    })
+}
+
+fn http_method(value: i32) -> Result<Option<http::Method>, Error> {
+    match pb::HttpMethod::try_from(value) {
+        Ok(pb::HttpMethod::Unspecified) => Ok(None),
+        Ok(pb::HttpMethod::Get) => Ok(Some(http::Method::GET)),
+        Ok(pb::HttpMethod::Head) => Ok(Some(http::Method::HEAD)),
+        Ok(pb::HttpMethod::Post) => Ok(Some(http::Method::POST)),
+        Ok(pb::HttpMethod::Put) => Ok(Some(http::Method::PUT)),
+        Ok(pb::HttpMethod::Delete) => Ok(Some(http::Method::DELETE)),
+        Ok(pb::HttpMethod::Connect) => Ok(Some(http::Method::CONNECT)),
+        Ok(pb::HttpMethod::Options) => Ok(Some(http::Method::OPTIONS)),
+        Ok(pb::HttpMethod::Trace) => Ok(Some(http::Method::TRACE)),
+        Ok(pb::HttpMethod::Patch) => Ok(Some(http::Method::PATCH)),
+        Err(_) => Err(Error::UnsupportedEnum {
+            kind: "HttpMethod",
+            value,
+        }),
+    }
+}
+
+fn header_match(msg: pb::HeaderMatch) -> Result<HeaderMatch, Error> {
+    let name = http::HeaderName::from_bytes(msg.name.as_bytes()).map_err(|source| {
+        Error::InvalidHeaderName {
+            name: msg.name.clone(),
+            source,
+        }
+    })?;
+    let raw = msg.value.ok_or(Error::MissingField("HeaderMatch.value"))?;
+    let value = match raw {
+        pb::header_match::Value::Exact(s) => {
+            let v =
+                http::HeaderValue::try_from(&s).map_err(|source| Error::InvalidHeaderValue {
+                    value: s.clone(),
+                    source,
+                })?;
+            HeaderValueMatch::Exact { value: v }
+        }
+        pb::header_match::Value::Regex(pat) => {
+            let re = regex::Regex::new(&pat).map_err(|source| Error::InvalidRegex {
+                pattern: pat.clone(),
+                source,
+            })?;
+            HeaderValueMatch::Regex { value: re }
+        }
+    };
+    Ok(HeaderMatch { name, value })
+}
+
+fn query_param_match(msg: pb::QueryParamMatch) -> Result<QueryParamMatch, Error> {
+    let raw = msg
+        .value
+        .ok_or(Error::MissingField("QueryParamMatch.value"))?;
+    let value = match raw {
+        pb::query_param_match::Value::Exact(s) => QueryValueMatch::Exact { value: s },
+        pb::query_param_match::Value::Regex(pat) => {
+            let re = regex::Regex::new(&pat).map_err(|source| Error::InvalidRegex {
+                pattern: pat.clone(),
+                source,
+            })?;
+            QueryValueMatch::Regex { value: re }
+        }
+    };
+    Ok(QueryParamMatch {
+        name: msg.name,
+        value,
+    })
 }
 
 fn path_match(msg: pb::PathMatch) -> Result<PathMatch, Error> {
@@ -258,5 +346,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn pb_match_with(
+        method: pb::HttpMethod,
+        headers: Vec<pb::HeaderMatch>,
+        query_params: Vec<pb::QueryParamMatch>,
+    ) -> pb::HttpMatch {
+        pb::HttpMatch {
+            host: String::new(),
+            has_host: false,
+            path: Some(pb::PathMatch {
+                kind: pb::PathMatchKind::PathPrefix as i32,
+                value: "/".into(),
+            }),
+            method: method as i32,
+            header_matches: headers,
+            query_param_matches: query_params,
+        }
+    }
+
+    #[test]
+    fn method_round_trips_through_http_match() {
+        let m = http_match(pb_match_with(pb::HttpMethod::Post, vec![], vec![])).unwrap();
+        assert_eq!(m.method, Some(http::Method::POST));
+    }
+
+    #[test]
+    fn method_unspecified_yields_none() {
+        let m = http_match(pb_match_with(pb::HttpMethod::Unspecified, vec![], vec![])).unwrap();
+        assert!(m.method.is_none());
+    }
+
+    #[test]
+    fn header_match_exact_round_trips() {
+        let m = http_match(pb_match_with(
+            pb::HttpMethod::Unspecified,
+            vec![pb::HeaderMatch {
+                name: "x-debug".into(),
+                value: Some(pb::header_match::Value::Exact("1".into())),
+            }],
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(m.headers.len(), 1);
+        assert_eq!(m.headers[0].name.as_str(), "x-debug");
+        assert!(matches!(m.headers[0].value, HeaderValueMatch::Exact { .. }));
+    }
+
+    #[test]
+    fn header_match_regex_round_trips() {
+        let m = http_match(pb_match_with(
+            pb::HttpMethod::Unspecified,
+            vec![pb::HeaderMatch {
+                name: "x-version".into(),
+                value: Some(pb::header_match::Value::Regex(r"^v\d+$".into())),
+            }],
+            vec![],
+        ))
+        .unwrap();
+        assert!(matches!(m.headers[0].value, HeaderValueMatch::Regex { .. }));
+    }
+
+    #[test]
+    fn header_match_missing_value_oneof_rejected() {
+        let err = http_match(pb_match_with(
+            pb::HttpMethod::Unspecified,
+            vec![pb::HeaderMatch {
+                name: "x".into(),
+                value: None,
+            }],
+            vec![],
+        ))
+        .expect_err("must fail");
+        assert!(matches!(err, Error::MissingField("HeaderMatch.value")));
+    }
+
+    #[test]
+    fn header_match_invalid_regex_rejected() {
+        let bad = pb::HttpRouteUpsert {
+            key: Some(pb::RouteKey {
+                bind: "b".into(),
+                listener: "l".into(),
+                name: "r".into(),
+            }),
+            matches: vec![pb_match_with(
+                pb::HttpMethod::Unspecified,
+                vec![pb::HeaderMatch {
+                    name: "x".into(),
+                    value: Some(pb::header_match::Value::Regex("[".into())),
+                }],
+                vec![],
+            )],
+            backend_refs: vec![],
+            filters: vec![],
+        };
+        let err = http_route(bad).expect_err("must fail");
+        assert!(matches!(err, Error::InvalidRegex { .. }));
+    }
+
+    #[test]
+    fn header_match_invalid_name_rejected() {
+        let bad = pb::HttpRouteUpsert {
+            key: Some(pb::RouteKey {
+                bind: "b".into(),
+                listener: "l".into(),
+                name: "r".into(),
+            }),
+            matches: vec![pb_match_with(
+                pb::HttpMethod::Unspecified,
+                vec![pb::HeaderMatch {
+                    name: "bad name".into(),
+                    value: Some(pb::header_match::Value::Exact("v".into())),
+                }],
+                vec![],
+            )],
+            backend_refs: vec![],
+            filters: vec![],
+        };
+        let err = http_route(bad).expect_err("must fail");
+        assert!(matches!(err, Error::InvalidHeaderName { .. }));
     }
 }

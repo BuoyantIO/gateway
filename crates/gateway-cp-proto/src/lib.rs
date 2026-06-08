@@ -75,6 +75,9 @@ mod tests {
                     kind: v1::PathMatchKind::PathPrefix as i32,
                     value: "/api".into(),
                 }),
+                method: v1::HttpMethod::Unspecified as i32,
+                header_matches: vec![],
+                query_param_matches: vec![],
             }],
             backend_refs: vec![v1::BackendRef {
                 name: "demo/api-svc:8080".into(),

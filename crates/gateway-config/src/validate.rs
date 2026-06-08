@@ -8,7 +8,7 @@ use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::filter::{HttpFilter, RequestHeaderOps};
 use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
-use crate::route::{HttpRoute, PathMatchKind, TcpRoute, TlsRoute};
+use crate::route::{HttpMatch, HttpRoute, PathMatchKind, QueryParamMatch, TcpRoute, TlsRoute};
 
 #[derive(Debug, Error)]
 #[error("{key}: {reason}")]
@@ -40,6 +40,11 @@ pub enum RejectionReason {
     StaticBackendNoEndpoints,
     #[error("TCP listener must have exactly one route, found {0}")]
     TcpListenerRouteCount(usize),
+    /// A query-param match has an empty `name`. (Header-match
+    /// names are `http::HeaderName` and rejected at deserialization
+    /// time — empty / malformed names can't reach validation.)
+    #[error("query param match `name` must not be empty")]
+    EmptyQueryParamName,
 }
 
 impl fmt::Display for BindProtocol {
@@ -220,18 +225,7 @@ fn validate_tcp_route(key: &str, route: &TcpRoute, out: &mut Vec<Rejection>) {
 
 fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
     for (i, m) in route.matches.iter().enumerate() {
-        match m.path.kind {
-            // Both PathPrefix and Exact require an absolute path per
-            // Gateway API.
-            PathMatchKind::PathPrefix | PathMatchKind::Exact => {
-                if !m.path.value.starts_with('/') {
-                    out.push(Rejection {
-                        key: format!("{key}/matches[{i}]/path"),
-                        reason: RejectionReason::PathNotSlash(m.path.value.clone()),
-                    });
-                }
-            }
-        }
+        validate_http_match(&format!("{key}/matches[{i}]"), m, out);
     }
     check_unique(
         &format!("{key}/filters"),
@@ -246,6 +240,37 @@ fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
                 validate_request_header_ops(&format!("{key}/filters[{i}]"), request_headers, out);
             }
         }
+    }
+}
+
+fn validate_http_match(key: &str, m: &HttpMatch, out: &mut Vec<Rejection>) {
+    match m.path.kind {
+        // Both PathPrefix and Exact require an absolute path per
+        // Gateway API.
+        PathMatchKind::PathPrefix | PathMatchKind::Exact => {
+            if !m.path.value.starts_with('/') {
+                out.push(Rejection {
+                    key: format!("{key}/path"),
+                    reason: RejectionReason::PathNotSlash(m.path.value.clone()),
+                });
+            }
+        }
+    }
+    // Header name/value and regex validity are enforced at
+    // deserialization time by the typed match shapes — nothing to
+    // re-check here. Query-param names are `String` so check
+    // emptiness manually.
+    for (i, q) in m.query_params.iter().enumerate() {
+        validate_query_param_match(&format!("{key}/queryParams[{i}]"), q, out);
+    }
+}
+
+fn validate_query_param_match(key: &str, q: &QueryParamMatch, out: &mut Vec<Rejection>) {
+    if q.name.is_empty() {
+        out.push(Rejection {
+            key: format!("{key}/name"),
+            reason: RejectionReason::EmptyQueryParamName,
+        });
     }
 }
 
@@ -652,6 +677,120 @@ gatewayConfig:
 ",
         );
         validate(&cfg).expect("listener names are scoped to their parent bind");
+    }
+
+    #[test]
+    fn header_match_invalid_name_rejected_at_parse_time() {
+        // Invalid header names are caught by the deserializer (via
+        // `http::HeaderName::from_bytes`), not by `validate()`.
+        let err = crate::parse_yaml(
+            r#"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches:
+                - path: { type: PathPrefix, value: / }
+                  headers:
+                    - { name: "bad name", value: { type: Exact, value: v } }
+              backendRefs: [{ name: be }]
+"#,
+        )
+        .expect_err("invalid header name should fail YAML parse");
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid HTTP header name"), "got: {msg}");
+    }
+
+    #[test]
+    fn header_match_invalid_regex_rejected_at_parse_time() {
+        // Invalid regexes are caught by `serde_regex` at deserialize.
+        let err = crate::parse_yaml(
+            r#"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches:
+                - path: { type: PathPrefix, value: / }
+                  headers:
+                    - { name: x-id, value: { type: Regex, value: "[" } }
+              backendRefs: [{ name: be }]
+"#,
+        )
+        .expect_err("invalid regex should fail YAML parse");
+        let _ = format!("{err}"); // shape varies; existence is the assertion
+    }
+
+    #[test]
+    fn query_param_empty_name_rejected() {
+        let cfg = parse(
+            r#"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches:
+                - path: { type: PathPrefix, value: / }
+                  queryParams:
+                    - { name: "", value: { type: Exact, value: v } }
+              backendRefs: [{ name: be }]
+"#,
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::EmptyQueryParamName))
+        );
+    }
+
+    #[test]
+    fn method_and_headers_valid_config_accepted() {
+        let cfg = parse(
+            r#"
+gatewayConfig:
+  name: g
+  binds:
+    - name: b
+      port: 80
+      bindProtocol: HTTP
+      listeners:
+        - name: l
+          listenerProtocol: HTTP
+          routes:
+            - name: r
+              matches:
+                - path: { type: PathPrefix, value: / }
+                  method: GET
+                  headers:
+                    - { name: x-debug, value: { type: Exact, value: "1" } }
+                    - { name: x-version, value: { type: Regex, value: "^v\\d+$" } }
+                  queryParams:
+                    - { name: preview, value: { type: Exact, value: "true" } }
+              backendRefs: [{ name: be }]
+"#,
+        );
+        validate(&cfg).expect("valid config with all match dims should accept");
     }
 
     #[test]

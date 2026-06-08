@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::listener::Listener;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bind {
     pub name: String,

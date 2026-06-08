@@ -14,6 +14,27 @@ pub enum Error {
     #[error("unsupported {kind} enum value: {value}")]
     UnsupportedEnum { kind: &'static str, value: i32 },
 
+    #[error("invalid header name `{name}`: {source}")]
+    InvalidHeaderName {
+        name: String,
+        #[source]
+        source: http::header::InvalidHeaderName,
+    },
+
+    #[error("invalid header value `{value}`: {source}")]
+    InvalidHeaderValue {
+        value: String,
+        #[source]
+        source: http::header::InvalidHeaderValue,
+    },
+
+    #[error("invalid regex `{pattern}`: {source}")]
+    InvalidRegex {
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
+
     #[error(transparent)]
     Store(#[from] gateway_state::StoreError),
 

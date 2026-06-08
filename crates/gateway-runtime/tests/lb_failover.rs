@@ -109,6 +109,9 @@ fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
                             kind: PathMatchKind::PathPrefix,
                             value: "/".into(),
                         },
+                        method: None,
+                        headers: vec![],
+                        query_params: vec![],
                     }],
                     backend_refs: vec![BackendRef {
                         name: "be".into(),

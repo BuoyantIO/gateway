@@ -11,7 +11,9 @@ use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesMatches,
-    HttpRouteRulesMatchesPathType,
+    HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
+    HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
+    HttpRouteRulesMatchesQueryParamsType,
 };
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
@@ -254,6 +256,9 @@ fn emit_routes_under_listener(
                         host: host.clone(),
                         has_host: true,
                         path: m.path.clone(),
+                        method: m.method,
+                        header_matches: m.header_matches.clone(),
+                        query_param_matches: m.query_param_matches.clone(),
                     })
                 })
                 .collect()
@@ -357,9 +362,12 @@ fn wildcard_covers(pattern_suffix: &str, host: &str) -> bool {
     !prefix.is_empty()
 }
 
-/// v0: path only. `method` / `headers` / `queryParams` matches are
-/// dropped with a warn — the parent route still ships, just with
-/// reduced specificity.
+/// Translate one `HttpRouteRulesMatches` to the proto. Path,
+/// method, headers, and queryParams are all carried; `RegularExpression`
+/// path is not yet implemented and drops the entire match with a
+/// warn. Header names are deduplicated case-insensitively (first
+/// occurrence wins) and query keys case-sensitively, per Gateway
+/// API spec.
 fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
     // Path defaults to `PathPrefix /` if unset, per Gateway API spec.
     let path = m.path.as_ref();
@@ -376,8 +384,6 @@ fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
                     pb::PathMatchKind::PathPrefix
                 }
                 Some(HttpRouteRulesMatchesPathType::Exact) => pb::PathMatchKind::Exact,
-                // TODO(issue #3): support RegularExpression behind a
-                // Cargo feature flag once broader match-type work lands.
                 Some(HttpRouteRulesMatchesPathType::RegularExpression) => {
                     tracing::warn!("skipping RegularExpression path match: not yet supported");
                     return None;
@@ -389,11 +395,95 @@ fn translate_match(m: &HttpRouteRulesMatches) -> Option<pb::HttpMatch> {
             }
         }
     };
+    let method = translate_method(m.method.as_ref());
+    let header_matches = m
+        .headers
+        .as_deref()
+        .map(translate_header_matches)
+        .unwrap_or_default();
+    let query_param_matches = m
+        .query_params
+        .as_deref()
+        .map(translate_query_param_matches)
+        .unwrap_or_default();
     Some(pb::HttpMatch {
         host: String::new(),
         has_host: false,
         path: Some(path_msg),
+        method: method as i32,
+        header_matches,
+        query_param_matches,
     })
+}
+
+fn translate_method(m: Option<&HttpRouteRulesMatchesMethod>) -> pb::HttpMethod {
+    match m {
+        None => pb::HttpMethod::Unspecified,
+        Some(HttpRouteRulesMatchesMethod::Get) => pb::HttpMethod::Get,
+        Some(HttpRouteRulesMatchesMethod::Head) => pb::HttpMethod::Head,
+        Some(HttpRouteRulesMatchesMethod::Post) => pb::HttpMethod::Post,
+        Some(HttpRouteRulesMatchesMethod::Put) => pb::HttpMethod::Put,
+        Some(HttpRouteRulesMatchesMethod::Delete) => pb::HttpMethod::Delete,
+        Some(HttpRouteRulesMatchesMethod::Connect) => pb::HttpMethod::Connect,
+        Some(HttpRouteRulesMatchesMethod::Options) => pb::HttpMethod::Options,
+        Some(HttpRouteRulesMatchesMethod::Trace) => pb::HttpMethod::Trace,
+        Some(HttpRouteRulesMatchesMethod::Patch) => pb::HttpMethod::Patch,
+    }
+}
+
+/// Dedup header matches by lowercase name (Gateway API "first entry
+/// wins" rule for repeated header names) and emit proto messages.
+fn translate_header_matches(headers: &[HttpRouteRulesMatchesHeaders]) -> Vec<pb::HeaderMatch> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(headers.len());
+    for h in headers {
+        let key = h.name.to_ascii_lowercase();
+        if !seen.insert(key) {
+            tracing::warn!(name = %h.name, "skipping duplicate header match name");
+            continue;
+        }
+        let value = match h.r#type {
+            None | Some(HttpRouteRulesMatchesHeadersType::Exact) => {
+                pb::header_match::Value::Exact(h.value.clone())
+            }
+            Some(HttpRouteRulesMatchesHeadersType::RegularExpression) => {
+                pb::header_match::Value::Regex(h.value.clone())
+            }
+        };
+        out.push(pb::HeaderMatch {
+            name: h.name.clone(),
+            value: Some(value),
+        });
+    }
+    out
+}
+
+/// Dedup query param matches by name (case-sensitive, per Gateway
+/// API) and emit proto messages.
+fn translate_query_param_matches(
+    qs: &[HttpRouteRulesMatchesQueryParams],
+) -> Vec<pb::QueryParamMatch> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(qs.len());
+    for q in qs {
+        if !seen.insert(q.name.clone()) {
+            tracing::warn!(name = %q.name, "skipping duplicate query param match name");
+            continue;
+        }
+        let value = match q.r#type {
+            None | Some(HttpRouteRulesMatchesQueryParamsType::Exact) => {
+                pb::query_param_match::Value::Exact(q.value.clone())
+            }
+            Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression) => {
+                pb::query_param_match::Value::Regex(q.value.clone())
+            }
+        };
+        out.push(pb::QueryParamMatch {
+            name: q.name.clone(),
+            value: Some(value),
+        });
+    }
+    out
 }
 
 fn translate_backend_ref(br: &HttpRouteRulesBackendRefs, route_ns: &str) -> Option<pb::BackendRef> {
@@ -1180,5 +1270,202 @@ mod tests {
         let path = route.matches[0].path.as_ref().expect("path set");
         assert_eq!(path.kind, pb::PathMatchKind::Exact as i32);
         assert_eq!(path.value, "/manifest.json");
+    }
+
+    // ---------- method / headers / queryParams ----------
+
+    use gateway_api::apis::standard::httproutes::{
+        HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
+        HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParams,
+        HttpRouteRulesMatchesQueryParamsType,
+    };
+
+    fn match_full(
+        path: Option<&str>,
+        method: Option<HttpRouteRulesMatchesMethod>,
+        headers: Vec<HttpRouteRulesMatchesHeaders>,
+        query_params: Vec<HttpRouteRulesMatchesQueryParams>,
+    ) -> HttpRouteRulesMatches {
+        HttpRouteRulesMatches {
+            path: path.map(path_prefix),
+            method,
+            headers: if headers.is_empty() {
+                None
+            } else {
+                Some(headers)
+            },
+            query_params: if query_params.is_empty() {
+                None
+            } else {
+                Some(query_params)
+            },
+        }
+    }
+
+    fn header_exact(name: &str, value: &str) -> HttpRouteRulesMatchesHeaders {
+        HttpRouteRulesMatchesHeaders {
+            name: name.into(),
+            r#type: Some(HttpRouteRulesMatchesHeadersType::Exact),
+            value: value.into(),
+        }
+    }
+
+    fn header_regex(name: &str, value: &str) -> HttpRouteRulesMatchesHeaders {
+        HttpRouteRulesMatchesHeaders {
+            name: name.into(),
+            r#type: Some(HttpRouteRulesMatchesHeadersType::RegularExpression),
+            value: value.into(),
+        }
+    }
+
+    fn qp_exact(name: &str, value: &str) -> HttpRouteRulesMatchesQueryParams {
+        HttpRouteRulesMatchesQueryParams {
+            name: name.into(),
+            r#type: Some(HttpRouteRulesMatchesQueryParamsType::Exact),
+            value: value.into(),
+        }
+    }
+
+    fn qp_regex(name: &str, value: &str) -> HttpRouteRulesMatchesQueryParams {
+        HttpRouteRulesMatchesQueryParams {
+            name: name.into(),
+            r#type: Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression),
+            value: value.into(),
+        }
+    }
+
+    fn route_with_match(m: HttpRouteRulesMatches) -> HttpRouteRules {
+        HttpRouteRules {
+            matches: Some(vec![m]),
+            backend_refs: Some(vec![backend_ref("svc", 8080)]),
+            filters: Some(vec![]),
+            name: None,
+            timeouts: None,
+        }
+    }
+
+    fn single_route_state(m: HttpRouteRulesMatches) -> K8sState {
+        K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![route_with_match(m)],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        }
+    }
+
+    #[test]
+    fn method_match_translated_to_proto_enum() {
+        let state = single_route_state(match_full(
+            Some("/"),
+            Some(HttpRouteRulesMatchesMethod::Post),
+            vec![],
+            vec![],
+        ));
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let m = &s.routes.values().next().unwrap().matches[0];
+        assert_eq!(m.method, pb::HttpMethod::Post as i32);
+    }
+
+    #[test]
+    fn header_match_exact_and_regex_translated() {
+        let state = single_route_state(match_full(
+            Some("/"),
+            None,
+            vec![
+                header_exact("x-feature", "on"),
+                header_regex("x-version", r"^v\d+$"),
+            ],
+            vec![],
+        ));
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let m = &s.routes.values().next().unwrap().matches[0];
+        assert_eq!(m.header_matches.len(), 2);
+        assert_eq!(m.header_matches[0].name, "x-feature");
+        assert!(matches!(
+            m.header_matches[0].value,
+            Some(pb::header_match::Value::Exact(_))
+        ));
+        assert!(matches!(
+            m.header_matches[1].value,
+            Some(pb::header_match::Value::Regex(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_header_name_case_insensitive_first_wins() {
+        // "X-Debug" and "x-debug" must collapse to one entry, keeping
+        // the first.
+        let state = single_route_state(match_full(
+            Some("/"),
+            None,
+            vec![
+                header_exact("X-Debug", "1"),
+                header_exact("x-debug", "2"),
+                header_exact("y-Other", "z"),
+            ],
+            vec![],
+        ));
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let m = &s.routes.values().next().unwrap().matches[0];
+        assert_eq!(m.header_matches.len(), 2);
+        assert_eq!(m.header_matches[0].name, "X-Debug");
+        assert!(matches!(
+            &m.header_matches[0].value,
+            Some(pb::header_match::Value::Exact(v)) if v == "1"
+        ));
+        assert_eq!(m.header_matches[1].name, "y-Other");
+    }
+
+    #[test]
+    fn query_param_match_translated() {
+        let state = single_route_state(match_full(
+            Some("/"),
+            None,
+            vec![],
+            vec![qp_exact("preview", "true"), qp_regex("v", r"^v\d+$")],
+        ));
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let m = &s.routes.values().next().unwrap().matches[0];
+        assert_eq!(m.query_param_matches.len(), 2);
+        assert!(matches!(
+            m.query_param_matches[0].value,
+            Some(pb::query_param_match::Value::Exact(_))
+        ));
+        assert!(matches!(
+            m.query_param_matches[1].value,
+            Some(pb::query_param_match::Value::Regex(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_query_param_name_case_sensitive_first_wins() {
+        // Query keys are case-sensitive; `K` and `k` are NOT
+        // duplicates. `k` repeated IS a duplicate.
+        let state = single_route_state(match_full(
+            Some("/"),
+            None,
+            vec![],
+            vec![qp_exact("k", "1"), qp_exact("k", "2"), qp_exact("K", "3")],
+        ));
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let m = &s.routes.values().next().unwrap().matches[0];
+        assert_eq!(m.query_param_matches.len(), 2);
+        assert_eq!(m.query_param_matches[0].name, "k");
+        assert_eq!(m.query_param_matches[1].name, "K");
     }
 }

@@ -20,9 +20,12 @@ use std::time::Instant;
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::filter::{HeaderPair, HttpFilter as HttpFilterConfig, RequestHeaderOps};
-use gateway_config::route::{HttpMatch, PathMatch, PathMatchKind};
+use gateway_config::route::{
+    HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, PathMatchKind, QueryParamMatch,
+    QueryValueMatch,
+};
 use gateway_state::{ActiveBackend, ActiveHttpListener, ActiveHttpRoute, BindKey, Store};
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -200,10 +203,22 @@ async fn serve_request(
     client: HttpClient,
     req: Request<Incoming>,
 ) -> Response<ResponseBody> {
-    let host = host_from_request(&req).map(str::to_owned);
+    let host_owned = host_from_request(&req).map(str::to_owned);
+    let host_stripped = host_owned.as_deref().map(strip_port).map(str::to_owned);
     let path = req.uri().path().to_owned();
+    let query = req.uri().query().map(str::to_owned);
+    let method = req.method().clone();
+    let headers = req.headers().clone();
 
-    let resolved = match resolve_http_route(&store, &bind_key, host.as_deref(), &path) {
+    let ctx = MatchContext {
+        host: host_stripped.as_deref(),
+        path: &path,
+        method: &method,
+        headers: &headers,
+        query: query.as_deref(),
+    };
+
+    let resolved = match resolve_http_route(&store, &bind_key, &ctx) {
         Ok(r) => r,
         Err(e) => return synthesize_error(e),
     };
@@ -245,28 +260,77 @@ struct ResolvedRoute {
     route_name: String,
 }
 
+/// Borrow-struct carrying everything route resolution reads from the
+/// incoming request. Built once per request in `serve_request` and
+/// passed by reference through the match helpers.
+pub(crate) struct MatchContext<'a> {
+    pub host: Option<&'a str>,
+    pub path: &'a str,
+    pub method: &'a Method,
+    pub headers: &'a http::HeaderMap,
+    pub query: Option<&'a str>,
+}
+
+/// Per-request match summary. The `Ord` impl encodes Gateway API
+/// precedence: path-match (Exact > Prefix; then length) wins first,
+/// then method-match presence, then header-match count, then
+/// query-param-match count.
+///
+/// The field order of this struct is load-bearing for derived
+/// `PartialOrd` / `Ord`: comparisons walk fields in declaration order.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RequestMatch {
+    /// Variant order in `PathSummary` is load-bearing: `Prefix <
+    /// Exact`, then within each, longer wins.
+    path: PathSummary,
+    /// Whether a method match was specified AND matched.
+    method: bool,
+    /// Count of header-match entries that matched (all must match for
+    /// the rule to be a candidate).
+    headers: usize,
+    /// Count of query-param-match entries that matched.
+    query_params: usize,
+}
+
+/// Summarized path match. Order: `Prefix(_) < Exact(_)` regardless of
+/// length; within a variant, longer wins. Fixes the `usize::MAX`
+/// hack from issue #2.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PathSummary {
+    Prefix(usize),
+    Exact(usize),
+}
+
+impl PathSummary {
+    /// Build from `score_path`-style raw output. Returns `None` when
+    /// no path entry matched.
+    fn from_match(pm: &PathMatch, path: &str) -> Option<Self> {
+        let len = score_path(pm, path)?;
+        match pm.kind {
+            PathMatchKind::PathPrefix => Some(Self::Prefix(len)),
+            PathMatchKind::Exact => Some(Self::Exact(len)),
+        }
+    }
+}
+
 /// Walk `bind → listeners → routes` and pick:
 ///  1. the HTTP listener whose `hostname` matches the request `Host` /
 ///     `:authority` (exact host preferred over the empty-host catch-all);
-///  2. the route under that listener with the longest matching path
-///     prefix (tiebreak by route name order, which the store sorts at
-///     placement time).
+///  2. the route under that listener whose match summary ranks highest
+///     per Gateway API precedence (tiebreak by route name order, which
+///     the store sorts at placement time).
 fn resolve_http_route(
     store: &Store,
     bind_key: &BindKey,
-    host: Option<&str>,
-    path: &str,
+    ctx: &MatchContext<'_>,
 ) -> Result<ResolvedRoute, RouteResolveError> {
     let read = store.read();
     let bind = read.bind(bind_key).ok_or(RouteResolveError::BindGone)?;
 
-    let host_only = host.map(strip_port);
-
     let listener =
-        pick_http_listener(&bind.listeners, host_only).ok_or(RouteResolveError::NoListener)?;
+        pick_http_listener(&bind.listeners, ctx.host).ok_or(RouteResolveError::NoListener)?;
 
-    let chosen =
-        pick_http_route(&listener.routes, host_only, path).ok_or(RouteResolveError::NoRoute)?;
+    let chosen = pick_http_route(&listener.routes, ctx).ok_or(RouteResolveError::NoRoute)?;
 
     let backend_ref = chosen
         .backends
@@ -305,34 +369,70 @@ fn pick_http_listener<'a>(
 
 fn pick_http_route<'a>(
     routes: &'a [Arc<ActiveHttpRoute>],
-    host: Option<&str>,
-    path: &str,
+    ctx: &MatchContext<'_>,
 ) -> Option<&'a Arc<ActiveHttpRoute>> {
-    let mut best: Option<(usize, &Arc<ActiveHttpRoute>)> = None;
+    let mut best: Option<(RequestMatch, &Arc<ActiveHttpRoute>)> = None;
     for r in routes {
-        if let Some(len) = best_match_score(&r.matches, host, path) {
-            match best {
-                Some((cur, _)) if len <= cur => {}
-                _ => best = Some((len, r)),
+        if let Some(summary) = best_match_summary(&r.matches, ctx) {
+            match &best {
+                Some((cur, _)) if &summary <= cur => {}
+                _ => best = Some((summary, r)),
             }
         }
     }
     best.map(|(_, r)| r)
 }
 
-/// Return the longest matching path-prefix length across all of a
-/// route's `HttpMatch` entries; `None` if no entry matches.
-fn best_match_score(matches: &[HttpMatch], host: Option<&str>, path: &str) -> Option<usize> {
-    let mut best: Option<usize> = None;
+/// Return the highest-ranking `RequestMatch` across a route's match
+/// entries; `None` if no entry matches. A match entry fails the rule
+/// on any single dimension miss (host / method / header / query
+/// param / path), so we evaluate all dimensions before computing the
+/// path summary.
+fn best_match_summary(matches: &[HttpMatch], ctx: &MatchContext<'_>) -> Option<RequestMatch> {
+    let mut best: Option<RequestMatch> = None;
     for m in matches {
+        // Host filter (from HTTPRoute.hostnames fan-out).
         if let Some(want) = m.host.as_deref() {
-            match host {
+            match ctx.host {
                 Some(got) if hostname_matches(want, got) => {}
                 _ => continue,
             }
         }
-        if let Some(len) = score_path(&m.path, path) {
-            best = Some(best.map_or(len, |cur| cur.max(len)));
+        // Method.
+        let method_matched = match &m.method {
+            Some(want) => {
+                if !method_matches(want, ctx.method) {
+                    continue;
+                }
+                true
+            }
+            None => false,
+        };
+        // Headers (all must match).
+        if !m.headers.iter().all(|h| header_matches(h, ctx.headers)) {
+            continue;
+        }
+        // Query params (all must match).
+        if !m
+            .query_params
+            .iter()
+            .all(|q| query_param_matches(q, ctx.query))
+        {
+            continue;
+        }
+        // Path last; if it doesn't match, the rule doesn't apply.
+        let Some(path_summary) = PathSummary::from_match(&m.path, ctx.path) else {
+            continue;
+        };
+        let summary = RequestMatch {
+            path: path_summary,
+            method: method_matched,
+            headers: m.headers.len(),
+            query_params: m.query_params.len(),
+        };
+        match &best {
+            Some(cur) if &summary <= cur => {}
+            _ => best = Some(summary),
         }
     }
     best
@@ -379,12 +479,68 @@ fn score_path(pm: &PathMatch, path: &str) -> Option<usize> {
             }
             None
         }
-        // TODO(issue #5): replace usize::MAX with proper precedence
-        // ranking (exact > prefix > catch-all, then path length).
-        // Until then, Exact unconditionally outscores any PathPrefix
-        // at the same path.
-        PathMatchKind::Exact => (pm.value == path).then_some(usize::MAX),
+        // Exact-vs-prefix precedence is now expressed by the
+        // `PathSummary` `Ord` impl: `Prefix(_) < Exact(_)`. This
+        // function returns raw path length; the variant tagging
+        // happens in `PathSummary::from_match`.
+        PathMatchKind::Exact => (pm.value == path).then_some(pm.value.len()),
     }
+}
+
+// =================== per-dimension match helpers ===================
+
+fn method_matches(want: &Method, got: &Method) -> bool {
+    want == got
+}
+
+/// Match one header constraint against the request's header map.
+/// Header names are compared case-insensitively (via `HeaderName`),
+/// values are compared case-sensitively for `Exact`, and regexes are
+/// anchored at both ends.
+///
+/// Repeated header values: if the request carries multiple values
+/// for the same header, the match succeeds if **any** of them
+/// matches (linkerd / Envoy convention; Gateway API leaves this
+/// undefined).
+fn header_matches(want: &HeaderMatch, headers: &http::HeaderMap) -> bool {
+    let values = headers.get_all(&want.name);
+    match &want.value {
+        HeaderValueMatch::Exact { value: v } => values.iter().any(|h| h == v),
+        HeaderValueMatch::Regex { value: re } => values.iter().any(|h| match h.to_str() {
+            Ok(s) => regex_anchored(re, s),
+            Err(_) => false,
+        }),
+    }
+}
+
+/// Match one query-param constraint against the request's query
+/// string. Names are case-sensitive. Both sides are percent-decoded
+/// via `form_urlencoded`. Regexes are anchored at both ends.
+///
+/// Repeated keys: match succeeds if **any** occurrence's value
+/// matches (linkerd convention; Gateway API leaves this undefined).
+fn query_param_matches(want: &QueryParamMatch, query: Option<&str>) -> bool {
+    let Some(qs) = query else {
+        return false;
+    };
+    form_urlencoded::parse(qs.as_bytes()).any(|(k, v)| {
+        if k != want.name {
+            return false;
+        }
+        match &want.value {
+            QueryValueMatch::Exact { value: want_v } => &*v == want_v.as_str(),
+            QueryValueMatch::Regex { value: re } => regex_anchored(re, &v),
+        }
+    })
+}
+
+/// Whole-string regex match. `regex::Regex::find` matches anywhere;
+/// we explicitly check `start == 0 && end == len`. This mirrors
+/// linkerd2-proxy's
+/// `linkerd/http/route/src/http/match/header.rs:21-29`.
+fn regex_anchored(re: &regex::Regex, value: &str) -> bool {
+    re.find(value)
+        .is_some_and(|m| m.start() == 0 && m.end() == value.len())
 }
 
 fn strip_port(authority: &str) -> &str {
@@ -633,6 +789,8 @@ mod tests {
         assert_eq!(h.get("authorization").unwrap(), "Bearer t");
     }
 
+    // --- score_path basic ---
+
     #[test]
     fn score_exact_match() {
         assert_eq!(score_path(&pm("/api"), "/api"), Some(4));
@@ -658,46 +816,44 @@ mod tests {
         assert_eq!(score_path(&pm("/"), "/foo/bar"), Some(1));
     }
 
-    // --- Exact path match ---
-
     #[test]
-    fn score_exact_equal() {
-        assert_eq!(score_path(&pm_exact("/foo"), "/foo"), Some(usize::MAX));
-        assert_eq!(
-            score_path(&pm_exact("/healthz"), "/healthz"),
-            Some(usize::MAX)
-        );
+    fn score_exact_equal_returns_length() {
+        // Exact-vs-prefix precedence is now expressed by `PathSummary`,
+        // so `score_path` returns the same usize for both kinds; only
+        // the variant carries the precedence bit.
+        assert_eq!(score_path(&pm_exact("/foo"), "/foo"), Some(4));
+        assert_eq!(score_path(&pm_exact("/healthz"), "/healthz"), Some(8));
     }
 
     #[test]
     fn score_exact_unequal_rejected() {
         // Critical: Exact must not prefix-match. `/foo/bar` is NOT `/foo`.
         assert_eq!(score_path(&pm_exact("/foo"), "/foo/bar"), None);
-        // `/healthzz` is not `/healthz` — pure string inequality.
         assert_eq!(score_path(&pm_exact("/healthz"), "/healthzz"), None);
         // Trailing slash matters: `/foo` and `/foo/` are different.
         assert_eq!(score_path(&pm_exact("/foo"), "/foo/"), None);
         assert_eq!(score_path(&pm_exact("/foo/"), "/foo"), None);
     }
 
+    // --- PathSummary::Ord ---
+
     #[test]
-    fn best_match_exact_beats_prefix() {
-        // Two routes, one Exact and one PathPrefix, both targeting /foo.
-        let exact = vec![HttpMatch {
-            host: None,
-            path: pm_exact("/foo"),
-        }];
-        let prefix = vec![HttpMatch {
-            host: None,
-            path: pm("/foo"),
-        }];
-        let exact_score = best_match_score(&exact, None, "/foo").unwrap();
-        let prefix_score = best_match_score(&prefix, None, "/foo").unwrap();
-        assert!(
-            exact_score > prefix_score,
-            "exact ({exact_score}) should beat prefix ({prefix_score}) at the same path"
-        );
+    fn path_summary_exact_beats_any_prefix() {
+        // Even when the prefix is longer, Exact wins.
+        assert!(PathSummary::Exact(3) > PathSummary::Prefix(100));
     }
+
+    #[test]
+    fn path_summary_longer_prefix_beats_shorter() {
+        assert!(PathSummary::Prefix(7) > PathSummary::Prefix(3));
+    }
+
+    #[test]
+    fn path_summary_longer_exact_beats_shorter_exact() {
+        assert!(PathSummary::Exact(9) > PathSummary::Exact(5));
+    }
+
+    // --- strip_port ---
 
     #[test]
     fn strip_port_with_port() {
@@ -709,32 +865,307 @@ mod tests {
         assert_eq!(strip_port("example.com"), "example.com");
     }
 
-    #[test]
-    fn best_match_uses_longest_prefix() {
-        let matches = vec![
-            HttpMatch {
-                host: None,
-                path: pm("/api"),
-            },
-            HttpMatch {
-                host: None,
-                path: pm("/api/v2"),
-            },
-        ];
-        assert_eq!(best_match_score(&matches, None, "/api/v2/foo"), Some(7));
+    // --- match helpers: best_match_summary ---
+
+    fn ctx<'a>(
+        host: Option<&'a str>,
+        path: &'a str,
+        method: &'a Method,
+        headers: &'a http::HeaderMap,
+        query: Option<&'a str>,
+    ) -> MatchContext<'a> {
+        MatchContext {
+            host,
+            path,
+            method,
+            headers,
+            query,
+        }
+    }
+
+    fn am(path: PathMatch) -> HttpMatch {
+        HttpMatch {
+            host: None,
+            path,
+            method: None,
+            headers: vec![],
+            query_params: vec![],
+        }
     }
 
     #[test]
-    fn best_match_filters_on_host() {
-        let matches = vec![HttpMatch {
-            host: Some("a.example.com".into()),
-            path: pm("/"),
-        }];
-        assert!(best_match_score(&matches, Some("b.example.com"), "/").is_none());
-        assert_eq!(
-            best_match_score(&matches, Some("a.example.com"), "/"),
-            Some(1)
+    fn summary_picks_longest_prefix_path() {
+        let matches = vec![am(pm("/api")), am(pm("/api/v2"))];
+        let m = Method::GET;
+        let h = http::HeaderMap::new();
+        let c = ctx(None, "/api/v2/foo", &m, &h, None);
+        let s = best_match_summary(&matches, &c).expect("matched");
+        assert_eq!(s.path, PathSummary::Prefix(7));
+    }
+
+    #[test]
+    fn summary_filters_on_host() {
+        let mut a = am(pm("/"));
+        a.host = Some("a.example.com".into());
+        let m = Method::GET;
+        let h = http::HeaderMap::new();
+        assert!(
+            best_match_summary(&[a.clone()], &ctx(Some("b.example.com"), "/", &m, &h, None))
+                .is_none()
         );
+        assert!(best_match_summary(&[a], &ctx(Some("a.example.com"), "/", &m, &h, None)).is_some());
+    }
+
+    #[test]
+    fn summary_with_wildcard_host() {
+        let mut a = am(pm("/"));
+        a.host = Some("*.example.com".into());
+        let m = Method::GET;
+        let h = http::HeaderMap::new();
+        assert!(
+            best_match_summary(
+                &[a.clone()],
+                &ctx(Some("foo.example.com"), "/", &m, &h, None)
+            )
+            .is_some()
+        );
+        // bare suffix does NOT match — wildcard needs extra label
+        assert!(best_match_summary(&[a], &ctx(Some("example.com"), "/", &m, &h, None)).is_none());
+    }
+
+    #[test]
+    fn summary_exact_outranks_prefix_at_same_path() {
+        let exact_only = vec![am(pm_exact("/foo"))];
+        let prefix_only = vec![am(pm("/foo"))];
+        let method = Method::GET;
+        let headers = http::HeaderMap::new();
+        let cx = ctx(None, "/foo", &method, &headers, None);
+        let exact_score = best_match_summary(&exact_only, &cx).unwrap();
+        let prefix_score = best_match_summary(&prefix_only, &cx).unwrap();
+        assert!(exact_score > prefix_score, "exact must outrank prefix");
+    }
+
+    // --- method matching ---
+
+    #[test]
+    fn method_match_exact() {
+        let mut a = am(pm("/"));
+        a.method = Some(Method::POST);
+        let h = http::HeaderMap::new();
+        let m_get = Method::GET;
+        let m_post = Method::POST;
+        assert!(best_match_summary(&[a.clone()], &ctx(None, "/", &m_get, &h, None)).is_none());
+        let s = best_match_summary(&[a], &ctx(None, "/", &m_post, &h, None)).unwrap();
+        assert!(s.method, "method-present should mark summary.method = true");
+    }
+
+    // --- header matching ---
+
+    fn header_exact(name: &str, value: &str) -> HeaderMatch {
+        HeaderMatch {
+            name: http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value: HeaderValueMatch::Exact {
+                value: http::HeaderValue::from_str(value).unwrap(),
+            },
+        }
+    }
+
+    fn header_regex(name: &str, pattern: &str) -> HeaderMatch {
+        HeaderMatch {
+            name: http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value: HeaderValueMatch::Regex {
+                value: regex::Regex::new(pattern).unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn header_match_exact_matches_case_insensitive_name() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("X-Debug", "1".parse().unwrap());
+        assert!(header_matches(&header_exact("x-debug", "1"), &headers));
+        assert!(header_matches(&header_exact("X-DEBUG", "1"), &headers));
+        assert!(!header_matches(&header_exact("x-debug", "2"), &headers));
+    }
+
+    #[test]
+    fn header_match_exact_value_is_case_sensitive() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-mode", "Active".parse().unwrap());
+        assert!(header_matches(&header_exact("x-mode", "Active"), &headers));
+        assert!(!header_matches(&header_exact("x-mode", "active"), &headers));
+    }
+
+    #[test]
+    fn header_match_repeated_value_matches_any() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-tag", "a".parse().unwrap());
+        headers.append("x-tag", "b".parse().unwrap());
+        headers.append("x-tag", "c".parse().unwrap());
+        assert!(header_matches(&header_exact("x-tag", "b"), &headers));
+    }
+
+    #[test]
+    fn header_match_regex_is_anchored() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-id", "bar".parse().unwrap());
+        // Regex `bar` should match full `bar` value.
+        assert!(header_matches(&header_regex("x-id", "bar"), &headers));
+        // Regex `bar` should NOT match `barbaz` — linkerd-style
+        // explicit anchoring at both ends.
+        headers.insert("x-id", "barbaz".parse().unwrap());
+        assert!(!header_matches(&header_regex("x-id", "bar"), &headers));
+        // Regex `b.+` matches the whole string.
+        assert!(header_matches(&header_regex("x-id", "b.+"), &headers));
+    }
+
+    #[test]
+    fn header_match_missing_header_no_match() {
+        let headers = http::HeaderMap::new();
+        assert!(!header_matches(&header_exact("x-missing", "v"), &headers));
+    }
+
+    // --- query param matching ---
+
+    fn qp_exact(name: &str, value: &str) -> QueryParamMatch {
+        QueryParamMatch {
+            name: name.into(),
+            value: QueryValueMatch::Exact {
+                value: value.into(),
+            },
+        }
+    }
+
+    fn qp_regex(name: &str, pattern: &str) -> QueryParamMatch {
+        QueryParamMatch {
+            name: name.into(),
+            value: QueryValueMatch::Regex {
+                value: regex::Regex::new(pattern).unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn query_param_exact_matches() {
+        assert!(query_param_matches(
+            &qp_exact("foo", "bar"),
+            Some("foo=bar")
+        ));
+        assert!(query_param_matches(
+            &qp_exact("foo", "bar"),
+            Some("a=1&foo=bar&b=2")
+        ));
+        assert!(!query_param_matches(
+            &qp_exact("foo", "bar"),
+            Some("foo=baz")
+        ));
+        assert!(!query_param_matches(&qp_exact("foo", "bar"), None));
+    }
+
+    #[test]
+    fn query_param_percent_decoded_comparison() {
+        // form_urlencoded percent-decodes both sides.
+        assert!(query_param_matches(
+            &qp_exact("x", "hello world"),
+            Some("x=hello%20world")
+        ));
+    }
+
+    #[test]
+    fn query_param_repeated_key_matches_any() {
+        // First-or-any; both should match here.
+        assert!(query_param_matches(
+            &qp_exact("k", "v2"),
+            Some("k=v1&k=v2&k=v3")
+        ));
+    }
+
+    #[test]
+    fn query_param_regex_is_anchored() {
+        // `bar` matches full `bar` but not `barbaz`.
+        assert!(query_param_matches(&qp_regex("x", "bar"), Some("x=bar")));
+        assert!(!query_param_matches(
+            &qp_regex("x", "bar"),
+            Some("x=barbaz")
+        ));
+        assert!(query_param_matches(&qp_regex("x", "b.+"), Some("x=barbaz")));
+    }
+
+    // --- RequestMatch::Ord cascade (Gateway API spec order) ---
+
+    fn rm(path: PathSummary, method: bool, headers: usize, query: usize) -> RequestMatch {
+        RequestMatch {
+            path,
+            method,
+            headers,
+            query_params: query,
+        }
+    }
+
+    #[test]
+    fn request_match_ord_path_beats_method() {
+        // Exact path with no method beats Prefix path with method.
+        let a = rm(PathSummary::Exact(4), false, 0, 0);
+        let b = rm(PathSummary::Prefix(4), true, 0, 0);
+        assert!(a > b);
+    }
+
+    #[test]
+    fn request_match_ord_method_beats_headers() {
+        // Same path; method-present > more-headers.
+        let a = rm(PathSummary::Prefix(1), true, 0, 0);
+        let b = rm(PathSummary::Prefix(1), false, 5, 0);
+        assert!(a > b);
+    }
+
+    #[test]
+    fn request_match_ord_more_headers_beats_fewer() {
+        let a = rm(PathSummary::Prefix(1), false, 3, 0);
+        let b = rm(PathSummary::Prefix(1), false, 2, 100);
+        assert!(a > b);
+    }
+
+    #[test]
+    fn request_match_ord_more_query_beats_fewer_when_tied() {
+        let a = rm(PathSummary::Prefix(1), false, 1, 2);
+        let b = rm(PathSummary::Prefix(1), false, 1, 1);
+        assert!(a > b);
+    }
+
+    // --- end-to-end via best_match_summary: header rule beats catchall ---
+
+    #[test]
+    fn summary_header_rule_beats_catchall() {
+        let header_rule = vec![HttpMatch {
+            host: None,
+            path: pm("/"),
+            method: None,
+            headers: vec![header_exact("x-feature", "on")],
+            query_params: vec![],
+        }];
+        let catchall = vec![am(pm("/"))];
+
+        let mut request_headers = http::HeaderMap::new();
+        request_headers.insert("x-feature", "on".parse().unwrap());
+        let method = Method::GET;
+
+        let with_header = best_match_summary(
+            &header_rule,
+            &ctx(None, "/", &method, &request_headers, None),
+        )
+        .unwrap();
+        let catchall_only =
+            best_match_summary(&catchall, &ctx(None, "/", &method, &request_headers, None))
+                .unwrap();
+        assert!(
+            with_header > catchall_only,
+            "header-matched rule must outrank catch-all at the same path"
+        );
+
+        // Without the header, the header rule does not match.
+        let empty = http::HeaderMap::new();
+        assert!(best_match_summary(&header_rule, &ctx(None, "/", &method, &empty, None)).is_none());
+        assert!(best_match_summary(&catchall, &ctx(None, "/", &method, &empty, None)).is_some());
     }
 
     // --- hostname_matches ---
@@ -773,20 +1204,27 @@ mod tests {
 
     #[test]
     fn best_match_with_wildcard_host() {
-        let matches = vec![HttpMatch {
-            host: Some("*.example.com".into()),
-            path: pm("/"),
-        }];
-        assert_eq!(
-            best_match_score(&matches, Some("foo.example.com"), "/"),
-            Some(1)
+        // covered by summary_with_wildcard_host above; kept as the
+        // dedicated single-case test in case future refactors split
+        // host filtering out of `best_match_summary`.
+        let mut a = am(pm("/"));
+        a.host = Some("*.example.com".into());
+        let m = Method::GET;
+        let h = http::HeaderMap::new();
+        assert!(
+            best_match_summary(
+                &[a.clone()],
+                &ctx(Some("foo.example.com"), "/", &m, &h, None)
+            )
+            .is_some()
         );
-        // multi-label suffix also matches
-        assert_eq!(
-            best_match_score(&matches, Some("a.b.example.com"), "/"),
-            Some(1)
+        assert!(
+            best_match_summary(
+                &[a.clone()],
+                &ctx(Some("a.b.example.com"), "/", &m, &h, None)
+            )
+            .is_some()
         );
-        // bare suffix does NOT match — wildcard needs extra label
-        assert!(best_match_score(&matches, Some("example.com"), "/").is_none());
+        assert!(best_match_summary(&[a], &ctx(Some("example.com"), "/", &m, &h, None)).is_none());
     }
 }

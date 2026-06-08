@@ -9,6 +9,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+http = "1"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
+serde_regex = "1"
 serde_yaml = "0.9"
 thiserror = "2"

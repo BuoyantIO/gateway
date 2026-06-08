@@ -92,6 +92,9 @@ fn http_route(name: &str, path_prefix: &str, backend: &str) -> HttpRoute {
                 kind: PathMatchKind::PathPrefix,
                 value: path_prefix.into(),
             },
+            method: None,
+            headers: vec![],
+            query_params: vec![],
         }],
         backend_refs: vec![BackendRef {
             name: backend.into(),
@@ -442,6 +445,165 @@ async fn request_header_modifier_applies() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert_eq!(echoed, "from-filter");
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// Header-based routing: a route with `headers: [x-feature=on]`
+/// must beat a catch-all `/` route per Gateway API precedence, but
+/// only when the header is set.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn header_routing_picks_header_rule_over_catchall() {
+    let upstream_a = spawn_http_echo().await;
+    let upstream_b = spawn_http_echo().await;
+    let bind_port = free_port().await;
+
+    // Two backends. Each route has a filter that injects a
+    // `x-test-served-by` header so the echo server reflects it back
+    // as `x-echo-served-by`. That's how the test discriminates which
+    // backend handled the request.
+    let route_with_header_match = {
+        let mut r = HttpRoute {
+            name: "r-header".into(),
+            matches: vec![HttpMatch {
+                host: None,
+                path: PathMatch {
+                    kind: PathMatchKind::PathPrefix,
+                    value: "/".into(),
+                },
+                method: None,
+                // header-match field is on the **config-side**
+                // HttpMatch; the Store compiles it into an
+                // ActiveHttpMatch at apply time.
+                headers: vec![gateway_config::route::HeaderMatch {
+                    name: http::HeaderName::from_static("x-feature"),
+                    value: gateway_config::route::HeaderValueMatch::Exact {
+                        value: http::HeaderValue::from_static("on"),
+                    },
+                }],
+                query_params: vec![],
+            }],
+            backend_refs: vec![BackendRef {
+                name: "be-a".into(),
+                weight: 1,
+            }],
+            filters: vec![HttpFilter::RequestHeaderModifier {
+                name: "tag-a".into(),
+                request_headers: RequestHeaderOps {
+                    add: vec![HeaderPair {
+                        name: "x-test-served-by".into(),
+                        value: "A".into(),
+                    }],
+                    set: vec![],
+                    remove: vec![],
+                },
+            }],
+        };
+        // Sanity: the helper above doesn't apply, build by hand.
+        r.name = "r-header".into();
+        r
+    };
+    let catchall_route = http_route_with_filter(
+        "r-catchall",
+        "/",
+        "be-b",
+        HttpFilter::RequestHeaderModifier {
+            name: "tag-b".into(),
+            request_headers: RequestHeaderOps {
+                add: vec![HeaderPair {
+                    name: "x-test-served-by".into(),
+                    value: "B".into(),
+                }],
+                set: vec![],
+                remove: vec![],
+            },
+        },
+    );
+
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener(
+                "l",
+                None,
+                vec![route_with_header_match, catchall_route],
+            )],
+        }],
+        backends: vec![
+            static_backend("be-a", upstream_a),
+            static_backend("be-b", upstream_b),
+        ],
+        secrets: vec![],
+    };
+
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+
+    // Request 1: header set → route A should win.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/"))
+        .header("x-feature", "on")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = resp
+        .headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        served, "A",
+        "header set should route to header-matched rule"
+    );
+
+    // Request 2: no header → catchall.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/"))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = resp
+        .headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(served, "B", "no header should fall through to catchall");
+
+    // Request 3: wrong header value → catchall.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/"))
+        .header("x-feature", "off")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = resp
+        .headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        served, "B",
+        "wrong header value should fall through to catchall"
+    );
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(2), gw_handle)

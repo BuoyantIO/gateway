@@ -101,9 +101,12 @@ message HttpRouteUpsert {
 }
 
 message HttpMatch {
-  string    host     = 1;
-  bool      has_host = 2;
-  PathMatch path     = 3;
+  string    host                              = 1;
+  bool      has_host                          = 2;
+  PathMatch path                              = 3;
+  HttpMethod                method            = 4;  // METHOD_UNSPECIFIED == not set
+  repeated HeaderMatch      header_matches    = 5;
+  repeated QueryParamMatch  query_param_matches = 6;
 }
 
 message PathMatch {
@@ -115,6 +118,36 @@ enum PathMatchKind {
   PATH_MATCH_KIND_UNSPECIFIED = 0;
   PATH_MATCH_KIND_PATH_PREFIX = 1;
   PATH_MATCH_KIND_EXACT       = 2;
+}
+
+// Mirrors Gateway API's closed set of HTTP methods.
+enum HttpMethod {
+  HTTP_METHOD_UNSPECIFIED = 0;
+  HTTP_METHOD_GET         = 1;
+  HTTP_METHOD_HEAD        = 2;
+  HTTP_METHOD_POST        = 3;
+  HTTP_METHOD_PUT         = 4;
+  HTTP_METHOD_DELETE      = 5;
+  HTTP_METHOD_CONNECT     = 6;
+  HTTP_METHOD_OPTIONS     = 7;
+  HTTP_METHOD_TRACE       = 8;
+  HTTP_METHOD_PATCH       = 9;
+}
+
+message HeaderMatch {
+  string name = 1;
+  oneof value {
+    string exact = 2;
+    string regex = 3;
+  }
+}
+
+message QueryParamMatch {
+  string name = 1;
+  oneof value {
+    string exact = 2;
+    string regex = 3;
+  }
 }
 
 message BackendRef {

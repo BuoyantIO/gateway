@@ -4,7 +4,7 @@ use crate::backend::Backend;
 use crate::bind::Bind;
 use crate::secret::Secret;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayConfig {
     pub name: String,

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::route::{HttpRoute, TcpRoute, TlsRoute};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "listenerProtocol", rename_all = "UPPERCASE")]
 pub enum Listener {
     Tls(TlsListener),
@@ -22,7 +22,7 @@ pub struct TlsListener {
     pub routes: Vec<TlsRoute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpsListener {
     pub name: String,
@@ -33,7 +33,7 @@ pub struct HttpsListener {
     pub routes: Vec<HttpRoute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpListener {
     pub name: String,
