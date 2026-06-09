@@ -61,11 +61,6 @@ pub struct HttpMatch {
     pub query_params: Vec<QueryParamMatch>,
 }
 
-/// Path match. Internally tagged on `type` with a `value` field;
-/// serializes as `{ type: PathPrefix, value: "/api" }` or
-/// `{ type: Regex, value: "^/api/v\\d+$" }`. `Regex` patterns are
-/// compiled by `serde_regex` at deserialization time and matched
-/// anchored at both ends by the resolver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum PathMatch {
@@ -88,12 +83,6 @@ pub struct HeaderMatch {
     pub value: HeaderValueMatch,
 }
 
-/// Header value match. `Regex` is anchored at both ends by the
-/// resolver (`re.find(s).is_some_and(|m| m.start() == 0 &&
-/// m.end() == s.len())`).
-///
-/// Internal tagging on `type` with a `value` field; serializes as
-/// `{ type: Exact, value: "1" }` or `{ type: Regex, value: "^foo" }`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum HeaderValueMatch {

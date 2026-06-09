@@ -1,9 +1,6 @@
 //! Kubernetes control plane: watches Gateway API resources and pushes
 //! incremental `ConfigUpdate` batches to data planes over a streaming
 //! gRPC channel.
-//!
-//! This task wires only the pure translation + diff layer. Watch
-//! plumbing and the gRPC server land in later steps.
 
 pub mod diff;
 pub mod server;

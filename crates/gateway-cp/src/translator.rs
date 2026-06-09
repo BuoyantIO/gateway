@@ -170,7 +170,7 @@ fn emit_listener(snapshot: &mut Snapshot, gw_ns: &str, gw_name: &str, listener: 
         );
         return;
     }
-    // v0: one Bind per Gateway listener, no port-sharing across
+    // One Bind per Gateway listener, no port-sharing across
     // listeners. Bind and Listener share the same derived name —
     // we don't yet group multiple listeners under one Bind.
     let bind_name = bind_name(gw_ns, gw_name, &listener.name);

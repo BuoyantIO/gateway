@@ -164,6 +164,8 @@ impl Default for EndpointStateConfig {
 /// live for the process lifetime. The struct is cheap to `clone` —
 /// every per-connection task gets its own handle that shares the
 /// inner Arc'd map.
+/// TODO: add eviction of old entries, either via a background sweep or
+/// TTL on the inner `Arc<EndpointInfo>`.
 #[derive(Clone)]
 pub struct EndpointStateMap {
     inner: Arc<RwLock<HashMap<EndpointKey, Arc<EndpointInfo>>>>,

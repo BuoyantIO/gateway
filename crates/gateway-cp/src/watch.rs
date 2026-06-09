@@ -5,7 +5,7 @@
 //! single `tokio::select!` over the four watcher streams drives the
 //! loop: every event triggers a `translate` + `ServerState::publish`.
 //!
-//! v0 publishes on every event. `diff` returns `None` when nothing
+//! Currently publishes on every event. `diff` returns `None` when nothing
 //! changed, so spurious publishes are no-ops at the broadcast layer
 //! and never reach the data planes. Add debouncing back when
 //! translate cost during config bursts becomes measurable.
