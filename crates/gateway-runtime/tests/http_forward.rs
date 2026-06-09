@@ -11,7 +11,7 @@ use bytes::Bytes;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
-use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
+use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::Gateway;
@@ -402,7 +402,7 @@ async fn request_header_modifier_applies() {
 
     let filter = HttpFilter::RequestHeaderModifier {
         name: "add-test".into(),
-        request_headers: RequestHeaderOps {
+        request_headers: HeaderOps {
             add: vec![HeaderPair {
                 name: "x-test-added".into(),
                 value: "from-filter".into(),
@@ -487,7 +487,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
             }],
             filters: vec![HttpFilter::RequestHeaderModifier {
                 name: "tag-a".into(),
-                request_headers: RequestHeaderOps {
+                request_headers: HeaderOps {
                     add: vec![HeaderPair {
                         name: "x-test-served-by".into(),
                         value: "A".into(),
@@ -507,7 +507,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         "be-b",
         HttpFilter::RequestHeaderModifier {
             name: "tag-b".into(),
-            request_headers: RequestHeaderOps {
+            request_headers: HeaderOps {
                 add: vec![HeaderPair {
                     name: "x-test-served-by".into(),
                     value: "B".into(),
@@ -632,7 +632,7 @@ async fn regex_path_routes_matching_request() {
         }],
         filters: vec![HttpFilter::RequestHeaderModifier {
             name: "tag-regex".into(),
-            request_headers: RequestHeaderOps {
+            request_headers: HeaderOps {
                 add: vec![HeaderPair {
                     name: "x-test-served-by".into(),
                     value: "REGEX".into(),
@@ -649,7 +649,7 @@ async fn regex_path_routes_matching_request() {
         "be-catchall",
         HttpFilter::RequestHeaderModifier {
             name: "tag-catchall".into(),
-            request_headers: RequestHeaderOps {
+            request_headers: HeaderOps {
                 add: vec![HeaderPair {
                     name: "x-test-served-by".into(),
                     value: "CATCHALL".into(),
@@ -715,6 +715,89 @@ async fn regex_path_routes_matching_request() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert_eq!(served, "CATCHALL", "non-matching path should fall through");
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// Response-side filter mutates the upstream response's headers
+/// before they reach the client. Mirrors the
+/// `request_header_modifier_applies` test on the response side.
+#[tokio::test]
+async fn response_header_modifier_applies() {
+    use gateway_config::filter::HeaderOps;
+
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+
+    // Echo server sets `x-server-version: HTTP/1.1` on every
+    // response. The filter:
+    //   - adds `x-test-csp` (will appear on the response)
+    //   - sets `x-test-frame-options` (no upstream collision; just
+    //     present)
+    //   - removes `x-server-version` (upstream-set; should disappear)
+    let filter = HttpFilter::ResponseHeaderModifier {
+        name: "rsp".into(),
+        response_headers: HeaderOps {
+            add: vec![HeaderPair {
+                name: "x-test-csp".into(),
+                value: "default-src 'self'".into(),
+            }],
+            set: vec![HeaderPair {
+                name: "x-test-frame-options".into(),
+                value: "sameorigin".into(),
+            }],
+            remove: vec!["x-server-version".into()],
+        },
+    };
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener(
+                "l",
+                None,
+                vec![http_route_with_filter("r", "/", "be", filter)],
+            )],
+        }],
+        backends: vec![static_backend("be", upstream_port)],
+        secrets: vec![],
+    };
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-test-csp")
+            .and_then(|v| v.to_str().ok()),
+        Some("default-src 'self'"),
+        "added header should be on the response"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-test-frame-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("sameorigin"),
+        "set header should be on the response"
+    );
+    assert!(
+        !resp.headers().contains_key("x-server-version"),
+        "removed header must not appear on the response"
+    );
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(2), gw_handle)

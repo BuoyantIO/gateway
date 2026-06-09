@@ -460,7 +460,7 @@ mod tests {
                     kind: Some(pb::http_filter::Kind::RequestHeaderModifier(
                         pb::RequestHeaderModifier {
                             name: "add-x".into(),
-                            request_headers: Some(pb::RequestHeaderOps {
+                            request_headers: Some(pb::HeaderOps {
                                 add: vec![pb::HeaderPair {
                                     name: "x-test".into(),
                                     value: "yes".into(),

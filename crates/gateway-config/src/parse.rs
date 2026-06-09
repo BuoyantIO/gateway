@@ -302,7 +302,10 @@ gatewayConfig:
         };
         let HttpFilter::RequestHeaderModifier {
             request_headers, ..
-        } = &l.routes[0].filters[0];
+        } = &l.routes[0].filters[0]
+        else {
+            panic!("expected RequestHeaderModifier")
+        };
         assert_eq!(request_headers.add.len(), 1);
         assert_eq!(request_headers.set.len(), 1);
         assert_eq!(request_headers.remove, vec!["x-rm".to_string()]);

@@ -87,7 +87,7 @@ mod tests {
                 kind: Some(v1::http_filter::Kind::RequestHeaderModifier(
                     v1::RequestHeaderModifier {
                         name: "add-gateway-header".into(),
-                        request_headers: Some(v1::RequestHeaderOps {
+                        request_headers: Some(v1::HeaderOps {
                             add: vec![v1::HeaderPair {
                                 name: "x-gateway".into(),
                                 value: "demo".into(),

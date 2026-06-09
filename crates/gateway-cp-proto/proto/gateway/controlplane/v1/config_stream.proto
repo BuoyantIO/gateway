@@ -158,16 +158,22 @@ message BackendRef {
 
 message HttpFilter {
   oneof kind {
-    RequestHeaderModifier request_header_modifier = 1;
+    RequestHeaderModifier  request_header_modifier  = 1;
+    ResponseHeaderModifier response_header_modifier = 2;
   }
 }
 
 message RequestHeaderModifier {
-  string           name            = 1;
-  RequestHeaderOps request_headers = 2;
+  string    name            = 1;
+  HeaderOps request_headers = 2;
 }
 
-message RequestHeaderOps {
+message ResponseHeaderModifier {
+  string    name             = 1;
+  HeaderOps response_headers = 2;
+}
+
+message HeaderOps {
   repeated HeaderPair add    = 1;
   repeated HeaderPair set    = 2;
   repeated string     remove = 3;

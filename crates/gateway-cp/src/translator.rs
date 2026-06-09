@@ -502,38 +502,84 @@ fn translate_backend_ref(br: &HttpRouteRulesBackendRefs, route_ns: &str) -> Opti
 
 fn translate_filter(f: &HttpRouteRulesFilters) -> Option<pb::HttpFilter> {
     if let Some(rhm) = f.request_header_modifier.as_ref() {
-        let add = rhm
-            .add
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|h| pb::HeaderPair {
-                name: h.name.clone(),
-                value: h.value.clone(),
-            })
-            .collect();
-        let set = rhm
-            .set
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|h| pb::HeaderPair {
-                name: h.name.clone(),
-                value: h.value.clone(),
-            })
-            .collect();
-        let remove = rhm.remove.clone().unwrap_or_default();
+        let (add, set, remove) = translate_header_ops(
+            rhm.add
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|h| (&h.name, &h.value)),
+            rhm.set
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|h| (&h.name, &h.value)),
+            rhm.remove
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(String::as_str),
+        );
         return Some(pb::HttpFilter {
             kind: Some(pb::http_filter::Kind::RequestHeaderModifier(
                 pb::RequestHeaderModifier {
                     name: String::new(),
-                    request_headers: Some(pb::RequestHeaderOps { add, set, remove }),
+                    request_headers: Some(pb::HeaderOps { add, set, remove }),
+                },
+            )),
+        });
+    }
+    if let Some(rhm) = f.response_header_modifier.as_ref() {
+        let (add, set, remove) = translate_header_ops(
+            rhm.add
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|h| (&h.name, &h.value)),
+            rhm.set
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|h| (&h.name, &h.value)),
+            rhm.remove
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(String::as_str),
+        );
+        return Some(pb::HttpFilter {
+            kind: Some(pb::http_filter::Kind::ResponseHeaderModifier(
+                pb::ResponseHeaderModifier {
+                    name: String::new(),
+                    response_headers: Some(pb::HeaderOps { add, set, remove }),
                 },
             )),
         });
     }
     tracing::warn!(?f.r#type, "skipping unsupported HTTPRoute filter");
     None
+}
+
+/// Shared add/set/remove translator for the request- and
+/// response-side header modifiers. Returns proto-shaped vecs.
+fn translate_header_ops<'a, A, S, R>(
+    add: A,
+    set: S,
+    remove: R,
+) -> (Vec<pb::HeaderPair>, Vec<pb::HeaderPair>, Vec<String>)
+where
+    A: Iterator<Item = (&'a String, &'a String)>,
+    S: Iterator<Item = (&'a String, &'a String)>,
+    R: Iterator<Item = &'a str>,
+{
+    let to_pair = |(name, value): (&String, &String)| pb::HeaderPair {
+        name: name.clone(),
+        value: value.clone(),
+    };
+    (
+        add.map(to_pair).collect(),
+        set.map(to_pair).collect(),
+        remove.map(str::to_owned).collect(),
+    )
 }
 
 /// Emit one `BackendUpsert` per (svc, port) referenced by a route in
@@ -844,6 +890,34 @@ mod tests {
         }
     }
 
+    fn response_header_modifier_filter() -> HttpRouteRulesFilters {
+        use gateway_api::apis::standard::httproutes::{
+            HttpRouteRulesFiltersResponseHeaderModifier,
+            HttpRouteRulesFiltersResponseHeaderModifierAdd,
+            HttpRouteRulesFiltersResponseHeaderModifierSet,
+        };
+        HttpRouteRulesFilters {
+            r#type: gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersType::ResponseHeaderModifier,
+            request_header_modifier: None,
+            response_header_modifier: Some(HttpRouteRulesFiltersResponseHeaderModifier {
+                add: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierAdd {
+                    name: "x-csp".into(),
+                    value: "default-src 'self'".into(),
+                }]),
+                set: Some(vec![HttpRouteRulesFiltersResponseHeaderModifierSet {
+                    name: "x-frame-options".into(),
+                    value: "sameorigin".into(),
+                }]),
+                remove: Some(vec!["x-server-version".into()]),
+            }),
+            request_redirect: None,
+            url_rewrite: None,
+            request_mirror: None,
+            extension_ref: None,
+            cors: None,
+        }
+    }
+
     // ---------- tests ----------
 
     #[test]
@@ -1074,6 +1148,48 @@ mod tests {
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let route = s.routes.values().next().unwrap();
         assert_eq!(route.filters.len(), 1);
+    }
+
+    #[test]
+    fn response_header_modifier_translated() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![backend_ref("svc", 8080)],
+                    vec![response_header_modifier_filter()],
+                )],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        assert_eq!(route.filters.len(), 1);
+        let f = &route.filters[0];
+        match f.kind.as_ref().expect("filter kind set") {
+            pb::http_filter::Kind::ResponseHeaderModifier(rhm) => {
+                let ops = rhm.response_headers.as_ref().expect("response_headers set");
+                assert_eq!(ops.add.len(), 1);
+                assert_eq!(ops.add[0].name, "x-csp");
+                assert_eq!(ops.set.len(), 1);
+                assert_eq!(ops.set[0].name, "x-frame-options");
+                assert_eq!(ops.remove, vec!["x-server-version".to_string()]);
+            }
+            other @ pb::http_filter::Kind::RequestHeaderModifier(_) => {
+                panic!("expected ResponseHeaderModifier, got {other:?}")
+            }
+        }
     }
 
     // ---------- hostname helpers ----------

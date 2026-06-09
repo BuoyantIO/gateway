@@ -773,7 +773,7 @@ mod tests {
 
     use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
     use gateway_config::bind::{Bind, BindProtocol};
-    use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
+    use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
     use gateway_config::listener::{
         HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
     };
@@ -1250,7 +1250,7 @@ mod tests {
             }],
             filters: vec![HttpFilter::RequestHeaderModifier {
                 name: "add-hdr".into(),
-                request_headers: RequestHeaderOps {
+                request_headers: HeaderOps {
                     add: vec![HeaderPair {
                         name: "x-test".into(),
                         value: "yes".into(),

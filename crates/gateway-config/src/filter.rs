@@ -6,7 +6,12 @@ pub enum HttpFilter {
     #[serde(rename_all = "camelCase")]
     RequestHeaderModifier {
         name: String,
-        request_headers: RequestHeaderOps,
+        request_headers: HeaderOps,
+    },
+    #[serde(rename_all = "camelCase")]
+    ResponseHeaderModifier {
+        name: String,
+        response_headers: HeaderOps,
     },
 }
 
@@ -23,7 +28,7 @@ pub enum TcpFilter {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequestHeaderOps {
+pub struct HeaderOps {
     #[serde(default)]
     pub add: Vec<HeaderPair>,
     #[serde(default)]
@@ -41,7 +46,8 @@ pub struct HeaderPair {
 impl HttpFilter {
     pub fn name(&self) -> &str {
         match self {
-            Self::RequestHeaderModifier { name, .. } => name,
+            Self::RequestHeaderModifier { name, .. }
+            | Self::ResponseHeaderModifier { name, .. } => name,
         }
     }
 }

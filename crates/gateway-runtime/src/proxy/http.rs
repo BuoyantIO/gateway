@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
-use gateway_config::filter::{HeaderPair, HttpFilter as HttpFilterConfig, RequestHeaderOps};
+use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter as HttpFilterConfig};
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
@@ -92,12 +92,25 @@ impl std::fmt::Debug for HttpClient {
 
 /// Runtime-side HTTP filter contract. Each
 /// `gateway_config::filter::HttpFilter` variant maps to one impl of
-/// this trait via [`build_http_filter`].
+/// this trait via [`build_http_filter`]. Both hooks have no-op
+/// defaults so each concrete filter opts in to only the side(s)
+/// it cares about.
 pub(crate) trait HttpFilter: Send + Sync {
     fn apply_request_headers(
         &self,
-        parts: &mut http::request::Parts,
-    ) -> Result<HttpFilterDecision, FilterError>;
+        _parts: &mut http::request::Parts,
+    ) -> Result<HttpFilterDecision, FilterError> {
+        Ok(HttpFilterDecision::Continue)
+    }
+
+    /// Response-side hook. Runs in reverse-of-request order across
+    /// the route's filter list.
+    fn apply_response_headers(
+        &self,
+        _parts: &mut http::response::Parts,
+    ) -> Result<(), FilterError> {
+        Ok(())
+    }
 }
 
 pub(crate) enum HttpFilterDecision {
@@ -121,11 +134,16 @@ fn build_http_filter(cfg: &HttpFilterConfig) -> Arc<dyn HttpFilter> {
         } => Arc::new(RequestHeaderModifierFilter {
             ops: request_headers.clone(),
         }),
+        HttpFilterConfig::ResponseHeaderModifier {
+            response_headers, ..
+        } => Arc::new(ResponseHeaderModifierFilter {
+            ops: response_headers.clone(),
+        }),
     }
 }
 
 struct RequestHeaderModifierFilter {
-    ops: RequestHeaderOps,
+    ops: HeaderOps,
 }
 
 impl HttpFilter for RequestHeaderModifierFilter {
@@ -133,27 +151,57 @@ impl HttpFilter for RequestHeaderModifierFilter {
         &self,
         parts: &mut http::request::Parts,
     ) -> Result<HttpFilterDecision, FilterError> {
-        for HeaderPair { name, value } in &self.ops.set {
-            let header_name = HeaderName::try_from(name.as_str())
-                .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
-            let header_value = HeaderValue::try_from(value.as_str())
-                .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
-            parts.headers.insert(header_name, header_value);
-        }
-        for HeaderPair { name, value } in &self.ops.add {
-            let header_name = HeaderName::try_from(name.as_str())
-                .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
-            let header_value = HeaderValue::try_from(value.as_str())
-                .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
-            parts.headers.append(header_name, header_value);
-        }
-        for name in &self.ops.remove {
-            if let Ok(n) = HeaderName::try_from(name.as_str()) {
-                parts.headers.remove(n);
-            }
-        }
+        apply_header_ops(
+            &mut parts.headers,
+            &self.ops.set,
+            &self.ops.add,
+            &self.ops.remove,
+        )?;
         Ok(HttpFilterDecision::Continue)
     }
+}
+
+struct ResponseHeaderModifierFilter {
+    ops: HeaderOps,
+}
+
+impl HttpFilter for ResponseHeaderModifierFilter {
+    fn apply_response_headers(&self, parts: &mut http::response::Parts) -> Result<(), FilterError> {
+        apply_header_ops(
+            &mut parts.headers,
+            &self.ops.set,
+            &self.ops.add,
+            &self.ops.remove,
+        )
+    }
+}
+
+fn apply_header_ops(
+    headers: &mut http::HeaderMap,
+    set: &[HeaderPair],
+    add: &[HeaderPair],
+    remove: &[String],
+) -> Result<(), FilterError> {
+    for HeaderPair { name, value } in set {
+        let header_name = HeaderName::try_from(name.as_str())
+            .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
+        let header_value = HeaderValue::try_from(value.as_str())
+            .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
+        headers.insert(header_name, header_value);
+    }
+    for HeaderPair { name, value } in add {
+        let header_name = HeaderName::try_from(name.as_str())
+            .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
+        let header_value = HeaderValue::try_from(value.as_str())
+            .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
+        headers.append(header_name, header_value);
+    }
+    for name in remove {
+        if let Ok(n) = HeaderName::try_from(name.as_str()) {
+            headers.remove(n);
+        }
+    }
+    Ok(())
 }
 
 // =================== connection + request handlers ===================
@@ -248,7 +296,25 @@ async fn serve_request(
         "http request routed"
     );
 
-    forward(&client, resolved.backend.protocol, req, &endpoint, &info).await
+    let upstream = forward(&client, resolved.backend.protocol, req, &endpoint, &info).await;
+
+    // Response-filter pipeline: iterate the route's filters in
+    // **reverse** order per Area 03 ("response-side runs
+    // reverse-of-request"). Each filter's response hook is no-op
+    // by default; only `ResponseHeaderModifier`-style filters
+    // mutate the response. Hop-by-hop stripping (below) runs
+    // after, so a filter can't accidentally keep a hop-by-hop
+    // header alive.
+    let (mut parts, body) = upstream.into_parts();
+    for cfg in resolved.filters.iter().rev() {
+        let filter = build_http_filter(cfg);
+        if let Err(e) = filter.apply_response_headers(&mut parts) {
+            tracing::warn!(error = %e, "failed to apply response filter");
+            return synthesize_status(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    strip_hop_by_hop_headers(&mut parts.headers);
+    Response::from_parts(parts, body)
 }
 
 // =================== route resolution ===================
@@ -663,10 +729,10 @@ async fn forward(
         }
     };
 
-    let (mut parts, body) = upstream_resp.into_parts();
-    // Strip hop-by-hop headers from the upstream response too, before
-    // handing it back to the downstream client.
-    strip_hop_by_hop_headers(&mut parts.headers);
+    // Response-side hop-by-hop stripping is deferred to
+    // `serve_request` so that response filters can run on the
+    // raw upstream headers first.
+    let (parts, body) = upstream_resp.into_parts();
     let boxed: ResponseBody = body.map_err(|e| Box::new(e) as BoxError).boxed();
     Response::from_parts(parts, boxed)
 }
@@ -728,6 +794,103 @@ mod tests {
         PathMatch::Regex {
             value: regex::Regex::new(pattern).unwrap(),
         }
+    }
+
+    // --- ResponseHeaderModifierFilter ---
+
+    fn response_filter(
+        add: &[(&str, &str)],
+        set: &[(&str, &str)],
+        remove: &[&str],
+    ) -> ResponseHeaderModifierFilter {
+        ResponseHeaderModifierFilter {
+            ops: HeaderOps {
+                add: add
+                    .iter()
+                    .map(|(n, v)| HeaderPair {
+                        name: (*n).into(),
+                        value: (*v).into(),
+                    })
+                    .collect(),
+                set: set
+                    .iter()
+                    .map(|(n, v)| HeaderPair {
+                        name: (*n).into(),
+                        value: (*v).into(),
+                    })
+                    .collect(),
+                remove: remove.iter().map(|s| (*s).into()).collect(),
+            },
+        }
+    }
+
+    fn build_response_parts(initial: &[(&str, &str)]) -> http::response::Parts {
+        let mut builder = http::Response::builder();
+        for (n, v) in initial {
+            builder = builder.header(*n, *v);
+        }
+        let resp = builder.body(()).unwrap();
+        resp.into_parts().0
+    }
+
+    #[test]
+    fn response_header_filter_adds_sets_and_removes() {
+        let filter = response_filter(
+            &[("x-csp", "default-src 'self'")],
+            &[("x-frame-options", "sameorigin")],
+            &["x-server-version"],
+        );
+        let mut parts =
+            build_response_parts(&[("x-frame-options", "STALE"), ("x-server-version", "leaked")]);
+        filter.apply_response_headers(&mut parts).unwrap();
+        assert_eq!(parts.headers.get("x-csp").unwrap(), "default-src 'self'");
+        assert_eq!(parts.headers.get("x-frame-options").unwrap(), "sameorigin");
+        assert!(!parts.headers.contains_key("x-server-version"));
+    }
+
+    #[test]
+    fn request_filter_default_response_hook_is_noop() {
+        // RequestHeaderModifierFilter only mutates the request side;
+        // its inherited default `apply_response_headers` impl must
+        // leave the response untouched.
+        let req_filter = RequestHeaderModifierFilter {
+            ops: HeaderOps {
+                add: vec![],
+                set: vec![],
+                remove: vec!["x-unused".into()],
+            },
+        };
+        let mut parts = build_response_parts(&[("x-keep", "value")]);
+        req_filter.apply_response_headers(&mut parts).unwrap();
+        assert_eq!(parts.headers.get("x-keep").unwrap(), "value");
+    }
+
+    #[test]
+    fn response_filter_default_request_hook_is_noop() {
+        // ResponseHeaderModifierFilter only mutates the response
+        // side; its inherited default `apply_request_headers` impl
+        // returns `Continue` without touching the request.
+        let rsp_filter = ResponseHeaderModifierFilter {
+            ops: HeaderOps {
+                add: vec![HeaderPair {
+                    name: "x-server".into(),
+                    value: "gw".into(),
+                }],
+                set: vec![],
+                remove: vec![],
+            },
+        };
+        let req = http::Request::builder()
+            .header("x-keep", "value")
+            .body(())
+            .unwrap();
+        let (mut parts, ()) = req.into_parts();
+        let decision = rsp_filter.apply_request_headers(&mut parts).unwrap();
+        assert!(matches!(decision, HttpFilterDecision::Continue));
+        assert_eq!(parts.headers.get("x-keep").unwrap(), "value");
+        // The response-only add must NOT have leaked onto the
+        // request headers.
+        assert!(!parts.headers.contains_key("x-server"));
     }
 
     // --- hop-by-hop header stripping ---

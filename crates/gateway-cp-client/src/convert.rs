@@ -11,7 +11,7 @@ use std::net::IpAddr;
 
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
-use gateway_config::filter::{HeaderPair, HttpFilter, RequestHeaderOps};
+use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
 use gateway_config::listener::{HttpListener, Listener};
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, QueryParamMatch,
@@ -253,11 +253,14 @@ fn http_filter(msg: pb::HttpFilter) -> Option<HttpFilter> {
             let ops = rhm.request_headers.unwrap_or_default();
             Some(HttpFilter::RequestHeaderModifier {
                 name: rhm.name,
-                request_headers: RequestHeaderOps {
-                    add: ops.add.into_iter().map(header_pair).collect(),
-                    set: ops.set.into_iter().map(header_pair).collect(),
-                    remove: ops.remove,
-                },
+                request_headers: header_ops(ops),
+            })
+        }
+        pb::http_filter::Kind::ResponseHeaderModifier(rhm) => {
+            let ops = rhm.response_headers.unwrap_or_default();
+            Some(HttpFilter::ResponseHeaderModifier {
+                name: rhm.name,
+                response_headers: header_ops(ops),
             })
         }
     }
@@ -267,6 +270,14 @@ fn header_pair(msg: pb::HeaderPair) -> HeaderPair {
     HeaderPair {
         name: msg.name,
         value: msg.value,
+    }
+}
+
+fn header_ops(msg: pb::HeaderOps) -> HeaderOps {
+    HeaderOps {
+        add: msg.add.into_iter().map(header_pair).collect(),
+        set: msg.set.into_iter().map(header_pair).collect(),
+        remove: msg.remove,
     }
 }
 
@@ -494,5 +505,47 @@ mod tests {
         };
         let err = http_route(bad).expect_err("must fail");
         assert!(matches!(err, Error::InvalidHeaderName { .. }));
+    }
+
+    #[test]
+    fn response_header_modifier_round_trips() {
+        let filter = pb::HttpFilter {
+            kind: Some(pb::http_filter::Kind::ResponseHeaderModifier(
+                pb::ResponseHeaderModifier {
+                    name: "rsp".into(),
+                    response_headers: Some(pb::HeaderOps {
+                        add: vec![pb::HeaderPair {
+                            name: "x-csp".into(),
+                            value: "default-src 'self'".into(),
+                        }],
+                        set: vec![pb::HeaderPair {
+                            name: "x-frame-options".into(),
+                            value: "sameorigin".into(),
+                        }],
+                        remove: vec!["x-server-version".into()],
+                    }),
+                },
+            )),
+        };
+        let cfg = http_filter(filter).expect("known kind");
+        match cfg {
+            HttpFilter::ResponseHeaderModifier {
+                name,
+                response_headers,
+            } => {
+                assert_eq!(name, "rsp");
+                assert_eq!(response_headers.add.len(), 1);
+                assert_eq!(response_headers.add[0].name, "x-csp");
+                assert_eq!(response_headers.set.len(), 1);
+                assert_eq!(response_headers.set[0].name, "x-frame-options");
+                assert_eq!(
+                    response_headers.remove,
+                    vec!["x-server-version".to_string()]
+                );
+            }
+            v @ HttpFilter::RequestHeaderModifier { .. } => {
+                panic!("expected ResponseHeaderModifier, got {v:?}")
+            }
+        }
     }
 }
