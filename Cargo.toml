@@ -8,6 +8,7 @@ members = [
   "crates/gateway-cp-proto",
   "crates/gateway-cp-client",
   "crates/gateway-cp",
+  "e2e",
 ]
 
 [workspace.package]

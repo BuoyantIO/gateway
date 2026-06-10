@@ -1,0 +1,33 @@
+[package]
+name = "gateway-e2e"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+gateway-api = "0.21"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+k8s-openapi = { version = "0.27", features = ["v1_33"] }
+kube = { version = "3.1", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
