@@ -1,11 +1,18 @@
+# syntax=docker/dockerfile:1.4
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
+ENV CARGO_NET_RETRY=10
+ENV RUSTUP_MAX_RETRIES=10
+ENV CARGO_INCREMENTAL=0
 COPY . .
-RUN cargo build --release --locked -p gatewayd
+
+RUN --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
+    cargo build --release --locked -p gatewayd \
+    && cp /src/target/release/gatewayd /usr/local/bin/gatewayd
 
 FROM debian:bookworm-slim
-COPY --from=builder /src/target/release/gatewayd /usr/local/bin/gatewayd
+COPY --from=builder /usr/local/bin/gatewayd /usr/local/bin/gatewayd
 ENTRYPOINT ["/usr/local/bin/gatewayd"]
