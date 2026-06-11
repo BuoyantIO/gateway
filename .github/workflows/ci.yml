@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: just lint
+
+  test-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: just test-unit
+
+  test-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          install_only: true
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: just up
+      - run: just test-e2e
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get gateway,httproute -A || true
+          kubectl -n gateway-system logs deployment/gateway-cp --tail=200 || true
+          kind export logs /tmp/kind-logs --name gateway-e2e || true
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kind-logs
+          path: /tmp/kind-logs
+          retention-days: 3

@@ -292,8 +292,7 @@ async fn client_id_is_forwarded_to_server() {
             move |_| {
                 state
                     .try_lock()
-                    .map(|s| s.connect_count >= 1 && s.last_client_id.is_some())
-                    .unwrap_or(false)
+                    .is_ok_and(|s| s.connect_count >= 1 && s.last_client_id.is_some())
             }
         },
         Duration::from_secs(5),
@@ -327,12 +326,7 @@ async fn empty_initial_snapshot_leaves_store_empty() {
         store.clone(),
         {
             let state = state.clone();
-            move |_| {
-                state
-                    .try_lock()
-                    .map(|s| s.connect_count >= 1)
-                    .unwrap_or(false)
-            }
+            move |_| state.try_lock().is_ok_and(|s| s.connect_count >= 1)
         },
         Duration::from_secs(5),
     )
@@ -391,10 +385,7 @@ async fn stale_entities_purged_after_reconnect() {
             let state = state.clone();
             let store = store.clone();
             move |_| {
-                let connected_twice = state
-                    .try_lock()
-                    .map(|s| s.connect_count >= 2)
-                    .unwrap_or(false);
+                let connected_twice = state.try_lock().is_ok_and(|s| s.connect_count >= 2);
                 let backend_gone = store
                     .read()
                     .backend(&BackendKey::new("demo/api-svc:8080"))

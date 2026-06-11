@@ -17,6 +17,7 @@ pub struct Driver {
 }
 
 impl Driver {
+    #[allow(clippy::missing_panics_doc)]
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
