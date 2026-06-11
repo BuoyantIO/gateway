@@ -97,7 +97,7 @@ async fn delete_namespace(name: String) {
     };
     let api: Api<Namespace> = Api::all(client);
     let _ = api.delete(&name, &DeleteParams::default()).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     while std::time::Instant::now() < deadline {
         match api.get_opt(&name).await {
             Ok(None) => return,
