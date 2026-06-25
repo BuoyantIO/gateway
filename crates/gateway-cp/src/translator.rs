@@ -32,15 +32,17 @@ pub struct K8sState {
 /// Build per-Gateway snapshots from a static K8s state.
 ///
 /// Two passes:
-/// 1. Walk Gateways whose class is one we control; emit
-///    `BindUpsert` + `ListenerUpsert` per HTTP listener.
+/// 1. Walk Gateways whose class is one we control; group their
+///    listeners by port and emit one `BindUpsert` per (Gateway,
+///    port) plus one `ListenerUpsert` per accepted listener.
 /// 2. Walk `HTTPRoute`s; for each `parentRef` pointing at a controlled
 ///    Gateway, emit one `HttpRouteUpsert` per (matched listener × rule)
 ///    plus a `BackendUpsert` for every referenced Service.
 ///
-/// Skips (with a warn log, no error): non-HTTP listeners, foreign
-/// `GatewayClass`es, unknown filter types, cross-namespace
-/// backendRefs, headless / missing Services.
+/// Skips (with a warn log, no error): non-HTTP listeners, listeners
+/// conflicting on a shared port, foreign `GatewayClass`es, unknown
+/// filter types, cross-namespace backendRefs, headless / missing
+/// Services.
 pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, Snapshot> {
     // Index everything keyed by lookup paths the passes need.
     let owned_classes = collect_owned_classes(state, controller_name);
@@ -48,8 +50,11 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
     let services_by_id = index_services(state);
 
     let mut slices: HashMap<GatewayId, Snapshot> = HashMap::new();
+    // Listeners that survived pass-1 classification, per gateway:
+    // listener name -> port. Pass 2 attaches routes only to these.
+    let mut accepted_listeners: HashMap<GatewayId, HashMap<String, i32>> = HashMap::new();
 
-    // Pass 1: Bind + Listener per owned Gateway listener.
+    // Pass 1: one Bind per (Gateway, port), N Listeners under it.
     for gw in &state.gateways {
         let Some(ns) = gw.metadata.namespace.as_deref() else {
             continue;
@@ -61,11 +66,10 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
             continue;
         }
         let id: GatewayId = (ns.to_string(), name.to_string());
-        let snapshot = slices.entry(id).or_default();
+        let snapshot = slices.entry(id.clone()).or_default();
 
-        for listener in &gw.spec.listeners {
-            emit_listener(snapshot, ns, name, listener);
-        }
+        let accepted = emit_gateway_listeners(snapshot, ns, name, &gw.spec.listeners);
+        accepted_listeners.insert(id, accepted);
     }
 
     // Pass 2: HTTPRoutes attach to their parent Gateways.
@@ -98,13 +102,18 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
                 .collect();
 
             let id: GatewayId = (parent_ns.to_string(), parent_name.to_string());
+            let accepted = accepted_listeners.get(&id);
             let snapshot = slices.entry(id).or_default();
 
             for listener in target_listeners {
+                // Listeners classified out in pass 1 (non-HTTP,
+                // conflicted) take no route attachments.
+                let Some(&port) = accepted.and_then(|m| m.get(listener.name.as_str())) else {
+                    continue;
+                };
                 emit_routes_under_listener(
                     snapshot,
-                    parent_ns,
-                    parent_name,
+                    &bind_name(parent_ns, parent_name, port),
                     listener,
                     hr,
                     route_ns,
@@ -160,60 +169,111 @@ fn index_services(state: &K8sState) -> HashMap<(&str, &str), &Service> {
         .collect()
 }
 
-fn emit_listener(snapshot: &mut Snapshot, gw_ns: &str, gw_name: &str, listener: &GatewayListeners) {
-    if listener.protocol != "HTTP" {
-        tracing::warn!(
-            gateway = gw_name,
-            listener = %listener.name,
-            protocol = %listener.protocol,
-            "skipping non-HTTP listener"
+/// Per-port classification state while grouping a Gateway's
+/// listeners: the `BindProtocol` established by the first accepted
+/// listener on the port (every later listener must agree) and the
+/// hostnames already taken (None == catch-all; duplicates conflict).
+type PortGroup = (pb::BindProtocol, std::collections::HashSet<Option<String>>);
+
+/// Walk a Gateway's listeners in spec order, group them by port, and
+/// emit one `BindUpsert` per port plus one `ListenerUpsert` per
+/// accepted listener. Returns the accepted set (listener name →
+/// port) for the route pass.
+///
+/// Classification is first-listener-wins, per the Gateway API
+/// listener-distinctness rule. A listener is skipped (warn, no
+/// error) when:
+/// * its protocol isn't HTTP — v0 translates HTTP only;
+/// * its `BindProtocol` disagrees with the listener that established
+///   the port's bind — unreachable while only HTTP is accepted, but
+///   load-bearing once HTTPS translation lands;
+/// * its hostname duplicates an accepted listener on the same port
+///   (two unset hostnames collide too).
+fn emit_gateway_listeners(
+    snapshot: &mut Snapshot,
+    gw_ns: &str,
+    gw_name: &str,
+    listeners: &[GatewayListeners],
+) -> HashMap<String, i32> {
+    let mut accepted: HashMap<String, i32> = HashMap::new();
+    let mut ports: HashMap<i32, PortGroup> = HashMap::new();
+
+    for listener in listeners {
+        if listener.protocol != "HTTP" {
+            tracing::warn!(
+                gateway = gw_name,
+                listener = %listener.name,
+                protocol = %listener.protocol,
+                "skipping non-HTTP listener"
+            );
+            continue;
+        }
+        let protocol = pb::BindProtocol::Http;
+
+        let bind_name = bind_name(gw_ns, gw_name, listener.port);
+        // First accepted-protocol listener on a port creates the
+        // bind and establishes its protocol. The listener itself
+        // can't conflict yet (no hostnames recorded), so a bind is
+        // never emitted empty.
+        let (bind_protocol, hostnames) = ports.entry(listener.port).or_insert_with(|| {
+            snapshot.binds.insert(
+                BindKey::new(&bind_name),
+                pb::BindUpsert {
+                    name: bind_name.clone(),
+                    address: "0.0.0.0".into(),
+                    port: listener.port.unsigned_abs(),
+                    bind_protocol: protocol as i32,
+                },
+            );
+            (protocol, std::collections::HashSet::new())
+        });
+
+        if *bind_protocol != protocol {
+            tracing::warn!(
+                gateway = gw_name,
+                listener = %listener.name,
+                port = listener.port,
+                "skipping listener: protocol conflicts with the port's bind"
+            );
+            continue;
+        }
+        if !hostnames.insert(listener.hostname.clone()) {
+            tracing::warn!(
+                gateway = gw_name,
+                listener = %listener.name,
+                port = listener.port,
+                hostname = listener.hostname.as_deref().unwrap_or("<none>"),
+                "skipping listener: hostname conflicts on a shared port"
+            );
+            continue;
+        }
+
+        let lk = ListenerKey::new(BindKey::new(&bind_name), &listener.name);
+        snapshot.listeners.insert(
+            lk,
+            pb::ListenerUpsert {
+                key: Some(pb::ListenerKey {
+                    bind: bind_name.clone(),
+                    name: listener.name.clone(),
+                }),
+                hostname: listener.hostname.clone().unwrap_or_default(),
+                has_hostname: listener.hostname.is_some(),
+            },
         );
-        return;
+        accepted.insert(listener.name.clone(), listener.port);
     }
-    // One Bind per Gateway listener, no port-sharing across
-    // listeners. Bind and Listener share the same derived name —
-    // we don't yet group multiple listeners under one Bind.
-    let bind_name = bind_name(gw_ns, gw_name, &listener.name);
-    let bind_key = BindKey::new(&bind_name);
 
-    snapshot.binds.insert(
-        bind_key.clone(),
-        pb::BindUpsert {
-            name: bind_name.clone(),
-            address: "0.0.0.0".into(),
-            port: listener.port.unsigned_abs(),
-            bind_protocol: pb::BindProtocol::Http as i32,
-        },
-    );
-
-    let hostname = listener.hostname.clone();
-    let lk = ListenerKey::new(bind_key, &bind_name);
-    snapshot.listeners.insert(
-        lk,
-        pb::ListenerUpsert {
-            key: Some(pb::ListenerKey {
-                bind: bind_name.clone(),
-                name: bind_name.clone(),
-            }),
-            hostname: hostname.clone().unwrap_or_default(),
-            has_hostname: hostname.is_some(),
-        },
-    );
+    accepted
 }
 
 fn emit_routes_under_listener(
     snapshot: &mut Snapshot,
-    gw_ns: &str,
-    gw_name: &str,
+    bind_name: &str,
     listener: &GatewayListeners,
     hr: &HTTPRoute,
     route_ns: &str,
     route_name: &str,
 ) {
-    if listener.protocol != "HTTP" {
-        return;
-    }
-
     // Intersect listener.hostname with route.spec.hostnames. If the
     // intersection is empty, the route doesn't attach to this
     // listener and we emit nothing.
@@ -227,8 +287,7 @@ fn emit_routes_under_listener(
         return;
     };
 
-    let bind_name = bind_name(gw_ns, gw_name, &listener.name);
-    let listener_key = ListenerKey::new(BindKey::new(&bind_name), &bind_name);
+    let listener_key = ListenerKey::new(BindKey::new(bind_name), &listener.name);
 
     for (rule_idx, rule) in hr.spec.rules.as_deref().unwrap_or(&[]).iter().enumerate() {
         let route_full_name = format!("{route_ns}/{route_name}/rule{rule_idx}");
@@ -283,8 +342,8 @@ fn emit_routes_under_listener(
             route_key,
             pb::HttpRouteUpsert {
                 key: Some(pb::RouteKey {
-                    bind: bind_name.clone(),
-                    listener: bind_name.clone(),
+                    bind: bind_name.to_string(),
+                    listener: listener.name.clone(),
                     name: route_full_name,
                 }),
                 matches,
@@ -661,8 +720,11 @@ fn map_app_protocol(app_protocol: Option<&str>) -> pb::BackendProtocol {
 
 // ==================== name helpers ====================
 
-fn bind_name(gw_ns: &str, gw_name: &str, listener_name: &str) -> String {
-    format!("{gw_ns}/{gw_name}/{listener_name}")
+/// One Bind per (Gateway, port). The colon keeps the name visually
+/// distinct from listener paths and unambiguous against a listener
+/// literally named `8080`.
+fn bind_name(gw_ns: &str, gw_name: &str, port: i32) -> String {
+    format!("{gw_ns}/{gw_name}:{port}")
 }
 
 fn backend_key_string(svc_ns: &str, svc_name: &str, port: i32) -> String {
@@ -940,16 +1002,226 @@ mod tests {
         assert_eq!(snap.binds.len(), 1);
         assert_eq!(snap.listeners.len(), 1);
 
-        let bind = snap
-            .binds
-            .get(&BindKey::new("demo/api/http"))
-            .expect("bind");
+        let bind = snap.binds.get(&BindKey::new("demo/api:80")).expect("bind");
         assert_eq!(bind.port, 80);
 
-        let lk = ListenerKey::new(BindKey::new("demo/api/http"), "demo/api/http");
+        let lk = ListenerKey::new(BindKey::new("demo/api:80"), "http");
         let listener = snap.listeners.get(&lk).expect("listener");
         assert!(listener.has_hostname);
         assert_eq!(listener.hostname, "app.example.com");
+    }
+
+    // ---------- bind grouping by (gateway, port) ----------
+
+    #[test]
+    fn two_listeners_same_port_share_one_bind() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("web-a", 80, Some("a.example.com")),
+                    http_listener("web-b", 80, Some("b.example.com")),
+                ],
+            )],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert_eq!(s.binds.len(), 1, "one bind for the shared port");
+        let bind = s.binds.get(&BindKey::new("demo/api:80")).expect("bind");
+        assert_eq!(bind.port, 80);
+        assert_eq!(bind.bind_protocol, pb::BindProtocol::Http as i32);
+
+        assert_eq!(s.listeners.len(), 2, "both listeners under the bind");
+        for (name, host) in [("web-a", "a.example.com"), ("web-b", "b.example.com")] {
+            let lk = ListenerKey::new(BindKey::new("demo/api:80"), name);
+            let l = s.listeners.get(&lk).expect("listener under shared bind");
+            assert_eq!(l.hostname, host);
+            let key = l.key.as_ref().expect("listener key set");
+            assert_eq!(key.bind, "demo/api:80");
+            assert_eq!(key.name, name);
+        }
+    }
+
+    #[test]
+    fn listeners_on_distinct_ports_get_distinct_binds() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("web", 80, None),
+                    http_listener("alt", 8080, None),
+                ],
+            )],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert_eq!(s.binds.len(), 2);
+        assert_eq!(s.binds.get(&BindKey::new("demo/api:80")).unwrap().port, 80);
+        assert_eq!(
+            s.binds.get(&BindKey::new("demo/api:8080")).unwrap().port,
+            8080
+        );
+        assert_eq!(s.listeners.len(), 2);
+        assert!(
+            s.listeners
+                .contains_key(&ListenerKey::new(BindKey::new("demo/api:80"), "web"))
+        );
+        assert!(
+            s.listeners
+                .contains_key(&ListenerKey::new(BindKey::new("demo/api:8080"), "alt"))
+        );
+    }
+
+    #[test]
+    fn duplicate_hostname_on_shared_port_first_wins() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("first", 80, Some("app.example.com")),
+                    http_listener("dupe", 80, Some("app.example.com")),
+                ],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                // sectionName targets the conflicted listener: no
+                // routes may be emitted for it.
+                vec![parent_ref("api", Some("demo"), Some("dupe"))],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert_eq!(s.binds.len(), 1);
+        assert_eq!(s.listeners.len(), 1, "conflicted listener dropped");
+        assert!(
+            s.listeners
+                .contains_key(&ListenerKey::new(BindKey::new("demo/api:80"), "first"))
+        );
+        assert!(
+            s.routes.is_empty(),
+            "routes targeting the conflicted listener emit nothing"
+        );
+    }
+
+    #[test]
+    fn hostnameless_duplicate_on_shared_port_first_wins() {
+        // Two listeners with no hostname on one port collide (None ==
+        // None counts as a duplicate per listener distinctness).
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("first", 80, None),
+                    http_listener("second", 80, None),
+                ],
+            )],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        assert_eq!(s.binds.len(), 1);
+        assert_eq!(s.listeners.len(), 1);
+        assert!(
+            s.listeners
+                .contains_key(&ListenerKey::new(BindKey::new("demo/api:80"), "first"))
+        );
+    }
+
+    #[test]
+    fn route_without_section_fans_out_across_listeners_on_port() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("web-a", 80, Some("a.example.com")),
+                    http_listener("web-b", 80, Some("b.example.com")),
+                ],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert_eq!(s.routes.len(), 2, "route attaches under both listeners");
+        let mut listeners: Vec<&str> = s
+            .routes
+            .values()
+            .map(|r| r.key.as_ref().unwrap().listener.as_str())
+            .collect();
+        listeners.sort_unstable();
+        assert_eq!(listeners, vec!["web-a", "web-b"]);
+        // Hostname intersection applies per listener: each emitted
+        // route carries its own listener's hostname.
+        for route in s.routes.values() {
+            let key = route.key.as_ref().unwrap();
+            assert_eq!(key.bind, "demo/api:80");
+            let expect_host = match key.listener.as_str() {
+                "web-a" => "a.example.com",
+                "web-b" => "b.example.com",
+                other => panic!("unexpected listener {other}"),
+            };
+            assert_eq!(route.matches.len(), 1);
+            assert_eq!(route.matches[0].host, expect_host);
+        }
+    }
+
+    #[test]
+    fn route_with_section_name_only_under_named_listener() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("web-a", 80, Some("a.example.com")),
+                    http_listener("web-b", 80, Some("b.example.com")),
+                ],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), Some("web-b"))],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert_eq!(s.routes.len(), 1);
+        let key = s.routes.values().next().unwrap().key.as_ref().unwrap();
+        assert_eq!(key.bind, "demo/api:80");
+        assert_eq!(key.listener, "web-b");
     }
 
     #[test]
