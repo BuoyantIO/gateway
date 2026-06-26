@@ -73,6 +73,21 @@ impl fmt::Display for BackendKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SecretKey(pub String);
+
+impl SecretKey {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl fmt::Display for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Keep-set for [`crate::Store::retain`].
 #[derive(Debug, Default, Clone)]
 pub struct RegisteredKeys {
@@ -80,4 +95,5 @@ pub struct RegisteredKeys {
     pub listeners: HashSet<ListenerKey>,
     pub routes: HashSet<RouteKey>,
     pub backends: HashSet<BackendKey>,
+    pub secrets: HashSet<SecretKey>,
 }
