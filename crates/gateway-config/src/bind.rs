@@ -1,10 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::listener::Listener;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bind {
     pub name: String,
@@ -16,7 +16,7 @@ pub struct Bind {
     pub listeners: Vec<Listener>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum BindProtocol {
     Tls,

@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::backend::BackendRef;
 use crate::filter::{HttpFilter, TcpFilter, TlsFilter};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsRoute {
     pub name: String,
@@ -13,7 +13,7 @@ pub struct TlsRoute {
     pub filters: Vec<TlsFilter>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpRoute {
     pub name: String,
@@ -23,7 +23,7 @@ pub struct HttpRoute {
     pub filters: Vec<HttpFilter>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TcpRoute {
     pub name: String,
@@ -32,7 +32,7 @@ pub struct TcpRoute {
     pub filters: Vec<TcpFilter>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SniMatch {
     pub sni: String,
 }
@@ -42,7 +42,7 @@ pub struct SniMatch {
 /// matches, and pre-compiled `regex::Regex` for regex variants.
 /// Invalid input (bad header name, malformed regex, etc.) is
 /// caught at deserialization / `TryFrom` time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpMatch {
     #[serde(default)]
@@ -61,7 +61,7 @@ pub struct HttpMatch {
     pub query_params: Vec<QueryParamMatch>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum PathMatch {
     PathPrefix {
@@ -76,14 +76,14 @@ pub enum PathMatch {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HeaderMatch {
     #[serde(with = "crate::serde_http::header_name")]
     pub name: http::HeaderName,
     pub value: HeaderValueMatch,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum HeaderValueMatch {
     Exact {
@@ -96,13 +96,13 @@ pub enum HeaderValueMatch {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct QueryParamMatch {
     pub name: String,
     pub value: QueryValueMatch,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "PascalCase")]
 pub enum QueryValueMatch {
     Exact {
