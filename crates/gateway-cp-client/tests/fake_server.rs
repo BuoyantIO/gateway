@@ -129,6 +129,7 @@ fn listener_upsert(bind: &str, name: &str) -> pb::Upsert {
             }),
             hostname: String::new(),
             has_hostname: false,
+            tls: None,
         })),
     }
 }

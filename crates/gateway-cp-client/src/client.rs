@@ -110,6 +110,9 @@ async fn run_session(endpoint: &Endpoint, client_id: &str, store: &Store) -> Res
             for k in &outcome.upserted.backends {
                 seen.backends.insert(k.clone());
             }
+            for k in &outcome.upserted.secrets {
+                seen.secrets.insert(k.clone());
+            }
         }
 
         if sync_complete {

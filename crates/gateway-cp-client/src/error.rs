@@ -35,6 +35,13 @@ pub enum Error {
         source: regex::Error,
     },
 
+    #[error("invalid secret `{name}`: {source}")]
+    InvalidSecret {
+        name: String,
+        #[source]
+        source: gateway_config::secret::TlsSecretError,
+    },
+
     #[error(transparent)]
     Store(#[from] gateway_state::StoreError),
 
