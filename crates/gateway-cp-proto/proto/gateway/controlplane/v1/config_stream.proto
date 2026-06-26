@@ -50,6 +50,7 @@ message Upsert {
     ListenerUpsert  listener   = 11;
     HttpRouteUpsert http_route = 12;
     BackendUpsert   backend    = 13;
+    SecretUpsert    secret     = 14;
   }
 }
 
@@ -59,6 +60,7 @@ message Remove {
     ListenerKey listener   = 11;
     RouteKey    http_route = 12;
     BackendKey  backend    = 13;
+    SecretKey   secret     = 14;
   }
 }
 
@@ -68,12 +70,14 @@ message BindKey     { string name = 1; }
 message ListenerKey { string bind = 1; string name = 2; }
 message RouteKey    { string bind = 1; string listener = 2; string name = 3; }
 message BackendKey  { string name = 1; }
+message SecretKey   { string name = 1; }
 
-// -------- Bind (HTTP only in v0) --------
+// -------- Bind --------
 
 enum BindProtocol {
   BIND_PROTOCOL_UNSPECIFIED = 0;
   BIND_PROTOCOL_HTTP        = 1;
+  BIND_PROTOCOL_TLS         = 2;
 }
 
 message BindUpsert {
@@ -83,12 +87,32 @@ message BindUpsert {
   BindProtocol bind_protocol = 4;
 }
 
-// -------- HTTP Listener --------
+// -------- Listener --------
 
 message ListenerUpsert {
   ListenerKey key          = 1;
   string      hostname     = 2;
-  bool        has_hostname = 3;    // proto3 Option<String> workaround
+  bool        has_hostname = 3;
+  ListenerTls tls          = 4;
+}
+
+enum TlsMode {
+  TLS_MODE_UNSPECIFIED = 0;
+  TLS_MODE_TERMINATE   = 1;
+  TLS_MODE_PASSTHROUGH = 2;
+}
+
+message ListenerTls {
+  TlsMode         mode             = 1;
+  repeated string certificate_refs = 2;  // Secret names
+}
+
+// -------- Secret --------
+
+message SecretUpsert {
+  string name     = 1;
+  string cert_pem = 2;
+  string key_pem  = 3;
 }
 
 // -------- HttpRoute --------
