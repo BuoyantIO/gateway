@@ -258,6 +258,7 @@ fn emit_gateway_listeners(
                 }),
                 hostname: listener.hostname.clone().unwrap_or_default(),
                 has_hostname: listener.hostname.is_some(),
+                tls: None,
             },
         );
         accepted.insert(listener.name.clone(), listener.port);
