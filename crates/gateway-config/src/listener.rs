@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::route::{HttpRoute, TcpRoute, TlsRoute};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "listenerProtocol", rename_all = "UPPERCASE")]
 pub enum Listener {
     Tls(TlsListener),
@@ -11,7 +11,7 @@ pub enum Listener {
     Tcp(TcpListener),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsListener {
     pub name: String,
@@ -22,7 +22,7 @@ pub struct TlsListener {
     pub routes: Vec<TlsRoute>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpsListener {
     pub name: String,
@@ -33,7 +33,7 @@ pub struct HttpsListener {
     pub routes: Vec<HttpRoute>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpListener {
     pub name: String,
@@ -43,7 +43,7 @@ pub struct HttpListener {
     pub routes: Vec<HttpRoute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TcpListener {
     pub name: String,
@@ -51,20 +51,20 @@ pub struct TcpListener {
     pub routes: Vec<TcpRoute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TlsConfig {
     pub mode: TlsMode,
     #[serde(default)]
     pub certificates: Vec<CertRef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum TlsMode {
     Terminate,
     Passthrough,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CertRef {
     pub name: String,
     pub kind: String,
