@@ -54,7 +54,6 @@ gatewayConfig:
           port: 8080
   secrets:
     - name: app-tls
-      type: TLS
       certPem: |
         -----BEGIN CERTIFICATE-----
         MIIBgjCCASmgAwIBAgIUW/OT9NoEgpMEra4i2ttY/oSsRe0wCgYIKoZIzj0EAwIw

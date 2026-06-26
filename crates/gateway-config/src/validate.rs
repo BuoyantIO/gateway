@@ -80,7 +80,7 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), Vec<Rejection>> {
     );
     check_unique(
         "secrets",
-        cfg.secrets.iter().map(crate::secret::Secret::name),
+        cfg.secrets.iter().map(|s| s.name.as_str()),
         &mut rejections,
     );
 

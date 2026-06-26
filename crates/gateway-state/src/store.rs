@@ -10,7 +10,7 @@ use gateway_config::backend::{Backend, BackendRef};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::listener::{HttpListener, Listener};
 use gateway_config::route::HttpRoute;
-use gateway_config::secret::{Secret, TlsSecret};
+use gateway_config::secret::TlsSecret;
 
 use crate::active::{
     ActiveBackend, ActiveBackendRef, ActiveBind, ActiveHttpListener, ActiveHttpRoute,
@@ -164,7 +164,7 @@ impl Store {
         self.dispatch(events);
     }
 
-    pub fn upsert_secret(&self, secret: Secret) {
+    pub fn upsert_secret(&self, secret: TlsSecret) {
         self.inner.write().upsert_secret(secret);
     }
 
@@ -538,10 +538,9 @@ impl Inner {
     // Secrets are leaves with no preconditions and no dependents in
     // v0 — no cascade, no events. A `TlsSecret` is valid by
     // construction (parsed on the way in), so this is infallible.
-    fn upsert_secret(&mut self, secret: Secret) {
-        let Secret::Tls(tls) = secret;
-        let key = SecretKey::new(tls.name.clone());
-        self.secrets.insert(key, Arc::new(tls));
+    fn upsert_secret(&mut self, secret: TlsSecret) {
+        let key = SecretKey::new(secret.name.clone());
+        self.secrets.insert(key, Arc::new(secret));
     }
 
     fn remove_secret(&mut self, key: &SecretKey) {
@@ -1631,8 +1630,8 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         SecretKey::new(name)
     }
 
-    fn tls_secret(name: &str) -> Secret {
-        Secret::Tls(TlsSecret::new(name, CERT_PEM, KEY_PEM).expect("valid test secret"))
+    fn tls_secret(name: &str) -> TlsSecret {
+        TlsSecret::new(name, CERT_PEM, KEY_PEM).expect("valid test secret")
     }
 
     #[test]

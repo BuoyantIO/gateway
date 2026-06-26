@@ -3,13 +3,6 @@ use std::fmt;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Deserializer};
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-pub enum Secret {
-    #[serde(rename = "TLS")]
-    Tls(TlsSecret),
-}
-
 /// A TLS secret with its cert chain and private key already parsed
 /// to DER.
 pub struct TlsSecret {
@@ -73,14 +66,6 @@ impl<'de> Deserialize<'de> for TlsSecret {
         }
         let raw = Raw::deserialize(deserializer)?;
         Self::new(raw.name, &raw.cert_pem, &raw.key_pem).map_err(serde::de::Error::custom)
-    }
-}
-
-impl Secret {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Tls(s) => &s.name,
-        }
     }
 }
 
@@ -170,18 +155,18 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     #[test]
     fn deserialize_parses_pem_from_yaml() {
         let yaml = format!(
-            "type: TLS\nname: app-tls\ncertPem: |\n{}\nkeyPem: |\n{}",
+            "name: app-tls\ncertPem: |\n{}\nkeyPem: |\n{}",
             indent(TEST_CERT_PEM),
             indent(TEST_KEY_PEM),
         );
-        let secret: Secret = serde_yaml::from_str(&yaml).expect("parses");
-        assert_eq!(secret.name(), "app-tls");
+        let secret: TlsSecret = serde_yaml::from_str(&yaml).expect("parses");
+        assert_eq!(secret.name, "app-tls");
     }
 
     #[test]
     fn deserialize_rejects_malformed_pem() {
-        let yaml = "type: TLS\nname: bad\ncertPem: nope\nkeyPem: nope\n";
-        let err = serde_yaml::from_str::<Secret>(yaml).unwrap_err();
+        let yaml = "name: bad\ncertPem: nope\nkeyPem: nope\n";
+        let err = serde_yaml::from_str::<TlsSecret>(yaml).unwrap_err();
         assert!(err.to_string().contains("certificate") || err.to_string().contains("PEM"));
     }
 

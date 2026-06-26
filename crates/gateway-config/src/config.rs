@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use crate::backend::Backend;
 use crate::bind::Bind;
-use crate::secret::Secret;
+use crate::secret::TlsSecret;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,5 +12,5 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub backends: Vec<Backend>,
     #[serde(default)]
-    pub secrets: Vec<Secret>,
+    pub secrets: Vec<TlsSecret>,
 }
