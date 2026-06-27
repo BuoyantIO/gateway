@@ -65,7 +65,9 @@ impl<'de> Deserialize<'de> for TlsSecret {
             key_pem: String,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Self::new(raw.name, &raw.cert_pem, &raw.key_pem).map_err(serde::de::Error::custom)
+        let name = raw.name.clone();
+        Self::new(raw.name, &raw.cert_pem, &raw.key_pem)
+            .map_err(|e| serde::de::Error::custom(format!("invalid secret `{name}`: {e}")))
     }
 }
 
