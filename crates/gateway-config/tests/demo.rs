@@ -1,4 +1,3 @@
-use gateway_config::secret::Secret;
 use gateway_config::{parse_yaml, validate};
 
 const DEMO: &str = include_str!("fixtures/demo.yaml");
@@ -10,7 +9,7 @@ fn demo_fixture_parses_and_validates() {
     assert_eq!(cfg.binds.len(), 1);
     assert_eq!(cfg.backends.len(), 2);
     assert_eq!(cfg.secrets.len(), 1);
-    assert!(matches!(cfg.secrets[0], Secret::Tls(_)));
+    assert_eq!(cfg.secrets[0].name, "app-tls");
 
     validate(&cfg).expect("demo fixture should validate");
 }

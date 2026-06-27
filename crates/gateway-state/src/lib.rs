@@ -14,5 +14,5 @@ pub use active::{
 };
 pub use error::{ApplyReport, StoreError};
 pub use event::BindEvent;
-pub use key::{BackendKey, BindKey, ListenerKey, RegisteredKeys, RouteKey};
+pub use key::{BackendKey, BindKey, ListenerKey, RegisteredKeys, RouteKey, SecretKey};
 pub use store::{Store, StoreRead};

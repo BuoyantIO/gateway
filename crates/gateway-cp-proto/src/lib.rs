@@ -61,6 +61,7 @@ mod tests {
             }),
             hostname: "app.example.com".into(),
             has_hostname: true,
+            tls: None,
         };
         let route_upsert = v1::HttpRouteUpsert {
             key: Some(v1::RouteKey {

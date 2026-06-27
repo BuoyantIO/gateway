@@ -10,13 +10,14 @@ use gateway_config::backend::{Backend, BackendRef};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::listener::{HttpListener, Listener};
 use gateway_config::route::HttpRoute;
+use gateway_config::secret::TlsSecret;
 
 use crate::active::{
     ActiveBackend, ActiveBackendRef, ActiveBind, ActiveHttpListener, ActiveHttpRoute,
 };
 use crate::error::{ApplyReport, StoreError};
 use crate::event::BindEvent;
-use crate::key::{BackendKey, BindKey, ListenerKey, RegisteredKeys, RouteKey};
+use crate::key::{BackendKey, BindKey, ListenerKey, RegisteredKeys, RouteKey, SecretKey};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -62,6 +63,9 @@ struct Inner {
     bind_meta: HashMap<BindKey, BindMeta>,
     /// Registered backends.
     backends: HashMap<BackendKey, Arc<ActiveBackend>>,
+    /// Registered TLS secrets. Like backends, these have no
+    /// preconditions — always active when registered.
+    secrets: HashMap<SecretKey, Arc<TlsSecret>>,
 
     /// HTTP listeners whose preconditions are NOT currently met.
     pending_listeners: HashMap<ListenerKey, HttpListener>,
@@ -160,6 +164,14 @@ impl Store {
         self.dispatch(events);
     }
 
+    pub fn upsert_secret(&self, secret: TlsSecret) {
+        self.inner.write().upsert_secret(secret);
+    }
+
+    pub fn remove_secret(&self, key: &SecretKey) {
+        self.inner.write().remove_secret(key);
+    }
+
     pub fn apply(&self, cfg: &GatewayConfig) -> ApplyReport {
         let (report, events) = self.inner.write().apply(cfg);
         self.dispatch(events);
@@ -168,7 +180,7 @@ impl Store {
 
     /// Drop every registered key not in `keep`.
     pub fn retain(&self, keep: &RegisteredKeys) {
-        let (stale_routes, stale_backends, stale_listeners, stale_binds) = {
+        let (stale_routes, stale_backends, stale_listeners, stale_binds, stale_secrets) = {
             let read = self.read();
             (
                 read.registered_route_keys()
@@ -183,6 +195,9 @@ impl Store {
                 read.registered_bind_keys()
                     .filter(|k| !keep.binds.contains(k))
                     .collect::<Vec<_>>(),
+                read.registered_secret_keys()
+                    .filter(|k| !keep.secrets.contains(k))
+                    .collect::<Vec<_>>(),
             )
         };
         for k in &stale_routes {
@@ -196,6 +211,9 @@ impl Store {
         }
         for k in &stale_binds {
             self.remove_bind(k);
+        }
+        for k in &stale_secrets {
+            self.remove_secret(k);
         }
     }
 
@@ -221,6 +239,10 @@ impl StoreRead<'_> {
 
     pub fn backend(&self, key: &BackendKey) -> Option<Arc<ActiveBackend>> {
         self.guard.backends.get(key).cloned()
+    }
+
+    pub fn secret(&self, key: &SecretKey) -> Option<Arc<TlsSecret>> {
+        self.guard.secrets.get(key).cloned()
     }
 
     pub fn is_listener_active(&self, key: &ListenerKey) -> bool {
@@ -262,6 +284,11 @@ impl StoreRead<'_> {
     /// Every backend currently upserted.
     pub fn registered_backend_keys(&self) -> impl Iterator<Item = BackendKey> + '_ {
         self.guard.backends.keys().cloned()
+    }
+
+    /// Every secret currently upserted.
+    pub fn registered_secret_keys(&self) -> impl Iterator<Item = SecretKey> + '_ {
+        self.guard.secrets.keys().cloned()
     }
 }
 
@@ -508,6 +535,18 @@ impl Inner {
         self.cascade_routes_by_backend(key)
     }
 
+    // Secrets are leaves with no preconditions and no dependents in
+    // v0 — no cascade, no events. A `TlsSecret` is valid by
+    // construction (parsed on the way in), so this is infallible.
+    fn upsert_secret(&mut self, secret: TlsSecret) {
+        let key = SecretKey::new(secret.name.clone());
+        self.secrets.insert(key, Arc::new(secret));
+    }
+
+    fn remove_secret(&mut self, key: &SecretKey) {
+        self.secrets.remove(key);
+    }
+
     fn cascade_routes_by_backend(&mut self, key: &BackendKey) -> Vec<BindEvent> {
         let rkeys: Vec<RouteKey> = self
             .routes_by_backend
@@ -559,10 +598,8 @@ impl Inner {
             events.append(&mut e);
         }
         for secret in &cfg.secrets {
-            report.skipped.push(format!(
-                "secrets[{}]: not supported in this slice",
-                secret.name()
-            ));
+            self.upsert_secret(secret.clone());
+            report.applied += 1;
         }
 
         let new_keys: HashSet<BindKey> = self.bind_meta.keys().cloned().collect();
@@ -576,6 +613,7 @@ impl Inner {
     fn clear(&mut self) {
         self.bind_meta.clear();
         self.backends.clear();
+        self.secrets.clear();
         self.pending_listeners.clear();
         self.pending_routes.clear();
         self.binds.clear();
@@ -1531,6 +1569,7 @@ gatewayConfig:
             listeners: [lkey("b", "l")].into_iter().collect(),
             routes: [rkey("b", "l", "r")].into_iter().collect(),
             backends: [backendkey("be")].into_iter().collect(),
+            secrets: HashSet::default(),
         };
         store.retain(&keep);
 
@@ -1556,11 +1595,90 @@ gatewayConfig:
             listeners: [lkey("b", "l")].into_iter().collect(),
             routes: [rkey("b", "l", "r")].into_iter().collect(),
             backends: HashSet::default(),
+            secrets: HashSet::default(),
         };
         store.retain(&keep);
 
         let read = store.read();
         let routes: HashSet<RouteKey> = read.registered_route_keys().collect();
         assert!(routes.contains(&rkey("b", "l", "r")));
+    }
+
+    // --- secrets ---
+
+    // Throwaway self-signed EC cert + PKCS#8 key (same pair as the
+    // gateway-config fixtures).
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBgjCCASmgAwIBAgIUW/OT9NoEgpMEra4i2ttY/oSsRe0wCgYIKoZIzj0EAwIw\n\
+FzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MB4XDTI2MDYyNjEwNTEyOFoXDTM2MDYy\n\
+MzEwNTEyOFowFzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MFkwEwYHKoZIzj0CAQYI\n\
+KoZIzj0DAQcDQgAEZoF6gHnR0OJdILhqvT75ZE5oX/NkCobjCPRKQmQAvEFeN8ku\n\
+f+C449e9U2Gq6S7C72DJWjcsr8gaxjiMRie0H6NTMFEwHQYDVR0OBBYEFKmMFFZT\n\
+6oW/R893bFKGDqRaBuoRMB8GA1UdIwQYMBaAFKmMFFZT6oW/R893bFKGDqRaBuoR\n\
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgEdjQ6EJUY9QMrNQy\n\
+YhAYK89fjb5J6TE0AJY4QnmcFR0CIHo7A7WYP2hT7rr6orgxEqAVx7DGbd0aCCqe\n\
+GkIpYyxV\n\
+-----END CERTIFICATE-----\n";
+
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H\n\
+/hzgYBDdRqvQrz6jRyF1kz8TrcChRANCAARmgXqAedHQ4l0guGq9PvlkTmhf82QK\n\
+huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
+-----END PRIVATE KEY-----\n";
+
+    fn secretkey(name: &str) -> SecretKey {
+        SecretKey::new(name)
+    }
+
+    fn tls_secret(name: &str) -> TlsSecret {
+        TlsSecret::new(name, CERT_PEM, KEY_PEM).expect("valid test secret")
+    }
+
+    #[test]
+    fn upsert_secret_is_readable() {
+        let store = Store::new();
+        store.upsert_secret(tls_secret("app-tls"));
+        let s = store.read().secret(&secretkey("app-tls")).expect("present");
+        assert_eq!(s.name, "app-tls");
+        assert_eq!(s.certs.len(), 1);
+    }
+
+    #[test]
+    fn remove_secret_evicts() {
+        let store = Store::new();
+        store.upsert_secret(tls_secret("app-tls"));
+        store.remove_secret(&secretkey("app-tls"));
+        assert!(store.read().secret(&secretkey("app-tls")).is_none());
+    }
+
+    #[test]
+    fn retain_keeps_listed_secret_drops_unlisted() {
+        let store = Store::new();
+        store.upsert_secret(tls_secret("keep"));
+        store.upsert_secret(tls_secret("drop"));
+
+        let keep = RegisteredKeys {
+            secrets: [secretkey("keep")].into_iter().collect(),
+            ..Default::default()
+        };
+        store.retain(&keep);
+
+        assert!(store.read().secret(&secretkey("keep")).is_some());
+        assert!(store.read().secret(&secretkey("drop")).is_none());
+    }
+
+    #[test]
+    fn apply_reports_secret_applied() {
+        let store = Store::new();
+        let cfg = GatewayConfig {
+            name: "t".into(),
+            binds: vec![],
+            backends: vec![],
+            secrets: vec![tls_secret("app-tls")],
+        };
+        let report = store.apply(&cfg);
+        assert_eq!(report.applied, 1);
+        assert!(report.skipped.is_empty());
+        assert!(store.read().secret(&secretkey("app-tls")).is_some());
     }
 }

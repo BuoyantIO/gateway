@@ -2,7 +2,7 @@
 //! translation; no caching, no network.
 
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, Store};
+use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey, Store};
 
 use crate::convert;
 use crate::error::Error;
@@ -21,6 +21,7 @@ pub struct Affected {
     pub listeners: Vec<ListenerKey>,
     pub routes: Vec<RouteKey>,
     pub backends: Vec<BackendKey>,
+    pub secrets: Vec<SecretKey>,
 }
 
 /// Apply one batched `ConfigUpdate`. Upserts first, then removes.
@@ -68,6 +69,12 @@ fn apply_upsert(store: &Store, upsert: pb::Upsert, out: &mut Affected) -> Result
             store.upsert_backend(backend);
             out.backends.push(BackendKey::new(name));
         }
+        pb::upsert::Body::Secret(s) => {
+            let secret = convert::secret(s)?;
+            let key = SecretKey::new(secret.name.clone());
+            store.upsert_secret(secret);
+            out.secrets.push(key);
+        }
     }
     Ok(())
 }
@@ -97,6 +104,11 @@ fn apply_remove(store: &Store, remove: pb::Remove, out: &mut Affected) {
             let k = convert::backend_key(k);
             store.remove_backend(&k);
             out.backends.push(k);
+        }
+        pb::remove::Key::Secret(k) => {
+            let k = convert::secret_key(k);
+            store.remove_secret(&k);
+            out.secrets.push(k);
         }
     }
 }
@@ -133,6 +145,7 @@ mod tests {
                 }),
                 hostname,
                 has_hostname,
+                tls: None,
             })),
         }
     }
@@ -175,6 +188,35 @@ mod tests {
                     port,
                 }],
                 protocol: pb::BackendProtocol::Http1 as i32,
+            })),
+        }
+    }
+
+    // Throwaway self-signed EC cert + PKCS#8 key.
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBgjCCASmgAwIBAgIUW/OT9NoEgpMEra4i2ttY/oSsRe0wCgYIKoZIzj0EAwIw\n\
+FzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MB4XDTI2MDYyNjEwNTEyOFoXDTM2MDYy\n\
+MzEwNTEyOFowFzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MFkwEwYHKoZIzj0CAQYI\n\
+KoZIzj0DAQcDQgAEZoF6gHnR0OJdILhqvT75ZE5oX/NkCobjCPRKQmQAvEFeN8ku\n\
+f+C449e9U2Gq6S7C72DJWjcsr8gaxjiMRie0H6NTMFEwHQYDVR0OBBYEFKmMFFZT\n\
+6oW/R893bFKGDqRaBuoRMB8GA1UdIwQYMBaAFKmMFFZT6oW/R893bFKGDqRaBuoR\n\
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgEdjQ6EJUY9QMrNQy\n\
+YhAYK89fjb5J6TE0AJY4QnmcFR0CIHo7A7WYP2hT7rr6orgxEqAVx7DGbd0aCCqe\n\
+GkIpYyxV\n\
+-----END CERTIFICATE-----\n";
+
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H\n\
+/hzgYBDdRqvQrz6jRyF1kz8TrcChRANCAARmgXqAedHQ4l0guGq9PvlkTmhf82QK\n\
+huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
+-----END PRIVATE KEY-----\n";
+
+    fn secret_upsert(name: &str, cert_pem: &str, key_pem: &str) -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Secret(pb::SecretUpsert {
+                name: name.into(),
+                cert_pem: cert_pem.into(),
+                key_pem: key_pem.into(),
             })),
         }
     }
@@ -533,6 +575,63 @@ mod tests {
         let bind = store.read().bind(&BindKey::new("b")).unwrap();
         let r = &bind.listeners[0].routes[0];
         assert!(r.filters.is_empty());
+    }
+
+    // ----- secrets -----
+
+    #[test]
+    fn secret_upsert_lands_in_store() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(vec![secret_upsert("app-tls", CERT_PEM, KEY_PEM)], vec![]),
+        )
+        .expect("apply ok");
+        let s = store
+            .read()
+            .secret(&gateway_state::SecretKey::new("app-tls"))
+            .expect("secret present");
+        assert_eq!(s.name, "app-tls");
+    }
+
+    #[test]
+    fn remove_secret_evicts() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(vec![secret_upsert("app-tls", CERT_PEM, KEY_PEM)], vec![]),
+        )
+        .unwrap();
+        apply_update(
+            &store,
+            pb::ConfigUpdate {
+                upserts: vec![],
+                removes: vec![pb::Remove {
+                    key: Some(pb::remove::Key::Secret(pb::SecretKey {
+                        name: "app-tls".into(),
+                    })),
+                }],
+                sync_complete: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            store
+                .read()
+                .secret(&gateway_state::SecretKey::new("app-tls"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_secret_pem_rejected() {
+        let store = Store::new();
+        let err = apply_update(
+            &store,
+            batch(vec![secret_upsert("bad", "not a cert", KEY_PEM)], vec![]),
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, Error::InvalidSecret { name, .. } if name == "bad"));
     }
 
     // ----- empty sync -----

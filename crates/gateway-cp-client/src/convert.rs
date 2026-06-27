@@ -17,8 +17,9 @@ use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, QueryParamMatch,
     QueryValueMatch,
 };
+use gateway_config::secret::TlsSecret;
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
+use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
 
 use crate::error::Error;
 
@@ -107,6 +108,16 @@ pub fn backend(msg: pb::BackendUpsert) -> Result<Backend, Error> {
     }))
 }
 
+/// # Errors
+/// Returns [`Error::InvalidSecret`] if the cert chain / private key
+/// PEM is malformed (parsed up front so a bad secret is rejected here
+/// rather than at handshake time).
+pub fn secret(msg: pb::SecretUpsert) -> Result<TlsSecret, Error> {
+    let name = msg.name;
+    TlsSecret::new(name.clone(), &msg.cert_pem, &msg.key_pem)
+        .map_err(|source| Error::InvalidSecret { name, source })
+}
+
 // ==================== Remove keys ====================
 
 pub fn bind_key(msg: pb::BindKey) -> BindKey {
@@ -126,6 +137,10 @@ pub fn route_key(msg: pb::RouteKey) -> RouteKey {
 
 pub fn backend_key(msg: pb::BackendKey) -> BackendKey {
     BackendKey::new(msg.name)
+}
+
+pub fn secret_key(msg: pb::SecretKey) -> SecretKey {
+    SecretKey::new(msg.name)
 }
 
 // ==================== Pieces ====================
@@ -300,6 +315,7 @@ fn endpoint(msg: pb::Endpoint) -> Result<Endpoint, Error> {
 fn bind_protocol(value: i32) -> Result<BindProtocol, Error> {
     match pb::BindProtocol::try_from(value) {
         Ok(pb::BindProtocol::Http) => Ok(BindProtocol::Http),
+        Ok(pb::BindProtocol::Tls) => Ok(BindProtocol::Tls),
         Ok(pb::BindProtocol::Unspecified) | Err(_) => Err(Error::UnsupportedEnum {
             kind: "BindProtocol",
             value,
