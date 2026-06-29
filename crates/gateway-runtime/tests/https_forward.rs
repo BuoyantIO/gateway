@@ -449,3 +449,41 @@ async fn sni_with_no_matching_listener_rejected() {
     let _ = shutdown.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }
+
+// A bind with an exact `a.example.com` listener (cert A) alongside a
+// `*.example.com` wildcard listener (cert B), to exercise SNI wildcard
+// matching and exact-over-wildcard precedence on the accept path.
+fn wildcard_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
+    let mut config = two_listener_config(bind_port, upstream_port);
+    if let Listener::Https(lb) = &mut config.binds[0].listeners[1] {
+        lb.hostname = Some("*.example.com".into());
+    }
+    config
+}
+
+#[tokio::test]
+async fn sni_wildcard_match_and_exact_precedence() {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let store = Store::new();
+    let _ = store.apply(&wildcard_listener_config(bind_port, upstream));
+    let (gw, shutdown) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let cert_a = TlsSecret::new("a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
+    let cert_b = TlsSecret::new("b", CERT_B_PEM, KEY_B_PEM).unwrap().certs[0].clone();
+
+    // A host only the wildcard covers is served the wildcard's cert.
+    let tls_wild = tls_connect(bind_port, &[b"http/1.1"], "app.example.com").await;
+    assert_eq!(tls_wild.get_ref().1.peer_certificates().unwrap()[0], cert_b);
+
+    // The exact listener wins over the wildcard for its own hostname.
+    let tls_exact = tls_connect(bind_port, &[b"http/1.1"], "a.example.com").await;
+    assert_eq!(
+        tls_exact.get_ref().1.peer_certificates().unwrap()[0],
+        cert_a
+    );
+
+    let _ = shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
+}
