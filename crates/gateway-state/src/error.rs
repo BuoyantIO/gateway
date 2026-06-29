@@ -7,6 +7,9 @@ pub enum StoreError {
 
     #[error("unsupported TLS config for listener `{name}`: {reason}")]
     UnsupportedTls { name: String, reason: &'static str },
+
+    #[error("listener `{listener}` protocol does not match its bind")]
+    ListenerBindMismatch { listener: String },
 }
 
 #[derive(Debug, Default)]

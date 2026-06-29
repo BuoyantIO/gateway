@@ -20,12 +20,16 @@ hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tok
 parking_lot = "0.12"
 rand = "0.9"
 regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 tracing = "0.1"
 
 [dev-dependencies]
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }

@@ -13,7 +13,7 @@ use gateway_config::route::HttpRoute;
 use gateway_config::secret::TlsSecret;
 
 use crate::active::{
-    ActiveBackend, ActiveBackendRef, ActiveBind, ActiveHttpListener, ActiveHttpRoute,
+    ActiveBackend, ActiveBackendRef, ActiveBind, ActiveHttpRoute, ActiveListener, ActiveTls,
 };
 use crate::error::{ApplyReport, StoreError};
 use crate::event::BindEvent;
@@ -78,7 +78,7 @@ struct Inner {
     /// Resolved bind graph that readers walk.
     binds: HashMap<BindKey, Arc<ActiveBind>>,
     /// Listeners that satisfy every precondition right now.
-    active_listeners: HashMap<ListenerKey, Arc<ActiveHttpListener>>,
+    active_listeners: HashMap<ListenerKey, Arc<ActiveListener>>,
     /// Routes that satisfy every precondition right now.
     active_routes: HashMap<RouteKey, Arc<ActiveHttpRoute>>,
 
@@ -333,17 +333,26 @@ impl StoreRead<'_> {
 
 impl Inner {
     fn upsert_bind(&mut self, bind: Bind) -> Result<Vec<BindEvent>, StoreError> {
-        if bind.bind_protocol != BindProtocol::Http {
+        // HTTP (plaintext) and TLS (termination) binds are served; TCP
+        // is not. Embedded listeners are validated by the shared
+        // `decompose_listener` below.
+        if !matches!(bind.bind_protocol, BindProtocol::Http | BindProtocol::Tls) {
             return Err(StoreError::UnsupportedProtocol {
                 kind: "bind",
                 name: bind.name,
             });
         }
-        for listener in &bind.listeners {
-            if !matches!(listener, Listener::Http(_)) {
-                return Err(StoreError::UnsupportedProtocol {
-                    kind: "listener",
-                    name: listener.name().to_string(),
+        // Validate all embedded listeners before mutating any state:
+        // each must decompose, and its protocol must match the bind's.
+        let decomposed = bind
+            .listeners
+            .into_iter()
+            .map(decompose_listener)
+            .collect::<Result<Vec<_>, _>>()?;
+        for (name, data, _) in &decomposed {
+            if !protocol_matches(bind.bind_protocol, data) {
+                return Err(StoreError::ListenerBindMismatch {
+                    listener: name.clone(),
                 });
             }
         }
@@ -359,14 +368,8 @@ impl Inner {
             },
         );
 
-        for listener in bind.listeners {
-            let Listener::Http(http) = listener else {
-                unreachable!("already validated above")
-            };
-            let data = PendingListener::Http {
-                hostname: http.hostname,
-            };
-            self.upsert_listener_raw(&key, http.name, data, http.routes);
+        for (name, data, routes) in decomposed {
+            self.upsert_listener_raw(&key, name, data, routes);
         }
 
         // Re-evaluate orphan listeners under this bind that weren't in
@@ -436,54 +439,15 @@ impl Inner {
         parent: &BindKey,
         listener: Listener,
     ) -> Result<Vec<BindEvent>, StoreError> {
-        // Accept HTTP (no cert refs) and HTTPS (cert refs from its TLS
-        // config). Passthrough TLS and TCP are not supported.
-        let (name, data, routes) = match listener {
-            Listener::Http(h) => (
-                h.name,
-                PendingListener::Http {
-                    hostname: h.hostname,
-                },
-                h.routes,
-            ),
-            Listener::Https(h) => {
-                // v0 terminates only; passthrough HTTPS and non-Secret
-                // certificate refs are rejected rather than silently
-                // mis-gated.
-                if h.tls.mode != TlsMode::Terminate {
-                    return Err(StoreError::UnsupportedTls {
-                        name: h.name,
-                        reason: "only Terminate mode is supported",
-                    });
-                }
-                if h.tls.certificates.iter().any(|c| c.kind != "Secret") {
-                    return Err(StoreError::UnsupportedTls {
-                        name: h.name,
-                        reason: "certificate refs must be of kind Secret",
-                    });
-                }
-                let cert_refs = h
-                    .tls
-                    .certificates
-                    .iter()
-                    .map(|c| SecretKey::new(c.name.clone()))
-                    .collect();
-                (
-                    h.name,
-                    PendingListener::Https {
-                        hostname: h.hostname,
-                        cert_refs,
-                    },
-                    h.routes,
-                )
-            }
-            other => {
-                return Err(StoreError::UnsupportedProtocol {
-                    kind: "listener",
-                    name: other.name().to_string(),
-                });
-            }
-        };
+        let (name, data, routes) = decompose_listener(listener)?;
+        // Reject a listener whose protocol contradicts its bind — but
+        // only once the bind is known; an orphan listener is validated
+        // when its bind lands.
+        if let Some(meta) = self.bind_meta.get(parent)
+            && !protocol_matches(meta.bind_protocol, &data)
+        {
+            return Err(StoreError::ListenerBindMismatch { listener: name });
+        }
         self.upsert_listener_raw(parent, name, data, routes);
         if self.bind_meta.contains_key(parent) {
             self.rebuild_bind(parent);
@@ -891,7 +855,14 @@ impl Inner {
             self.re_resolve_route(&rk);
         }
 
-        if !self.bind_meta.contains_key(&key.bind) {
+        let Some(meta) = self.bind_meta.get(&key.bind) else {
+            return;
+        };
+        // Protocol gate: a listener never activates under a bind of the
+        // wrong protocol. The upsert paths reject this when the bind is
+        // already known; this also catches an orphan listener whose bind
+        // lands later.
+        if !protocol_matches(meta.bind_protocol, &self.pending_listeners[key]) {
             return;
         }
         // TLS dependency: every referenced secret must be present
@@ -923,10 +894,19 @@ impl Inner {
         let Some(raw) = self.pending_listeners.remove(key) else {
             return;
         };
-        let active = Arc::new(ActiveHttpListener {
+        // Resolve the listener's cert refs to the secrets it terminates
+        // with. All are present (checked above); empty == plaintext HTTP.
+        let tls = match raw.cert_refs() {
+            [] => None,
+            refs => Some(ActiveTls {
+                secrets: refs.iter().map(|s| Arc::clone(&self.secrets[s])).collect(),
+            }),
+        };
+        let active = Arc::new(ActiveListener {
             key: key.clone(),
             hostname: raw.hostname(),
             routes,
+            tls,
         });
         self.active_listeners.insert(key.clone(), active);
     }
@@ -957,7 +937,7 @@ impl Inner {
             .filter(|lk| self.active_listeners.contains_key(lk))
             .collect();
         lkeys.sort_by(|a, b| a.name.cmp(&b.name));
-        let listeners: Vec<Arc<ActiveHttpListener>> = lkeys
+        let listeners: Vec<Arc<ActiveListener>> = lkeys
             .into_iter()
             .map(|lk| Arc::clone(&self.active_listeners[&lk]))
             .collect();
@@ -969,6 +949,70 @@ impl Inner {
             listeners,
         });
         self.binds.insert(key.clone(), active);
+    }
+}
+
+/// Whether a listener's kind is valid under a bind's protocol. The
+/// runtime dispatches the accept path on the bind protocol, so an HTTP
+/// listener belongs only under an HTTP bind and an HTTPS (terminating)
+/// listener only under a TLS bind. TCP binds never reach here.
+fn protocol_matches(bind: BindProtocol, listener: &PendingListener) -> bool {
+    matches!(
+        (bind, listener),
+        (BindProtocol::Http, PendingListener::Http { .. })
+            | (BindProtocol::Tls, PendingListener::Https { .. })
+    )
+}
+
+/// Normalize a config `Listener` into the store's pending shape, with
+/// its routes split out. Accepts HTTP (no cert refs) and terminating
+/// HTTPS (cert refs from its TLS config); rejects passthrough TLS, TCP,
+/// and HTTPS configs the store can't serve (non-`Terminate` mode or
+/// non-`Secret` certificate refs). Shared by the embedded
+/// (`upsert_bind`) and incremental (`upsert_listener`) paths.
+fn decompose_listener(
+    listener: Listener,
+) -> Result<(String, PendingListener, Vec<HttpRoute>), StoreError> {
+    match listener {
+        Listener::Http(h) => Ok((
+            h.name,
+            PendingListener::Http {
+                hostname: h.hostname,
+            },
+            h.routes,
+        )),
+        Listener::Https(h) => {
+            if h.tls.mode != TlsMode::Terminate {
+                return Err(StoreError::UnsupportedTls {
+                    name: h.name,
+                    reason: "only Terminate mode is supported",
+                });
+            }
+            if h.tls.certificates.iter().any(|c| c.kind != "Secret") {
+                return Err(StoreError::UnsupportedTls {
+                    name: h.name,
+                    reason: "certificate refs must be of kind Secret",
+                });
+            }
+            let cert_refs = h
+                .tls
+                .certificates
+                .iter()
+                .map(|c| SecretKey::new(c.name.clone()))
+                .collect();
+            Ok((
+                h.name,
+                PendingListener::Https {
+                    hostname: h.hostname,
+                    cert_refs,
+                },
+                h.routes,
+            ))
+        }
+        other => Err(StoreError::UnsupportedProtocol {
+            kind: "listener",
+            name: other.name().to_string(),
+        }),
     }
 }
 
@@ -1313,18 +1357,20 @@ mod tests {
     }
 
     #[test]
-    fn tls_bind_rejected() {
+    fn tls_bind_accepted() {
+        // TLS binds are served now (termination); the bind registers
+        // even with no listener yet.
         let store = Store::new();
-        let err = store.upsert_bind(tls_bind("b", 443)).unwrap_err();
-        assert!(matches!(err, StoreError::UnsupportedProtocol { .. }));
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
+        assert!(store.read().bind(&bkey("b")).is_some());
     }
 
     #[test]
     fn https_listener_accepted() {
-        // HTTPS listeners are now accepted (their cert refs gate
-        // promotion); only TCP / passthrough TLS are rejected.
+        // HTTPS listeners are accepted under a TLS bind (their cert
+        // refs gate promotion); only TCP / passthrough TLS are rejected.
         let store = Store::new();
-        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
         assert!(
             store
                 .upsert_listener(&bkey("b"), https_listener("l"))
@@ -1349,6 +1395,69 @@ mod tests {
         b.listeners.push(tcp_listener("l"));
         let err = store.upsert_bind(b).unwrap_err();
         assert!(matches!(err, StoreError::UnsupportedProtocol { .. }));
+    }
+
+    // The runtime dispatches the accept path by bind protocol, so a
+    // listener whose protocol doesn't match its bind must be rejected:
+    // an HTTP listener under a TLS bind would get no certs, and an
+    // HTTPS listener under an HTTP bind would be served as plaintext.
+
+    #[test]
+    fn http_listener_under_tls_bind_rejected() {
+        let store = Store::new();
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
+        let err = store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ListenerBindMismatch { .. }));
+    }
+
+    #[test]
+    fn https_listener_under_http_bind_rejected() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        let err = store
+            .upsert_listener(&bkey("b"), https_listener("l"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ListenerBindMismatch { .. }));
+    }
+
+    #[test]
+    fn embedded_https_listener_under_http_bind_rejected() {
+        let store = Store::new();
+        let mut b = http_bind("b", 80);
+        b.listeners.push(https_listener("l"));
+        let err = store.upsert_bind(b).unwrap_err();
+        assert!(matches!(err, StoreError::ListenerBindMismatch { .. }));
+    }
+
+    #[test]
+    fn embedded_http_listener_under_tls_bind_rejected() {
+        let store = Store::new();
+        let mut b = tls_bind("b", 443);
+        b.listeners.push(http_listener("l"));
+        let err = store.upsert_bind(b).unwrap_err();
+        assert!(matches!(err, StoreError::ListenerBindMismatch { .. }));
+    }
+
+    // A listener stashed before its bind is validated at upsert time
+    // (bind unknown), so the protocol gate must also hold at promotion:
+    // an orphan HTTPS listener whose bind later lands as HTTP must never
+    // be promoted (which would serve it as plaintext).
+    #[test]
+    fn orphan_listener_not_promoted_under_mismatched_bind() {
+        let store = Store::new();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
+            .unwrap();
+        store.upsert_secret(tls_secret("app-tls"));
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+
+        // The bind lands as HTTP — a mismatch for the HTTPS listener.
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+
+        assert!(!store.read().is_listener_active(&lkey("b", "l")));
     }
 
     #[test]
@@ -1531,7 +1640,7 @@ gatewayConfig:
     }
 
     #[test]
-    fn apply_skips_non_http() {
+    fn apply_skips_tcp_keeps_http_and_tls() {
         let cfg = gateway_config::parse_yaml(
             r"
 gatewayConfig:
@@ -1563,12 +1672,12 @@ gatewayConfig:
         .unwrap();
         let store = Store::new();
         let report = store.apply(&cfg);
-        assert_eq!(report.skipped.len(), 2);
+        assert_eq!(report.skipped.len(), 1);
         assert!(report.skipped.iter().any(|s| s.contains("tcp-bind")));
-        assert!(report.skipped.iter().any(|s| s.contains("tls-bind")));
         assert!(store.read().bind(&bkey("http-bind")).is_some());
         assert!(store.read().bind(&bkey("tcp-bind")).is_none());
-        assert!(store.read().bind(&bkey("tls-bind")).is_none());
+        // TLS binds are served now, so this one is kept.
+        assert!(store.read().bind(&bkey("tls-bind")).is_some());
     }
 
     #[test]
@@ -1881,7 +1990,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     #[test]
     fn https_listener_stashed_until_secret_present() {
         let store = Store::new();
-        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
         store
             .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
             .unwrap();
@@ -1903,7 +2012,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     #[test]
     fn https_listener_needs_all_certs() {
         let store = Store::new();
-        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
         store
             .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["a", "b"]))
             .unwrap();
@@ -1981,7 +2090,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     #[test]
     fn removing_listener_cleans_secret_index() {
         let store = Store::new();
-        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
         store
             .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
             .unwrap();

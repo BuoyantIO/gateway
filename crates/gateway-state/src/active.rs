@@ -5,6 +5,7 @@ use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::bind::BindProtocol;
 use gateway_config::filter::HttpFilter;
 use gateway_config::route::HttpMatch;
+use gateway_config::secret::TlsSecret;
 
 use crate::key::{BackendKey, BindKey, ListenerKey, RouteKey};
 
@@ -13,20 +14,23 @@ pub struct ActiveBind {
     pub key: BindKey,
     pub address: IpAddr,
     pub port: u16,
-    /// Protocol family the operator declared for this bind. The store
-    /// only accepts `Http` today, but the field stays on the data model
-    /// regardless — protocol is a property of the bind, full stop.
-    /// When HTTPS lands the runtime will read this for dispatch.
+    /// Protocol family the operator declared for this bind. The runtime
+    /// dispatches the accept path on it (`Http` plaintext vs `Tls`
+    /// termination).
     pub bind_protocol: BindProtocol,
-    pub listeners: Vec<Arc<ActiveHttpListener>>,
+    pub listeners: Vec<Arc<ActiveListener>>,
 }
 
-/// An HTTP listener with one or more active routes. Route selection
-/// happens per-request in the runtime by matching against
-/// `ActiveHttpRoute::matches`. Active when at least one HTTP route is
-/// under it.
+/// A listener with one or more active routes that serves HTTP — either
+/// plaintext, or after terminating TLS (`tls.is_some()`). Route
+/// selection happens per-request in the runtime by matching against
+/// `ActiveHttpRoute::matches`. Active when at least one route is under
+/// it (and, for TLS, its certificate secrets are present).
+///
+/// TLS passthrough is a different data path (no HTTP routes) and is not
+/// represented here.
 #[derive(Debug, Clone)]
-pub struct ActiveHttpListener {
+pub struct ActiveListener {
     pub key: ListenerKey,
     /// Optional hostname filter for this listener. When set, the
     /// request's `:authority` (HTTP/2) or `Host` (HTTP/1.1) must
@@ -36,6 +40,18 @@ pub struct ActiveHttpListener {
     /// (deterministic from the store's placement logic); the runtime
     /// is responsible for picking the longest-prefix path match.
     pub routes: Vec<Arc<ActiveHttpRoute>>,
+    /// `Some` for an HTTPS (terminating) listener — the resolved
+    /// certificate material the runtime builds a TLS server config
+    /// from. `None` for plaintext HTTP.
+    pub tls: Option<ActiveTls>,
+}
+
+/// Resolved TLS material for a terminating listener. Holds the parsed
+/// secrets (cert chain + key as DER); the runtime turns these into a
+/// `rustls::ServerConfig`.
+#[derive(Debug, Clone)]
+pub struct ActiveTls {
+    pub secrets: Vec<Arc<TlsSecret>>,
 }
 
 #[derive(Debug, Clone)]

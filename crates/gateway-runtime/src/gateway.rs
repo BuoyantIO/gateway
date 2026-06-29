@@ -127,12 +127,13 @@ impl Gateway {
     fn spawn_session(&self, key: &BindKey) -> Option<BindSession> {
         let bind = self.store.read().bind(key)?;
         let addr = SocketAddr::new(bind.address, bind.port);
+        let protocol = bind.bind_protocol;
         let store = self.store.clone();
         let lb = Arc::clone(&self.lb);
         let http_client = self.http_client.clone();
         let bind_key = key.clone();
         let task = tokio::spawn(async move {
-            accept::run_bind(store, bind_key, addr, lb, http_client).await;
+            accept::run_bind(store, bind_key, addr, protocol, lb, http_client).await;
         });
         Some(BindSession {
             task,
