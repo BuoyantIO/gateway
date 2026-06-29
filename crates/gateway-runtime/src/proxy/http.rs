@@ -23,7 +23,7 @@ use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter as HttpFilterConf
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
-use gateway_state::{ActiveBackend, ActiveHttpListener, ActiveHttpRoute, BindKey, Store};
+use gateway_state::{ActiveBackend, ActiveHttpRoute, ActiveListener, BindKey, Store};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
@@ -31,7 +31,6 @@ use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use tokio::net::TcpStream;
 
 use crate::lb::{EndpointInfo, LoadBalancer};
 
@@ -206,21 +205,25 @@ fn apply_header_ops(
 
 // =================== connection + request handlers ===================
 
-/// Handle one accepted plaintext-HTTP downstream connection.
+/// Handle one accepted downstream connection. `io` is the byte stream —
+/// a plaintext `TcpStream`, or a `TlsStream` once the TLS bind path has
+/// terminated the handshake. Either way the HTTP serving is identical.
 ///
 /// `auto::Builder::serve_connection_with_upgrades` peeks the first
 /// bytes for the HTTP/2 preface and wires the H2 codec on match,
 /// otherwise HTTP/1.1. This is the same wiring agent gateway uses; it
 /// removes any need for the gateway itself to distinguish H1 from H2C.
-pub(crate) async fn handle_connection(
+pub(crate) async fn handle_connection<I>(
     store: Store,
     bind_key: BindKey,
-    stream: TcpStream,
+    stream: I,
     peer: SocketAddr,
     lb: Arc<LoadBalancer>,
     client: HttpClient,
-) {
-    tracing::debug!(bind = %bind_key, %peer, "http connection accepted");
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tracing::debug!(bind = %bind_key, %peer, "connection accepted");
 
     let io = TokioIo::new(stream);
     let svc = service_fn(move |req: Request<Incoming>| {
@@ -415,11 +418,11 @@ fn resolve_http_route(
 }
 
 fn pick_http_listener<'a>(
-    listeners: &'a [Arc<ActiveHttpListener>],
+    listeners: &'a [Arc<ActiveListener>],
     host: Option<&str>,
-) -> Option<&'a ActiveHttpListener> {
-    let mut hostname_match: Option<&ActiveHttpListener> = None;
-    let mut catchall: Option<&ActiveHttpListener> = None;
+) -> Option<&'a ActiveListener> {
+    let mut hostname_match: Option<&ActiveListener> = None;
+    let mut catchall: Option<&ActiveListener> = None;
     for l in listeners {
         match (&l.hostname, host) {
             (Some(want), Some(got)) if hostname_match.is_none() && hostname_matches(want, got) => {
