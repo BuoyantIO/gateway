@@ -5,12 +5,13 @@ use gateway_config::bind::BindProtocol;
 use gateway_config::secret::TlsSecret;
 use gateway_state::{BindKey, Store};
 use rustls::ServerConfig;
+use rustls::server::Acceptor;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::LazyConfigAcceptor;
 
 use crate::lb::LoadBalancer;
 use crate::proxy::http;
-use crate::proxy::http::HttpClient;
+use crate::proxy::http::{HttpClient, pick_listener_by_hostname};
 
 /// Per-bind accept task. Opens a `TcpListener` on `addr`, loops on
 /// accept, and hands each accepted connection to the HTTP handler —
@@ -61,12 +62,23 @@ pub(crate) async fn run_bind(
             }
             BindProtocol::Tls => {
                 tokio::spawn(async move {
-                    let Some(config) = server_config(&store, &bind_key) else {
-                        tracing::debug!(bind = %bind_key, %peer,
-                            "no TLS config for bind (cert not present?); dropping connection");
+                    // Read the ClientHello (incl. SNI) before choosing a
+                    // certificate, so the SNI picks the listener.
+                    let start = match LazyConfigAcceptor::new(Acceptor::default(), stream).await {
+                        Ok(start) => start,
+                        Err(e) => {
+                            tracing::debug!(bind = %bind_key, %peer, error = %e,
+                                "TLS ClientHello read failed");
+                            return;
+                        }
+                    };
+                    let sni = start.client_hello().server_name().map(str::to_owned);
+                    let Some(config) = server_config(&store, &bind_key, sni.as_deref()) else {
+                        tracing::debug!(bind = %bind_key, %peer, sni = ?sni,
+                            "no TLS listener matched (cert absent or unknown SNI); dropping");
                         return;
                     };
-                    match TlsAcceptor::from(config).accept(stream).await {
+                    match start.into_stream(config).await {
                         Ok(tls) => {
                             http::handle_connection(store, bind_key, tls, peer, lb, http_client)
                                 .await;
@@ -85,16 +97,21 @@ pub(crate) async fn run_bind(
     }
 }
 
-/// Build the `ServerConfig` for a TLS bind from its (single, in this
-/// version) terminating listener's certificate. Returns `None` when the
-/// bind has no active TLS listener yet — e.g. its secret hasn't landed.
-fn server_config(store: &Store, bind_key: &BindKey) -> Option<Arc<ServerConfig>> {
+/// Build the `ServerConfig` for a connection: pick the bind's listener
+/// whose hostname matches the `ClientHello` `sni` (exact > wildcard >
+/// catch-all) and use its certificate. Returns `None` when no listener
+/// matches (unknown SNI with no catch-all) or the matched listener's
+/// cert secret isn't present yet.
+fn server_config(
+    store: &Store,
+    bind_key: &BindKey,
+    sni: Option<&str>,
+) -> Option<Arc<ServerConfig>> {
     let bind = store.read().bind(bind_key)?;
-    let secret = bind
-        .listeners
-        .iter()
-        .find_map(|l| l.tls.as_ref())
-        .and_then(|tls| tls.secrets.first())?;
+    let listener = pick_listener_by_hostname(&bind.listeners, sni)?;
+    // One certificate per listener for now (multiple cert refs is a
+    // later change); the bind-protocol guard ensures it's a TLS listener.
+    let secret = listener.tls.as_ref()?.secrets.first()?;
     match build_server_config(secret) {
         Ok(config) => Some(config),
         Err(e) => {

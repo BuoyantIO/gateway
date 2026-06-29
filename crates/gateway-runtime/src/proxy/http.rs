@@ -397,8 +397,8 @@ fn resolve_http_route(
     let read = store.read();
     let bind = read.bind(bind_key).ok_or(RouteResolveError::BindGone)?;
 
-    let listener =
-        pick_http_listener(&bind.listeners, ctx.host).ok_or(RouteResolveError::NoListener)?;
+    let listener = pick_listener_by_hostname(&bind.listeners, ctx.host)
+        .ok_or(RouteResolveError::NoListener)?;
 
     let chosen = pick_http_route(&listener.routes, ctx).ok_or(RouteResolveError::NoRoute)?;
 
@@ -417,7 +417,11 @@ fn resolve_http_route(
     })
 }
 
-fn pick_http_listener<'a>(
+/// Pick the listener whose hostname best matches `host`: exact >
+/// wildcard suffix > catch-all (`hostname: None`). Host-agnostic — the
+/// HTTP path passes the request `Host`, the TLS accept path passes the
+/// `ClientHello` SNI.
+pub(crate) fn pick_listener_by_hostname<'a>(
     listeners: &'a [Arc<ActiveListener>],
     host: Option<&str>,
 ) -> Option<&'a ActiveListener> {
