@@ -397,8 +397,8 @@ fn resolve_http_route(
     let read = store.read();
     let bind = read.bind(bind_key).ok_or(RouteResolveError::BindGone)?;
 
-    let listener =
-        pick_http_listener(&bind.listeners, ctx.host).ok_or(RouteResolveError::NoListener)?;
+    let listener = pick_listener_by_hostname(&bind.listeners, ctx.host)
+        .ok_or(RouteResolveError::NoListener)?;
 
     let chosen = pick_http_route(&listener.routes, ctx).ok_or(RouteResolveError::NoRoute)?;
 
@@ -417,16 +417,27 @@ fn resolve_http_route(
     })
 }
 
-fn pick_http_listener<'a>(
+/// Pick the listener whose hostname best matches `host`: exact >
+/// wildcard suffix > catch-all (`hostname: None`). Host-agnostic — the
+/// HTTP path passes the request `Host`, the TLS accept path passes the
+/// `ClientHello` SNI.
+pub(crate) fn pick_listener_by_hostname<'a>(
     listeners: &'a [Arc<ActiveListener>],
     host: Option<&str>,
 ) -> Option<&'a ActiveListener> {
-    let mut hostname_match: Option<&ActiveListener> = None;
+    let mut exact_match: Option<&ActiveListener> = None;
+    let mut wildcard_match: Option<&ActiveListener> = None;
     let mut catchall: Option<&ActiveListener> = None;
     for l in listeners {
         match (&l.hostname, host) {
-            (Some(want), Some(got)) if hostname_match.is_none() && hostname_matches(want, got) => {
-                hostname_match = Some(l.as_ref());
+            (Some(want), Some(got)) if hostname_matches(want, got) => {
+                // A more specific hostname wins, so an exact match
+                // outranks a wildcard one independent of listener order.
+                if want.starts_with("*.") {
+                    wildcard_match.get_or_insert(l.as_ref());
+                } else {
+                    exact_match.get_or_insert(l.as_ref());
+                }
             }
             (None, _) if catchall.is_none() => {
                 catchall = Some(l.as_ref());
@@ -434,7 +445,7 @@ fn pick_http_listener<'a>(
             _ => {}
         }
     }
-    hostname_match.or(catchall)
+    exact_match.or(wildcard_match).or(catchall)
 }
 
 fn pick_http_route<'a>(
@@ -1442,5 +1453,75 @@ mod tests {
             .is_some()
         );
         assert!(best_match_summary(&[a], &ctx(Some("example.com"), "/", &m, &h, None)).is_none());
+    }
+
+    // --- pick_listener_by_hostname ---
+
+    fn listener(name: &str, hostname: Option<&str>) -> Arc<ActiveListener> {
+        Arc::new(ActiveListener {
+            key: gateway_state::ListenerKey::new(BindKey::new("b"), name),
+            hostname: hostname.map(str::to_owned),
+            routes: Vec::new(),
+            tls: None,
+        })
+    }
+
+    fn picked<'a>(ls: &'a [Arc<ActiveListener>], host: Option<&str>) -> Option<&'a str> {
+        pick_listener_by_hostname(ls, host).map(|l| l.key.name.as_str())
+    }
+
+    #[test]
+    fn pick_listener_exact_match() {
+        let ls = [listener("exact", Some("a.example.com"))];
+        assert_eq!(picked(&ls, Some("a.example.com")), Some("exact"));
+        assert_eq!(picked(&ls, Some("b.example.com")), None);
+    }
+
+    #[test]
+    fn pick_listener_wildcard_match() {
+        let ls = [listener("wild", Some("*.example.com"))];
+        assert_eq!(picked(&ls, Some("app.example.com")), Some("wild"));
+        assert_eq!(picked(&ls, Some("a.b.example.com")), Some("wild"));
+        assert_eq!(picked(&ls, Some("example.com")), None);
+    }
+
+    #[test]
+    fn pick_listener_exact_beats_wildcard() {
+        // Both match `app.example.com`; the exact listener must win
+        // regardless of iteration order.
+        let exact = listener("exact", Some("app.example.com"));
+        let wild = listener("wild", Some("*.example.com"));
+        assert_eq!(
+            picked(&[wild.clone(), exact.clone()], Some("app.example.com")),
+            Some("exact"),
+        );
+        assert_eq!(
+            picked(&[exact, wild.clone()], Some("app.example.com")),
+            Some("exact"),
+        );
+        // A host only the wildcard covers still picks the wildcard.
+        assert_eq!(picked(&[wild], Some("other.example.com")), Some("wild"));
+    }
+
+    #[test]
+    fn pick_listener_wildcard_beats_catchall() {
+        let wild = listener("wild", Some("*.example.com"));
+        let catchall = listener("catchall", None);
+        assert_eq!(
+            picked(&[catchall.clone(), wild.clone()], Some("app.example.com")),
+            Some("wild"),
+        );
+        // No hostname match → fall back to the catch-all.
+        assert_eq!(
+            picked(&[catchall, wild], Some("nomatch.org")),
+            Some("catchall"),
+        );
+    }
+
+    #[test]
+    fn pick_listener_catchall_only() {
+        let ls = [listener("catchall", None)];
+        assert_eq!(picked(&ls, Some("anything.com")), Some("catchall"));
+        assert_eq!(picked(&ls, None), Some("catchall"));
     }
 }

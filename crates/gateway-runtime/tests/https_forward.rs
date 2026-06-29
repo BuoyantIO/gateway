@@ -50,6 +50,26 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H\n\
 huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 -----END PRIVATE KEY-----\n";
 
+// A second throwaway pair (CN=second-listener), to tell SNI-selected
+// listeners apart by the certificate served.
+const CERT_B_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBiTCCAS+gAwIBAgIUFYI3ownf3oEEVFFQj8pA8hpuPD4wCgYIKoZIzj0EAwIw\n\
+GjEYMBYGA1UEAwwPc2Vjb25kLWxpc3RlbmVyMB4XDTI2MDYyOTEyNTAxNloXDTM2\n\
+MDYyNjEyNTAxNlowGjEYMBYGA1UEAwwPc2Vjb25kLWxpc3RlbmVyMFkwEwYHKoZI\n\
+zj0CAQYIKoZIzj0DAQcDQgAEZ90r7ZoDZDtVSfaKwdubEVIcx9yc89Q+btUYkf7b\n\
+Z1/daa1AQ0LJZPOipoZ1JmP4j98Byz9NRbH6dYL3DZZaRaNTMFEwHQYDVR0OBBYE\n\
+FHCcJHdHZnLHXupUl2eIsslQIr/dMB8GA1UdIwQYMBaAFHCcJHdHZnLHXupUl2eI\n\
+sslQIr/dMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhAMDHA+8t\n\
+VPeL5LaOAxi6qR1c9B0mIA7zMqSGUOgjHxWpAiB3x6X14G0y4v4OuV2GhSQSkwAm\n\
+abIF6YlJNVR6UhS8sg==\n\
+-----END CERTIFICATE-----\n";
+
+const KEY_B_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJ3s1PLJNTv03PFev\n\
+L3OYQ+MQAVhmZwkFWRONAjSid0ehRANCAARn3SvtmgNkO1VJ9orB25sRUhzH3Jzz\n\
+1D5u1RiR/ttnX91prUBDQslk86KmhnUmY/iP3wHLP01Fsfp1gvcNllpF\n\
+-----END PRIVATE KEY-----\n";
+
 // =================== harness ===================
 
 /// Plaintext HTTP echo: responds with `"{METHOD} {PATH}"`.
@@ -212,10 +232,14 @@ fn client_config(alpn: &[&[u8]]) -> ClientConfig {
     config
 }
 
-async fn tls_connect(bind_port: u16, alpn: &[&[u8]]) -> tokio_rustls::client::TlsStream<TcpStream> {
+async fn tls_connect(
+    bind_port: u16,
+    alpn: &[&[u8]],
+    sni: &str,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
     let connector = TlsConnector::from(Arc::new(client_config(alpn)));
     let tcp = TcpStream::connect(("127.0.0.1", bind_port)).await.unwrap();
-    let name = ServerName::try_from("localhost").unwrap();
+    let name = ServerName::try_from(sni.to_owned()).unwrap();
     connector.connect(name, tcp).await.expect("TLS handshake")
 }
 
@@ -230,7 +254,7 @@ async fn https_h1_round_trip() {
     let (gw, shutdown) = spawn_gateway(store);
     wait_for_listening(bind_port).await;
 
-    let tls = tls_connect(bind_port, &[b"http/1.1"]).await;
+    let tls = tls_connect(bind_port, &[b"http/1.1"], "localhost").await;
     let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
         .await
         .unwrap();
@@ -264,7 +288,7 @@ async fn https_h2_round_trip_via_alpn() {
     let (gw, shutdown) = spawn_gateway(store);
     wait_for_listening(bind_port).await;
 
-    let tls = tls_connect(bind_port, &[b"h2"]).await;
+    let tls = tls_connect(bind_port, &[b"h2"], "localhost").await;
     assert_eq!(
         tls.get_ref().1.alpn_protocol(),
         Some(&b"h2"[..]),
@@ -313,6 +337,151 @@ async fn https_not_served_when_secret_absent() {
     assert!(
         matches!(result, Ok(Err(_))),
         "handshake must fail when the cert secret is absent"
+    );
+
+    let _ = shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
+}
+
+// =================== SNI selection ===================
+
+/// One TLS bind, two HTTPS listeners on distinct hostnames, each with
+/// its own cert secret: `a.example.com` → cert A, `b.example.com` → cert B.
+fn two_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
+    let listener = |name: &str, host: &str, cert: &str| {
+        Listener::Https(HttpsListener {
+            name: name.into(),
+            hostname: Some(host.into()),
+            tls: TlsConfig {
+                mode: TlsMode::Terminate,
+                certificates: vec![CertRef {
+                    name: cert.into(),
+                    kind: "Secret".into(),
+                }],
+            },
+            routes: vec![HttpRoute {
+                name: "r".into(),
+                matches: vec![HttpMatch {
+                    host: None,
+                    path: PathMatch::PathPrefix { value: "/".into() },
+                    method: None,
+                    headers: vec![],
+                    query_params: vec![],
+                }],
+                backend_refs: vec![gateway_config::backend::BackendRef {
+                    name: "be".into(),
+                    weight: 1,
+                }],
+                filters: vec![],
+            }],
+        })
+    };
+    GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Tls,
+            listeners: vec![
+                listener("la", "a.example.com", "secret-a"),
+                listener("lb", "b.example.com", "secret-b"),
+            ],
+        }],
+        backends: vec![Backend::Static(StaticBackend {
+            name: "be".into(),
+            endpoints: vec![Endpoint {
+                name: "e0".into(),
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: upstream_port,
+            }],
+            protocol: BackendProtocol::Http1,
+        })],
+        secrets: vec![
+            TlsSecret::new("secret-a", CERT_PEM, KEY_PEM).unwrap(),
+            TlsSecret::new("secret-b", CERT_B_PEM, KEY_B_PEM).unwrap(),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn sni_selects_listener_certificate() {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let store = Store::new();
+    let _ = store.apply(&two_listener_config(bind_port, upstream));
+    let (gw, shutdown) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let cert_a = TlsSecret::new("a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
+    let cert_b = TlsSecret::new("b", CERT_B_PEM, KEY_B_PEM).unwrap().certs[0].clone();
+
+    // SNI a.example.com is served listener a's certificate, b gets b's.
+    let tls_a = tls_connect(bind_port, &[b"http/1.1"], "a.example.com").await;
+    assert_eq!(tls_a.get_ref().1.peer_certificates().unwrap()[0], cert_a);
+
+    let tls_b = tls_connect(bind_port, &[b"http/1.1"], "b.example.com").await;
+    assert_eq!(tls_b.get_ref().1.peer_certificates().unwrap()[0], cert_b);
+
+    let _ = shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
+}
+
+#[tokio::test]
+async fn sni_with_no_matching_listener_rejected() {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let store = Store::new();
+    // Both listeners are named; there is no catch-all.
+    let _ = store.apply(&two_listener_config(bind_port, upstream));
+    let (gw, shutdown) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let connector = TlsConnector::from(Arc::new(client_config(&[b"http/1.1"])));
+    let tcp = TcpStream::connect(("127.0.0.1", bind_port)).await.unwrap();
+    let name = ServerName::try_from("c.example.com").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), connector.connect(name, tcp)).await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "handshake must fail when SNI matches no listener and there is no catch-all"
+    );
+
+    let _ = shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
+}
+
+// A bind with an exact `a.example.com` listener (cert A) alongside a
+// `*.example.com` wildcard listener (cert B), to exercise SNI wildcard
+// matching and exact-over-wildcard precedence on the accept path.
+fn wildcard_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
+    let mut config = two_listener_config(bind_port, upstream_port);
+    if let Listener::Https(lb) = &mut config.binds[0].listeners[1] {
+        lb.hostname = Some("*.example.com".into());
+    }
+    config
+}
+
+#[tokio::test]
+async fn sni_wildcard_match_and_exact_precedence() {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let store = Store::new();
+    let _ = store.apply(&wildcard_listener_config(bind_port, upstream));
+    let (gw, shutdown) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let cert_a = TlsSecret::new("a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
+    let cert_b = TlsSecret::new("b", CERT_B_PEM, KEY_B_PEM).unwrap().certs[0].clone();
+
+    // A host only the wildcard covers is served the wildcard's cert.
+    let tls_wild = tls_connect(bind_port, &[b"http/1.1"], "app.example.com").await;
+    assert_eq!(tls_wild.get_ref().1.peer_certificates().unwrap()[0], cert_b);
+
+    // The exact listener wins over the wildcard for its own hostname.
+    let tls_exact = tls_connect(bind_port, &[b"http/1.1"], "a.example.com").await;
+    assert_eq!(
+        tls_exact.get_ref().1.peer_certificates().unwrap()[0],
+        cert_a
     );
 
     let _ = shutdown.send(());
