@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use gateway_config::GatewayConfig;
 use gateway_config::backend::{Backend, BackendRef};
 use gateway_config::bind::{Bind, BindProtocol};
-use gateway_config::listener::Listener;
+use gateway_config::listener::{Listener, TlsMode};
 use gateway_config::route::HttpRoute;
 use gateway_config::secret::TlsSecret;
 
@@ -447,6 +447,21 @@ impl Inner {
                 h.routes,
             ),
             Listener::Https(h) => {
+                // v0 terminates only; passthrough HTTPS and non-Secret
+                // certificate refs are rejected rather than silently
+                // mis-gated.
+                if h.tls.mode != TlsMode::Terminate {
+                    return Err(StoreError::UnsupportedTls {
+                        name: h.name,
+                        reason: "only Terminate mode is supported",
+                    });
+                }
+                if h.tls.certificates.iter().any(|c| c.kind != "Secret") {
+                    return Err(StoreError::UnsupportedTls {
+                        name: h.name,
+                        reason: "certificate refs must be of kind Secret",
+                    });
+                }
                 let cert_refs = h
                     .tls
                     .certificates
@@ -782,8 +797,15 @@ impl Inner {
             .map(|(sk, _)| sk.clone())
             .collect();
         for sk in secret_keys {
-            if let Some(set) = self.listeners_by_secret.get_mut(&sk) {
-                set.remove(key);
+            let empty = match self.listeners_by_secret.get_mut(&sk) {
+                Some(set) => {
+                    set.remove(key);
+                    set.is_empty()
+                }
+                None => false,
+            };
+            if empty {
+                self.listeners_by_secret.remove(&sk);
             }
         }
     }
@@ -1912,5 +1934,73 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
         store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
         assert!(store.read().is_listener_active(&lkey("b", "l")));
+    }
+
+    fn https_listener_full(name: &str, mode: TlsMode, certs: &[(&str, &str)]) -> Listener {
+        Listener::Https(HttpsListener {
+            name: name.into(),
+            hostname: None,
+            tls: TlsConfig {
+                mode,
+                certificates: certs
+                    .iter()
+                    .map(|(n, k)| CertRef {
+                        name: (*n).into(),
+                        kind: (*k).into(),
+                    })
+                    .collect(),
+            },
+            routes: vec![],
+        })
+    }
+
+    // v0 terminates only — a passthrough HTTPS listener is rejected,
+    // not accepted and then mis-gated on secrets.
+    #[test]
+    fn https_listener_passthrough_mode_rejected() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        let l = https_listener_full("l", TlsMode::Passthrough, &[("app-tls", "Secret")]);
+        let err = store.upsert_listener(&bkey("b"), l).unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedTls { .. }));
+    }
+
+    // Certificate refs must be Kubernetes Secrets; other kinds are
+    // rejected rather than gated against the secret set forever.
+    #[test]
+    fn https_listener_non_secret_cert_kind_rejected() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        let l = https_listener_full("l", TlsMode::Terminate, &[("cm", "ConfigMap")]);
+        let err = store.upsert_listener(&bkey("b"), l).unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedTls { .. }));
+    }
+
+    // Removing a listener must not leave an empty set behind in the
+    // secret index (white-box: the index is internal).
+    #[test]
+    fn removing_listener_cleans_secret_index() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
+            .unwrap();
+        assert!(
+            store
+                .inner
+                .read()
+                .listeners_by_secret
+                .contains_key(&secretkey("app-tls"))
+        );
+
+        store.remove_listener(&lkey("b", "l"));
+        assert!(
+            !store
+                .inner
+                .read()
+                .listeners_by_secret
+                .contains_key(&secretkey("app-tls")),
+            "empty secret set should be removed, not left behind"
+        );
     }
 }
