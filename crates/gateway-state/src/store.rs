@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use gateway_config::GatewayConfig;
 use gateway_config::backend::{Backend, BackendRef};
 use gateway_config::bind::{Bind, BindProtocol};
-use gateway_config::listener::{HttpListener, Listener};
+use gateway_config::listener::{Listener, TlsMode};
 use gateway_config::route::HttpRoute;
 use gateway_config::secret::TlsSecret;
 
@@ -67,8 +67,8 @@ struct Inner {
     /// preconditions — always active when registered.
     secrets: HashMap<SecretKey, Arc<TlsSecret>>,
 
-    /// HTTP listeners whose preconditions are NOT currently met.
-    pending_listeners: HashMap<ListenerKey, HttpListener>,
+    /// Listeners whose preconditions are NOT currently met.
+    pending_listeners: HashMap<ListenerKey, PendingListener>,
     /// HTTP routes whose preconditions are NOT currently met.
     /// The route's matches are already typed and pre-compiled — the
     /// values inside `HttpRoute` are parsed at YAML/proto
@@ -88,6 +88,41 @@ struct Inner {
     routes_by_parent: HashMap<ListenerKey, HashSet<RouteKey>>,
     /// Index: routes naming a given backend in their `backend_refs`.
     routes_by_backend: HashMap<BackendKey, HashSet<RouteKey>>,
+    /// Index: listeners naming a given secret in their `cert_refs`.
+    listeners_by_secret: HashMap<SecretKey, HashSet<ListenerKey>>,
+}
+
+/// A listener as held by the store, before resolution. Routes are
+/// tracked separately via `routes_by_parent`, not here. An `Https`
+/// listener names the TLS secrets it needs; those must all be present
+/// before it can be promoted (`cert_refs`). `Http` has no such
+/// dependency.
+#[derive(Debug, Clone)]
+enum PendingListener {
+    Http {
+        hostname: Option<String>,
+    },
+    Https {
+        hostname: Option<String>,
+        cert_refs: Vec<SecretKey>,
+    },
+}
+
+impl PendingListener {
+    fn hostname(&self) -> Option<String> {
+        match self {
+            Self::Http { hostname } | Self::Https { hostname, .. } => hostname.clone(),
+        }
+    }
+
+    /// Secrets this listener depends on — empty for `Http`, so the
+    /// promotion gate is uniform across both variants.
+    fn cert_refs(&self) -> &[SecretKey] {
+        match self {
+            Self::Http { .. } => &[],
+            Self::Https { cert_refs, .. } => cert_refs,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,11 +200,13 @@ impl Store {
     }
 
     pub fn upsert_secret(&self, secret: TlsSecret) {
-        self.inner.write().upsert_secret(secret);
+        let events = self.inner.write().upsert_secret(secret);
+        self.dispatch(events);
     }
 
     pub fn remove_secret(&self, key: &SecretKey) {
-        self.inner.write().remove_secret(key);
+        let events = self.inner.write().remove_secret(key);
+        self.dispatch(events);
     }
 
     pub fn apply(&self, cfg: &GatewayConfig) -> ApplyReport {
@@ -326,7 +363,10 @@ impl Inner {
             let Listener::Http(http) = listener else {
                 unreachable!("already validated above")
             };
-            self.upsert_listener_raw(&key, http);
+            let data = PendingListener::Http {
+                hostname: http.hostname,
+            };
+            self.upsert_listener_raw(&key, http.name, data, http.routes);
         }
 
         // Re-evaluate orphan listeners under this bind that weren't in
@@ -396,13 +436,55 @@ impl Inner {
         parent: &BindKey,
         listener: Listener,
     ) -> Result<Vec<BindEvent>, StoreError> {
-        let Listener::Http(http) = listener else {
-            return Err(StoreError::UnsupportedProtocol {
-                kind: "listener",
-                name: listener.name().to_string(),
-            });
+        // Accept HTTP (no cert refs) and HTTPS (cert refs from its TLS
+        // config). Passthrough TLS and TCP are not supported.
+        let (name, data, routes) = match listener {
+            Listener::Http(h) => (
+                h.name,
+                PendingListener::Http {
+                    hostname: h.hostname,
+                },
+                h.routes,
+            ),
+            Listener::Https(h) => {
+                // v0 terminates only; passthrough HTTPS and non-Secret
+                // certificate refs are rejected rather than silently
+                // mis-gated.
+                if h.tls.mode != TlsMode::Terminate {
+                    return Err(StoreError::UnsupportedTls {
+                        name: h.name,
+                        reason: "only Terminate mode is supported",
+                    });
+                }
+                if h.tls.certificates.iter().any(|c| c.kind != "Secret") {
+                    return Err(StoreError::UnsupportedTls {
+                        name: h.name,
+                        reason: "certificate refs must be of kind Secret",
+                    });
+                }
+                let cert_refs = h
+                    .tls
+                    .certificates
+                    .iter()
+                    .map(|c| SecretKey::new(c.name.clone()))
+                    .collect();
+                (
+                    h.name,
+                    PendingListener::Https {
+                        hostname: h.hostname,
+                        cert_refs,
+                    },
+                    h.routes,
+                )
+            }
+            other => {
+                return Err(StoreError::UnsupportedProtocol {
+                    kind: "listener",
+                    name: other.name().to_string(),
+                });
+            }
         };
-        self.upsert_listener_raw(parent, http);
+        self.upsert_listener_raw(parent, name, data, routes);
         if self.bind_meta.contains_key(parent) {
             self.rebuild_bind(parent);
             Ok(vec![BindEvent::Updated(parent.clone())])
@@ -415,8 +497,15 @@ impl Inner {
     /// it, place embedded routes, then place the listener itself.
     /// Does NOT rebuild the parent bind — callers batch that at the
     /// outer level.
-    fn upsert_listener_raw(&mut self, parent: &BindKey, http: HttpListener) {
-        let lkey = ListenerKey::new(parent.clone(), http.name.clone());
+    fn upsert_listener_raw(
+        &mut self,
+        parent: &BindKey,
+        name: String,
+        data: PendingListener,
+        routes: Vec<HttpRoute>,
+    ) {
+        let lkey = ListenerKey::new(parent.clone(), name);
+        self.clear_listener_secret_index(&lkey);
         let _ = self.pending_listeners.remove(&lkey);
         let _ = self.active_listeners.remove(&lkey);
 
@@ -424,13 +513,17 @@ impl Inner {
             .entry(parent.clone())
             .or_default()
             .insert(lkey.clone());
+        for sref in data.cert_refs() {
+            self.listeners_by_secret
+                .entry(sref.clone())
+                .or_default()
+                .insert(lkey.clone());
+        }
 
-        let mut shell = http;
-        let routes_to_insert = std::mem::take(&mut shell.routes);
-        for r in routes_to_insert {
+        for r in routes {
             self.upsert_route_raw(&lkey, r);
         }
-        self.place_listener(shell, &lkey);
+        self.place_listener(data, &lkey);
     }
 
     fn remove_listener(&mut self, key: &ListenerKey) -> Vec<BindEvent> {
@@ -442,6 +535,7 @@ impl Inner {
         if let Some(set) = self.listeners_by_parent.get_mut(&key.bind) {
             set.remove(key);
         }
+        self.clear_listener_secret_index(key);
         let rkeys: Vec<RouteKey> = self
             .routes_by_parent
             .get(key)
@@ -535,16 +629,41 @@ impl Inner {
         self.cascade_routes_by_backend(key)
     }
 
-    // Secrets are leaves with no preconditions and no dependents in
-    // v0 — no cascade, no events. A `TlsSecret` is valid by
-    // construction (parsed on the way in), so this is infallible.
-    fn upsert_secret(&mut self, secret: TlsSecret) {
+    // A `TlsSecret` is valid by construction (parsed on the way in),
+    // so this is infallible. Listeners may depend on the secret via
+    // their `cert_refs`, so re-resolve those.
+    fn upsert_secret(&mut self, secret: TlsSecret) -> Vec<BindEvent> {
         let key = SecretKey::new(secret.name.clone());
-        self.secrets.insert(key, Arc::new(secret));
+        self.secrets.insert(key.clone(), Arc::new(secret));
+        self.cascade_listeners_by_secret(&key)
     }
 
-    fn remove_secret(&mut self, key: &SecretKey) {
-        self.secrets.remove(key);
+    fn remove_secret(&mut self, key: &SecretKey) -> Vec<BindEvent> {
+        if self.secrets.remove(key).is_none() {
+            return Vec::new();
+        }
+        self.cascade_listeners_by_secret(key)
+    }
+
+    fn cascade_listeners_by_secret(&mut self, key: &SecretKey) -> Vec<BindEvent> {
+        let lkeys: Vec<ListenerKey> = self
+            .listeners_by_secret
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut affected_binds: HashSet<BindKey> = HashSet::new();
+        for lk in &lkeys {
+            self.re_resolve_listener(lk);
+            if self.bind_meta.contains_key(&lk.bind) {
+                affected_binds.insert(lk.bind.clone());
+            }
+        }
+        for bk in &affected_binds {
+            self.rebuild_bind(bk);
+        }
+        affected_binds.into_iter().map(BindEvent::Updated).collect()
     }
 
     fn cascade_routes_by_backend(&mut self, key: &BackendKey) -> Vec<BindEvent> {
@@ -598,8 +717,9 @@ impl Inner {
             events.append(&mut e);
         }
         for secret in &cfg.secrets {
-            self.upsert_secret(secret.clone());
+            let mut e = self.upsert_secret(secret.clone());
             report.applied += 1;
+            events.append(&mut e);
         }
 
         let new_keys: HashSet<BindKey> = self.bind_meta.keys().cloned().collect();
@@ -622,6 +742,7 @@ impl Inner {
         self.listeners_by_parent.clear();
         self.routes_by_parent.clear();
         self.routes_by_backend.clear();
+        self.listeners_by_secret.clear();
     }
 
     /// Is the listener known at all (active or pending)?
@@ -666,18 +787,58 @@ impl Inner {
         })
     }
 
-    /// Take a listener's raw form.
-    fn take_listener_raw(&mut self, key: &ListenerKey) -> Option<HttpListener> {
+    /// Strip secret-index entries for a listener key (used before
+    /// re-indexing with the new `cert_refs` on update, and on remove).
+    fn clear_listener_secret_index(&mut self, key: &ListenerKey) {
+        let secret_keys: Vec<SecretKey> = self
+            .listeners_by_secret
+            .iter()
+            .filter(|(_, set)| set.contains(key))
+            .map(|(sk, _)| sk.clone())
+            .collect();
+        for sk in secret_keys {
+            let empty = match self.listeners_by_secret.get_mut(&sk) {
+                Some(set) => {
+                    set.remove(key);
+                    set.is_empty()
+                }
+                None => false,
+            };
+            if empty {
+                self.listeners_by_secret.remove(&sk);
+            }
+        }
+    }
+
+    /// Take a listener's raw form. For an active listener the cert refs
+    /// come back from the secret index so a re-resolve preserves the
+    /// TLS dependency. (A listener with no cert refs round-trips as
+    /// `Http`; the store treats that identically to a hypothetical
+    /// zero-cert HTTPS listener, which the wire never produces.)
+    fn take_listener_raw(&mut self, key: &ListenerKey) -> Option<PendingListener> {
         if let Some(raw) = self.pending_listeners.remove(key) {
             return Some(raw);
         }
-        self.active_listeners
-            .remove(key)
-            .map(|active| HttpListener {
-                name: key.name.clone(),
-                hostname: active.hostname.clone(),
-                routes: vec![],
-            })
+        let active = self.active_listeners.remove(key)?;
+        let hostname = active.hostname.clone();
+        let cert_refs = self.cert_refs_for(key);
+        Some(if cert_refs.is_empty() {
+            PendingListener::Http { hostname }
+        } else {
+            PendingListener::Https {
+                hostname,
+                cert_refs,
+            }
+        })
+    }
+
+    /// Cert refs currently indexed for a listener (its TLS dependency).
+    fn cert_refs_for(&self, key: &ListenerKey) -> Vec<SecretKey> {
+        self.listeners_by_secret
+            .iter()
+            .filter(|(_, set)| set.contains(key))
+            .map(|(sk, _)| sk.clone())
+            .collect()
     }
 
     /// Decide the new placement of `route` under `key`. Active iff
@@ -713,9 +874,9 @@ impl Inner {
     /// Decide the new placement of `listener`. Two phases:
     /// speculatively park in pending so child routes can read
     /// "listener known"; re-resolve every child route; then promote
-    /// to active iff parent bind exists and **at least one** child
-    /// route is active.
-    fn place_listener(&mut self, listener: HttpListener, key: &ListenerKey) {
+    /// to active iff parent bind exists, every referenced TLS secret
+    /// is present, and **at least one** child route is active.
+    fn place_listener(&mut self, listener: PendingListener, key: &ListenerKey) {
         self.active_listeners.remove(key);
         self.pending_listeners.insert(key.clone(), listener);
 
@@ -731,6 +892,14 @@ impl Inner {
         }
 
         if !self.bind_meta.contains_key(&key.bind) {
+            return;
+        }
+        // TLS dependency: every referenced secret must be present
+        let secrets_ready = self.pending_listeners[key]
+            .cert_refs()
+            .iter()
+            .all(|s| self.secrets.contains_key(s));
+        if !secrets_ready {
             return;
         }
         let mut active_route_keys: Vec<RouteKey> = self
@@ -756,7 +925,7 @@ impl Inner {
         };
         let active = Arc::new(ActiveHttpListener {
             key: key.clone(),
-            hostname: raw.hostname,
+            hostname: raw.hostname(),
             routes,
         });
         self.active_listeners.insert(key.clone(), active);
@@ -813,7 +982,7 @@ mod tests {
     use gateway_config::bind::{Bind, BindProtocol};
     use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
     use gateway_config::listener::{
-        HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
+        CertRef, HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
     };
     use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 
@@ -873,12 +1042,22 @@ mod tests {
     }
 
     fn https_listener(name: &str) -> Listener {
+        https_listener_with_certs(name, &[])
+    }
+
+    fn https_listener_with_certs(name: &str, certs: &[&str]) -> Listener {
         Listener::Https(HttpsListener {
             name: name.into(),
             hostname: None,
             tls: TlsConfig {
                 mode: TlsMode::Terminate,
-                certificates: vec![],
+                certificates: certs
+                    .iter()
+                    .map(|c| CertRef {
+                        name: (*c).into(),
+                        kind: "Secret".into(),
+                    })
+                    .collect(),
             },
             routes: vec![],
         })
@@ -1141,11 +1320,24 @@ mod tests {
     }
 
     #[test]
-    fn https_listener_rejected() {
+    fn https_listener_accepted() {
+        // HTTPS listeners are now accepted (their cert refs gate
+        // promotion); only TCP / passthrough TLS are rejected.
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        assert!(
+            store
+                .upsert_listener(&bkey("b"), https_listener("l"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn tcp_listener_rejected() {
         let store = Store::new();
         store.upsert_bind(http_bind("b", 80)).unwrap();
         let err = store
-            .upsert_listener(&bkey("b"), https_listener("l"))
+            .upsert_listener(&bkey("b"), tcp_listener("l"))
             .unwrap_err();
         assert!(matches!(err, StoreError::UnsupportedProtocol { .. }));
     }
@@ -1680,5 +1872,135 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         assert_eq!(report.applied, 1);
         assert!(report.skipped.is_empty());
         assert!(store.read().secret(&secretkey("app-tls")).is_some());
+    }
+
+    // --- listener → secret stashing ---
+
+    // An HTTPS listener with an active route + backend, but its secret
+    // absent: gated pending until the secret lands, demoted when it goes.
+    #[test]
+    fn https_listener_stashed_until_secret_present() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+
+        // Route + backend are present, but the secret is missing.
+        assert!(store.read().is_route_active(&rkey("b", "l", "r")));
+        assert!(!store.read().is_listener_active(&lkey("b", "l")));
+
+        store.upsert_secret(tls_secret("app-tls"));
+        assert!(store.read().is_listener_active(&lkey("b", "l")));
+
+        store.remove_secret(&secretkey("app-tls"));
+        assert!(!store.read().is_listener_active(&lkey("b", "l")));
+    }
+
+    // All referenced secrets must be present.
+    #[test]
+    fn https_listener_needs_all_certs() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["a", "b"]))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+
+        store.upsert_secret(tls_secret("a"));
+        assert!(
+            !store.read().is_listener_active(&lkey("b", "l")),
+            "b missing"
+        );
+        store.upsert_secret(tls_secret("b"));
+        assert!(store.read().is_listener_active(&lkey("b", "l")));
+
+        store.remove_secret(&secretkey("a"));
+        assert!(!store.read().is_listener_active(&lkey("b", "l")));
+    }
+
+    // A plain HTTP listener has no cert refs and is
+    // unaffected by the secret gate.
+    #[test]
+    fn http_listener_unaffected_by_secret_gate() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        assert!(store.read().is_listener_active(&lkey("b", "l")));
+    }
+
+    fn https_listener_full(name: &str, mode: TlsMode, certs: &[(&str, &str)]) -> Listener {
+        Listener::Https(HttpsListener {
+            name: name.into(),
+            hostname: None,
+            tls: TlsConfig {
+                mode,
+                certificates: certs
+                    .iter()
+                    .map(|(n, k)| CertRef {
+                        name: (*n).into(),
+                        kind: (*k).into(),
+                    })
+                    .collect(),
+            },
+            routes: vec![],
+        })
+    }
+
+    // v0 terminates only — a passthrough HTTPS listener is rejected,
+    // not accepted and then mis-gated on secrets.
+    #[test]
+    fn https_listener_passthrough_mode_rejected() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        let l = https_listener_full("l", TlsMode::Passthrough, &[("app-tls", "Secret")]);
+        let err = store.upsert_listener(&bkey("b"), l).unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedTls { .. }));
+    }
+
+    // Certificate refs must be Kubernetes Secrets; other kinds are
+    // rejected rather than gated against the secret set forever.
+    #[test]
+    fn https_listener_non_secret_cert_kind_rejected() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        let l = https_listener_full("l", TlsMode::Terminate, &[("cm", "ConfigMap")]);
+        let err = store.upsert_listener(&bkey("b"), l).unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedTls { .. }));
+    }
+
+    // Removing a listener must not leave an empty set behind in the
+    // secret index (white-box: the index is internal).
+    #[test]
+    fn removing_listener_cleans_secret_index() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
+            .unwrap();
+        assert!(
+            store
+                .inner
+                .read()
+                .listeners_by_secret
+                .contains_key(&secretkey("app-tls"))
+        );
+
+        store.remove_listener(&lkey("b", "l"));
+        assert!(
+            !store
+                .inner
+                .read()
+                .listeners_by_secret
+                .contains_key(&secretkey("app-tls")),
+            "empty secret set should be removed, not left behind"
+        );
     }
 }
