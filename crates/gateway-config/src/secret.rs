@@ -6,6 +6,9 @@ use serde::{Deserialize, Deserializer};
 /// A TLS secret with its cert chain and private key already parsed
 /// to DER.
 pub struct TlsSecret {
+    /// Kubernetes namespace of the Secret. Empty for a flat local
+    /// config, which has no namespaces.
+    pub namespace: String,
     pub name: String,
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
@@ -14,6 +17,7 @@ pub struct TlsSecret {
 impl Clone for TlsSecret {
     fn clone(&self) -> Self {
         Self {
+            namespace: self.namespace.clone(),
             name: self.name.clone(),
             certs: self.certs.clone(),
             key: self.key.clone_key(),
@@ -29,12 +33,14 @@ impl TlsSecret {
     /// Returns [`TlsSecretError`] if the PEM is malformed, has no
     /// certificate, or has no private key.
     pub fn new(
+        namespace: impl Into<String>,
         name: impl Into<String>,
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<Self, TlsSecretError> {
         let (certs, key) = parse_pem(cert_pem, key_pem)?;
         Ok(Self {
+            namespace: namespace.into(),
             name: name.into(),
             certs,
             key,
@@ -46,6 +52,7 @@ impl TlsSecret {
 impl fmt::Debug for TlsSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsSecret")
+            .field("namespace", &self.namespace)
             .field("name", &self.name)
             .field("certs", &self.certs.len())
             .field("key", &"<redacted>")
@@ -60,13 +67,15 @@ impl<'de> Deserialize<'de> for TlsSecret {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Raw {
+            #[serde(default)]
+            namespace: String,
             name: String,
             cert_pem: String,
             key_pem: String,
         }
         let raw = Raw::deserialize(deserializer)?;
         let name = raw.name.clone();
-        Self::new(raw.name, &raw.cert_pem, &raw.key_pem)
+        Self::new(raw.namespace, raw.name, &raw.cert_pem, &raw.key_pem)
             .map_err(|e| serde::de::Error::custom(format!("invalid secret `{name}`: {e}")))
     }
 }
@@ -127,26 +136,27 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
     #[test]
     fn new_parses_valid_cert_and_key() {
-        let s = TlsSecret::new("app-tls", TEST_CERT_PEM, TEST_KEY_PEM).expect("valid");
+        let s = TlsSecret::new("apps", "app-tls", TEST_CERT_PEM, TEST_KEY_PEM).expect("valid");
+        assert_eq!(s.namespace, "apps");
         assert_eq!(s.name, "app-tls");
         assert_eq!(s.certs.len(), 1);
     }
 
     #[test]
     fn new_rejects_missing_certificate() {
-        let err = TlsSecret::new("s", "not a cert", TEST_KEY_PEM).unwrap_err();
+        let err = TlsSecret::new("", "s", "not a cert", TEST_KEY_PEM).unwrap_err();
         assert!(matches!(err, TlsSecretError::NoCertificate));
     }
 
     #[test]
     fn new_rejects_missing_private_key() {
-        let err = TlsSecret::new("s", TEST_CERT_PEM, "not a key").unwrap_err();
+        let err = TlsSecret::new("", "s", TEST_CERT_PEM, "not a key").unwrap_err();
         assert!(matches!(err, TlsSecretError::NoPrivateKey));
     }
 
     #[test]
     fn debug_redacts_key() {
-        let s = TlsSecret::new("app-tls", TEST_CERT_PEM, TEST_KEY_PEM).unwrap();
+        let s = TlsSecret::new("", "app-tls", TEST_CERT_PEM, TEST_KEY_PEM).unwrap();
         let out = format!("{s:?}");
         assert!(out.contains("app-tls"));
         assert!(out.contains("<redacted>"));

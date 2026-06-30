@@ -71,7 +71,7 @@ fn apply_upsert(store: &Store, upsert: pb::Upsert, out: &mut Affected) -> Result
         }
         pb::upsert::Body::Secret(s) => {
             let secret = convert::secret(s)?;
-            let key = SecretKey::new(secret.name.clone());
+            let key = SecretKey::new(secret.namespace.clone(), secret.name.clone());
             store.upsert_secret(secret);
             out.secrets.push(key);
         }
@@ -214,6 +214,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     fn secret_upsert(name: &str, cert_pem: &str, key_pem: &str) -> pb::Upsert {
         pb::Upsert {
             body: Some(pb::upsert::Body::Secret(pb::SecretUpsert {
+                namespace: String::new(),
                 name: name.into(),
                 cert_pem: cert_pem.into(),
                 key_pem: key_pem.into(),
@@ -589,7 +590,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         .expect("apply ok");
         let s = store
             .read()
-            .secret(&gateway_state::SecretKey::new("app-tls"))
+            .secret(&gateway_state::SecretKey::local("app-tls"))
             .expect("secret present");
         assert_eq!(s.name, "app-tls");
     }
@@ -608,6 +609,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
                 upserts: vec![],
                 removes: vec![pb::Remove {
                     key: Some(pb::remove::Key::Secret(pb::SecretKey {
+                        namespace: String::new(),
                         name: "app-tls".into(),
                     })),
                 }],
@@ -618,7 +620,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         assert!(
             store
                 .read()
-                .secret(&gateway_state::SecretKey::new("app-tls"))
+                .secret(&gateway_state::SecretKey::local("app-tls"))
                 .is_none()
         );
     }

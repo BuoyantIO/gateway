@@ -114,7 +114,7 @@ pub fn backend(msg: pb::BackendUpsert) -> Result<Backend, Error> {
 /// rather than at handshake time).
 pub fn secret(msg: pb::SecretUpsert) -> Result<TlsSecret, Error> {
     let name = msg.name;
-    TlsSecret::new(name.clone(), &msg.cert_pem, &msg.key_pem)
+    TlsSecret::new(msg.namespace, name.clone(), &msg.cert_pem, &msg.key_pem)
         .map_err(|source| Error::InvalidSecret { name, source })
 }
 
@@ -140,7 +140,7 @@ pub fn backend_key(msg: pb::BackendKey) -> BackendKey {
 }
 
 pub fn secret_key(msg: pb::SecretKey) -> SecretKey {
-    SecretKey::new(msg.name)
+    SecretKey::new(msg.namespace, msg.name)
 }
 
 // ==================== Pieces ====================

@@ -137,6 +137,7 @@ fn https_config(bind_port: u16, upstream_port: u16, with_secret: bool) -> Gatewa
         tls: TlsConfig {
             mode: TlsMode::Terminate,
             certificates: vec![CertRef {
+                namespace: String::new(),
                 name: "app-tls".into(),
                 kind: "Secret".into(),
             }],
@@ -176,7 +177,7 @@ fn https_config(bind_port: u16, upstream_port: u16, with_secret: bool) -> Gatewa
             protocol: BackendProtocol::Http1,
         })],
         secrets: if with_secret {
-            vec![TlsSecret::new("app-tls", CERT_PEM, KEY_PEM).unwrap()]
+            vec![TlsSecret::new("", "app-tls", CERT_PEM, KEY_PEM).unwrap()]
         } else {
             vec![]
         },
@@ -355,6 +356,7 @@ fn two_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
             tls: TlsConfig {
                 mode: TlsMode::Terminate,
                 certificates: vec![CertRef {
+                    namespace: String::new(),
                     name: cert.into(),
                     kind: "Secret".into(),
                 }],
@@ -398,8 +400,8 @@ fn two_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
             protocol: BackendProtocol::Http1,
         })],
         secrets: vec![
-            TlsSecret::new("secret-a", CERT_PEM, KEY_PEM).unwrap(),
-            TlsSecret::new("secret-b", CERT_B_PEM, KEY_B_PEM).unwrap(),
+            TlsSecret::new("", "secret-a", CERT_PEM, KEY_PEM).unwrap(),
+            TlsSecret::new("", "secret-b", CERT_B_PEM, KEY_B_PEM).unwrap(),
         ],
     }
 }
@@ -413,8 +415,11 @@ async fn sni_selects_listener_certificate() {
     let (gw, shutdown) = spawn_gateway(store);
     wait_for_listening(bind_port).await;
 
-    let cert_a = TlsSecret::new("a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
-    let cert_b = TlsSecret::new("b", CERT_B_PEM, KEY_B_PEM).unwrap().certs[0].clone();
+    let cert_a = TlsSecret::new("", "a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
+    let cert_b = TlsSecret::new("", "b", CERT_B_PEM, KEY_B_PEM)
+        .unwrap()
+        .certs[0]
+        .clone();
 
     // SNI a.example.com is served listener a's certificate, b gets b's.
     let tls_a = tls_connect(bind_port, &[b"http/1.1"], "a.example.com").await;
@@ -470,8 +475,11 @@ async fn sni_wildcard_match_and_exact_precedence() {
     let (gw, shutdown) = spawn_gateway(store);
     wait_for_listening(bind_port).await;
 
-    let cert_a = TlsSecret::new("a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
-    let cert_b = TlsSecret::new("b", CERT_B_PEM, KEY_B_PEM).unwrap().certs[0].clone();
+    let cert_a = TlsSecret::new("", "a", CERT_PEM, KEY_PEM).unwrap().certs[0].clone();
+    let cert_b = TlsSecret::new("", "b", CERT_B_PEM, KEY_B_PEM)
+        .unwrap()
+        .certs[0]
+        .clone();
 
     // A host only the wildcard covers is served the wildcard's cert.
     let tls_wild = tls_connect(bind_port, &[b"http/1.1"], "app.example.com").await;

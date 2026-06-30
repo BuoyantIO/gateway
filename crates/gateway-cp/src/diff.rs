@@ -2,15 +2,15 @@
 //!
 //! One pass per entity kind walks `keys(prev) ∪ keys(next)` and
 //! classifies: same value → skip, added or changed → `Upsert`,
-//! `prev`-only → `Remove`. The four passes share one `upserts` /
-//! `removes` pair, ordered Bind → Backend → Listener → Route for
-//! readable traces. The DP's Store handles ordering across kinds via
-//! its stashing model; the order here is convention, not correctness.
+//! `prev`-only → `Remove`. The passes share one `upserts` /
+//! `removes` pair, ordered Bind → Backend → Secret → Listener → Route
+//! for readable traces. The DP's Store handles ordering across kinds
+//! via its stashing model; the order here is convention, not correctness.
 
 use std::collections::HashSet;
 
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
+use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
 
 use crate::snapshot::Snapshot;
 
@@ -23,6 +23,7 @@ pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<pb::ConfigUpdate> {
 
     diff_binds(prev, next, &mut upserts, &mut removes);
     diff_backends(prev, next, &mut upserts, &mut removes);
+    diff_secrets(prev, next, &mut upserts, &mut removes);
     diff_listeners(prev, next, &mut upserts, &mut removes);
     diff_routes(prev, next, &mut upserts, &mut removes);
 
@@ -131,6 +132,30 @@ fn diff_routes(
     }
 }
 
+fn diff_secrets(
+    prev: &Snapshot,
+    next: &Snapshot,
+    upserts: &mut Vec<pb::Upsert>,
+    removes: &mut Vec<pb::Remove>,
+) {
+    let keys: HashSet<&SecretKey> = prev.secrets.keys().chain(next.secrets.keys()).collect();
+    for k in keys {
+        match (prev.secrets.get(k), next.secrets.get(k)) {
+            (Some(p), Some(n)) if p == n => {}
+            (_, Some(n)) => upserts.push(pb::Upsert {
+                body: Some(pb::upsert::Body::Secret(n.clone())),
+            }),
+            (Some(_), None) => removes.push(pb::Remove {
+                key: Some(pb::remove::Key::Secret(pb::SecretKey {
+                    namespace: k.namespace.clone(),
+                    name: k.name.clone(),
+                })),
+            }),
+            (None, None) => unreachable!(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +166,15 @@ mod tests {
             address: "0.0.0.0".into(),
             port,
             bind_protocol: pb::BindProtocol::Http as i32,
+        }
+    }
+
+    fn upsert_secret(namespace: &str, name: &str, cert_pem: &str) -> pb::SecretUpsert {
+        pb::SecretUpsert {
+            namespace: namespace.into(),
+            name: name.into(),
+            cert_pem: cert_pem.into(),
+            key_pem: "key".into(),
         }
     }
 
@@ -195,5 +229,59 @@ mod tests {
         // b removed, c added.
         assert_eq!(batch.upserts.len(), 1);
         assert_eq!(batch.removes.len(), 1);
+    }
+
+    #[test]
+    fn secret_add_yields_secret_upsert() {
+        let prev = Snapshot::default();
+        let mut next = Snapshot::default();
+        next.secrets.insert(
+            SecretKey::new("apps", "tls"),
+            upsert_secret("apps", "tls", "cert"),
+        );
+        let batch = diff(&prev, &next).expect("diff");
+        assert_eq!(batch.upserts.len(), 1);
+        assert!(batch.removes.is_empty());
+        assert!(matches!(
+            batch.upserts[0].body,
+            Some(pb::upsert::Body::Secret(_))
+        ));
+    }
+
+    #[test]
+    fn secret_delete_yields_namespaced_remove() {
+        let mut prev = Snapshot::default();
+        prev.secrets.insert(
+            SecretKey::new("apps", "tls"),
+            upsert_secret("apps", "tls", "cert"),
+        );
+        let next = Snapshot::default();
+        let batch = diff(&prev, &next).expect("diff");
+        assert!(batch.upserts.is_empty());
+        assert_eq!(batch.removes.len(), 1);
+        match &batch.removes[0].key {
+            Some(pb::remove::Key::Secret(k)) => {
+                assert_eq!(k.namespace, "apps");
+                assert_eq!(k.name, "tls");
+            }
+            other => panic!("expected secret remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_value_change_yields_upsert() {
+        let mut prev = Snapshot::default();
+        prev.secrets.insert(
+            SecretKey::new("apps", "tls"),
+            upsert_secret("apps", "tls", "old"),
+        );
+        let mut next = Snapshot::default();
+        next.secrets.insert(
+            SecretKey::new("apps", "tls"),
+            upsert_secret("apps", "tls", "new"),
+        );
+        let batch = diff(&prev, &next).expect("diff");
+        assert_eq!(batch.upserts.len(), 1);
+        assert!(batch.removes.is_empty());
     }
 }

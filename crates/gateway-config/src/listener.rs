@@ -66,6 +66,9 @@ pub enum TlsMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CertRef {
+    // Empty for a flat local
+    #[serde(default)]
+    pub namespace: String,
     pub name: String,
     pub kind: String,
 }

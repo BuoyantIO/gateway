@@ -16,8 +16,8 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType,
 };
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
-use k8s_openapi::api::core::v1::Service;
+use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
+use k8s_openapi::api::core::v1::{Secret, Service};
 
 use crate::snapshot::{GatewayId, Snapshot};
 
@@ -27,6 +27,7 @@ pub struct K8sState {
     pub gateways: Vec<Gateway>,
     pub http_routes: Vec<HTTPRoute>,
     pub services: Vec<Service>,
+    pub secrets: Vec<Secret>,
 }
 
 /// Build per-Gateway snapshots from a static K8s state.
@@ -48,6 +49,7 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
     let owned_classes = collect_owned_classes(state, controller_name);
     let gateways_by_id = index_gateways(state);
     let services_by_id = index_services(state);
+    let secrets_by_id = index_secrets(state);
 
     let mut slices: HashMap<GatewayId, Snapshot> = HashMap::new();
     // Listeners that survived pass-1 classification, per gateway:
@@ -69,6 +71,7 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
         let snapshot = slices.entry(id.clone()).or_default();
 
         let accepted = emit_gateway_listeners(snapshot, ns, name, &gw.spec.listeners);
+        emit_gateway_secrets(snapshot, ns, &gw.spec.listeners, &secrets_by_id);
         accepted_listeners.insert(id, accepted);
     }
 
@@ -160,6 +163,18 @@ fn index_gateways(state: &K8sState) -> HashMap<(&str, &str), &Gateway> {
 fn index_services(state: &K8sState) -> HashMap<(&str, &str), &Service> {
     state
         .services
+        .iter()
+        .filter_map(|s| {
+            let ns = s.metadata.namespace.as_deref()?;
+            let name = s.metadata.name.as_deref()?;
+            Some(((ns, name), s))
+        })
+        .collect()
+}
+
+fn index_secrets(state: &K8sState) -> HashMap<(&str, &str), &Secret> {
+    state
+        .secrets
         .iter()
         .filter_map(|s| {
             let ns = s.metadata.namespace.as_deref()?;
@@ -265,6 +280,78 @@ fn emit_gateway_listeners(
     }
 
     accepted
+}
+
+/// Emit a `SecretUpsert` for each `kubernetes.io/tls` Secret referenced
+/// by the gateway's listener `certificateRefs`. Same-namespace only;
+/// cross-namespace refs need a `ReferenceGrant` (not yet supported) and
+/// are skipped. Runs independent of listener acceptance so the material
+/// is already published when HTTPS listeners are translated.
+fn emit_gateway_secrets(
+    snapshot: &mut Snapshot,
+    gateway_ns: &str,
+    listeners: &[GatewayListeners],
+    secrets_by_id: &HashMap<(&str, &str), &Secret>,
+) {
+    for listener in listeners {
+        let Some(refs) = listener
+            .tls
+            .as_ref()
+            .and_then(|t| t.certificate_refs.as_ref())
+        else {
+            continue;
+        };
+        for r in refs {
+            // Only core/v1 Secret refs are supported.
+            if r.group.as_deref().is_some_and(|g| !g.is_empty()) {
+                tracing::warn!(name = %r.name, group = ?r.group, "skipping non-core certificateRef");
+                continue;
+            }
+            if r.kind.as_deref().is_some_and(|k| k != "Secret") {
+                tracing::warn!(name = %r.name, kind = ?r.kind, "skipping non-Secret certificateRef");
+                continue;
+            }
+            // Cross-namespace refs require a ReferenceGrant (not yet supported).
+            if r.namespace
+                .as_deref()
+                .is_some_and(|n| !n.is_empty() && n != gateway_ns)
+            {
+                tracing::warn!(name = %r.name, namespace = ?r.namespace,
+                    "skipping cross-namespace certificateRef");
+                continue;
+            }
+            let Some(secret) = secrets_by_id.get(&(gateway_ns, r.name.as_str())) else {
+                tracing::warn!(namespace = %gateway_ns, name = %r.name,
+                    "certificateRef Secret not present yet");
+                continue;
+            };
+            let Some((cert_pem, key_pem)) = tls_material(secret) else {
+                tracing::warn!(namespace = %gateway_ns, name = %r.name,
+                    "Secret missing or invalid tls.crt / tls.key");
+                continue;
+            };
+            // HashMap insert dedups a Secret referenced by several listeners.
+            snapshot.secrets.insert(
+                SecretKey::new(gateway_ns, r.name.clone()),
+                pb::SecretUpsert {
+                    namespace: gateway_ns.to_string(),
+                    name: r.name.clone(),
+                    cert_pem,
+                    key_pem,
+                },
+            );
+        }
+    }
+}
+
+/// Pull the PEM cert chain and key out of a `kubernetes.io/tls`
+/// Secret's `tls.crt` / `tls.key` data. `None` if either is absent or
+/// not valid UTF-8.
+fn tls_material(secret: &Secret) -> Option<(String, String)> {
+    let data = secret.data.as_ref()?;
+    let cert = String::from_utf8(data.get("tls.crt")?.0.clone()).ok()?;
+    let key = String::from_utf8(data.get("tls.key")?.0.clone()).ok()?;
+    Some((cert, key))
 }
 
 fn emit_routes_under_listener(
@@ -738,13 +825,17 @@ mod tests {
 
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
     use gateway_api::apis::standard::gateways::{
-        GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
+        GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces,
+        GatewayListenersTls, GatewayListenersTlsCertificateRefs, GatewaySpec,
     };
     use gateway_api::apis::standard::httproutes::{
         HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
         HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestHeaderModifierAdd,
         HttpRouteRulesFiltersRequestHeaderModifierSet, HttpRouteRulesMatchesPath, HttpRouteSpec,
     };
+    use std::collections::BTreeMap;
+
+    use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::ServiceSpec;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
@@ -761,6 +852,62 @@ mod tests {
                 ..Default::default()
             },
             status: None,
+        }
+    }
+
+    /// An HTTPS listener terminating with the named Secret cert refs.
+    /// `cert_refs` is a list of `(namespace, name)`; an empty namespace
+    /// means the ref omits it (resolves to the gateway's namespace).
+    fn https_listener(
+        name: &str,
+        port: i32,
+        hostname: Option<&str>,
+        cert_refs: &[(&str, &str)],
+    ) -> GatewayListeners {
+        GatewayListeners {
+            name: name.into(),
+            protocol: "HTTPS".into(),
+            port,
+            hostname: hostname.map(String::from),
+            tls: Some(GatewayListenersTls {
+                mode: None,
+                options: None,
+                certificate_refs: Some(
+                    cert_refs
+                        .iter()
+                        .map(|(ns, n)| GatewayListenersTlsCertificateRefs {
+                            group: None,
+                            kind: Some("Secret".into()),
+                            namespace: (!ns.is_empty()).then(|| (*ns).into()),
+                            name: (*n).into(),
+                        })
+                        .collect(),
+                ),
+            }),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                    from: None,
+                    selector: None,
+                }),
+                kinds: None,
+            }),
+        }
+    }
+
+    /// A `kubernetes.io/tls` Secret carrying `tls.crt` / `tls.key`.
+    fn tls_secret(ns: &str, name: &str, cert: &str, key: &str) -> Secret {
+        let mut data = BTreeMap::new();
+        data.insert("tls.crt".to_string(), ByteString(cert.as_bytes().to_vec()));
+        data.insert("tls.key".to_string(), ByteString(key.as_bytes().to_vec()));
+        Secret {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            data: Some(data),
+            type_: Some("kubernetes.io/tls".into()),
+            ..Default::default()
         }
     }
 
@@ -1105,6 +1252,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1168,6 +1316,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1215,6 +1364,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1259,6 +1409,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
 
         let out = translate(&state, OURS);
@@ -1292,6 +1443,7 @@ mod tests {
                 ],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1334,6 +1486,7 @@ mod tests {
                 }],
             )],
             services: vec![service("other-ns", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1362,6 +1515,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("None"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1387,6 +1541,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1416,6 +1571,7 @@ mod tests {
                 )],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1444,6 +1600,7 @@ mod tests {
                 )],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1589,6 +1746,7 @@ mod tests {
                 vec!["a.example.com".into(), "b.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1624,6 +1782,7 @@ mod tests {
                 vec!["other.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1652,6 +1811,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1681,6 +1841,7 @@ mod tests {
                 vec!["*.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1720,6 +1881,7 @@ mod tests {
                 }],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1766,6 +1928,7 @@ mod tests {
                 }],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1864,6 +2027,7 @@ mod tests {
                 vec![route_with_match(m)],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
         }
     }
 
@@ -2000,6 +2164,7 @@ mod tests {
                 Some("10.0.0.1"),
                 &[(port, app_protocol)],
             )],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -2048,6 +2213,118 @@ mod tests {
         );
     }
 
+    // ---- secret emission ----
+
+    #[test]
+    fn referenced_secret_emitted_with_material() {
+        // HTTPS listeners aren't translated yet, but the secret they
+        // reference must still be published.
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![https_listener(
+                    "https",
+                    443,
+                    Some("a.example.com"),
+                    &[("", "foo")],
+                )],
+            )],
+            secrets: vec![tls_secret("demo", "foo", "CERTPEM", "KEYPEM")],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).expect("snapshot");
+        let up = s
+            .secrets
+            .get(&SecretKey::new("demo", "foo"))
+            .expect("secret emitted");
+        assert_eq!(up.namespace, "demo");
+        assert_eq!(up.name, "foo");
+        assert_eq!(up.cert_pem, "CERTPEM");
+        assert_eq!(up.key_pem, "KEYPEM");
+    }
+
+    #[test]
+    fn unreferenced_secret_not_emitted() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![https_listener(
+                    "https",
+                    443,
+                    Some("a.example.com"),
+                    &[("", "foo")],
+                )],
+            )],
+            secrets: vec![
+                tls_secret("demo", "foo", "CERTPEM", "KEYPEM"),
+                tls_secret("demo", "bar", "OTHER", "OTHER"),
+            ],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).expect("snapshot");
+        assert!(s.secrets.contains_key(&SecretKey::new("demo", "foo")));
+        assert!(
+            !s.secrets.contains_key(&SecretKey::new("demo", "bar")),
+            "the cluster's other TLS secrets must not be broadcast"
+        );
+    }
+
+    #[test]
+    fn cross_namespace_certref_skipped() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![https_listener(
+                    "https",
+                    443,
+                    Some("a.example.com"),
+                    &[("other", "foo")],
+                )],
+            )],
+            secrets: vec![tls_secret("other", "foo", "CERTPEM", "KEYPEM")],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).expect("snapshot");
+        assert!(
+            s.secrets.is_empty(),
+            "cross-namespace ref needs a ReferenceGrant"
+        );
+    }
+
+    #[test]
+    fn missing_secret_skipped() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![https_listener(
+                    "https",
+                    443,
+                    Some("a.example.com"),
+                    &[("", "foo")],
+                )],
+            )],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).expect("snapshot");
+        assert!(s.secrets.is_empty());
+    }
+
     #[test]
     fn no_app_protocol_yields_http1() {
         // Regression guard: the pre-issue-#4 default behaviour.
@@ -2085,6 +2362,7 @@ mod tests {
                 Some("10.0.0.1"),
                 &[(8080, Some("grpc"))],
             )],
+            secrets: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
