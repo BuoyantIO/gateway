@@ -597,7 +597,7 @@ impl Inner {
     // so this is infallible. Listeners may depend on the secret via
     // their `cert_refs`, so re-resolve those.
     fn upsert_secret(&mut self, secret: TlsSecret) -> Vec<BindEvent> {
-        let key = SecretKey::new(secret.name.clone());
+        let key = SecretKey::new(secret.namespace.clone(), secret.name.clone());
         self.secrets.insert(key.clone(), Arc::new(secret));
         self.cascade_listeners_by_secret(&key)
     }
@@ -998,7 +998,7 @@ fn decompose_listener(
                 .tls
                 .certificates
                 .iter()
-                .map(|c| SecretKey::new(c.name.clone()))
+                .map(|c| SecretKey::new(c.namespace.clone(), c.name.clone()))
                 .collect();
             Ok((
                 h.name,
@@ -1098,6 +1098,7 @@ mod tests {
                 certificates: certs
                     .iter()
                     .map(|c| CertRef {
+                        namespace: String::new(),
                         name: (*c).into(),
                         kind: "Secret".into(),
                     })
@@ -1928,11 +1929,11 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 -----END PRIVATE KEY-----\n";
 
     fn secretkey(name: &str) -> SecretKey {
-        SecretKey::new(name)
+        SecretKey::local(name)
     }
 
     fn tls_secret(name: &str) -> TlsSecret {
-        TlsSecret::new(name, CERT_PEM, KEY_PEM).expect("valid test secret")
+        TlsSecret::new("", name, CERT_PEM, KEY_PEM).expect("valid test secret")
     }
 
     #[test]
@@ -2054,6 +2055,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
                 certificates: certs
                     .iter()
                     .map(|(n, k)| CertRef {
+                        namespace: String::new(),
                         name: (*n).into(),
                         kind: (*k).into(),
                     })

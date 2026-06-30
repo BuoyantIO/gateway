@@ -74,17 +74,34 @@ impl fmt::Display for BackendKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SecretKey(pub String);
+pub struct SecretKey {
+    /// Kubernetes namespace of the Secret. Empty for secrets from a
+    /// flat local config, which has no namespaces.
+    pub namespace: String,
+    pub name: String,
+}
 
 impl SecretKey {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+
+    /// A secret from a flat local config (no namespace).
+    pub fn local(name: impl Into<String>) -> Self {
+        Self::new("", name)
     }
 }
 
 impl fmt::Display for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        if self.namespace.is_empty() {
+            f.write_str(&self.name)
+        } else {
+            write!(f, "{}/{}", self.namespace, self.name)
+        }
     }
 }
 

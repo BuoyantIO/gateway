@@ -66,6 +66,10 @@ pub enum TlsMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CertRef {
+    /// Namespace of the referenced Secret. Empty for a flat local
+    /// config, which has no namespaces.
+    #[serde(default)]
+    pub namespace: String,
     pub name: String,
     pub kind: String,
 }

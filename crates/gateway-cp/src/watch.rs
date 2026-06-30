@@ -1,9 +1,10 @@
 //! kube watch loop.
 //!
-//! Four `kube_runtime::reflector` instances keep an in-memory view of
-//! `GatewayClass`, `Gateway`, `HTTPRoute`, and `core/v1 Service`. A
-//! single `tokio::select!` over the four watcher streams drives the
-//! loop: every event triggers a `translate` + `ServerState::publish`.
+//! Five `kube_runtime::reflector` instances keep an in-memory view of
+//! `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`, and
+//! `core/v1 Secret` (filtered to `type: kubernetes.io/tls`). A single
+//! `tokio::select!` over the watcher streams drives the loop: every
+//! event triggers a `translate` + `ServerState::publish`.
 //!
 //! Currently publishes on every event. `diff` returns `None` when nothing
 //! changed, so spurious publishes are no-ops at the broadcast layer
@@ -18,7 +19,7 @@ use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use kube::Api;
 use kube::runtime::reflector::{self, Store as ReflectorStore};
 use kube::runtime::watcher::{self, Config};
@@ -33,7 +34,7 @@ pub enum WatchError {
     Kube(#[from] kube::Error),
 }
 
-/// Run the watch loop until `shutdown` resolves. Sets up four
+/// Run the watch loop until `shutdown` resolves. Sets up five
 /// reflectors against the cluster `client` and drives them under one
 /// `select!`.
 ///
@@ -41,7 +42,7 @@ pub enum WatchError {
 /// Returns `WatchError::Kube` only for setup failures. Per-event
 /// watcher errors are transient and handled by `kube_runtime::watcher`
 /// internally; we log and continue.
-#[allow(clippy::similar_names)] // gc/gw/hr/svc bindings are intentionally parallel
+#[allow(clippy::similar_names)] // gc/gw/hr/svc/sec bindings are intentionally parallel
 pub async fn run(
     client: kube::Client,
     controller_name: String,
@@ -66,9 +67,15 @@ pub async fn run(
         reflector::reflector(hr_writer, watcher::watcher(hr_api, Config::default())).boxed();
 
     let (svc_store, svc_writer) = reflector::store::<Service>();
-    let svc_api: Api<Service> = Api::all(client);
+    let svc_api: Api<Service> = Api::all(client.clone());
     let mut svc_stream =
         reflector::reflector(svc_writer, watcher::watcher(svc_api, Config::default())).boxed();
+
+    let (sec_store, sec_writer) = reflector::store::<Secret>();
+    let sec_api: Api<Secret> = Api::all(client);
+    let sec_config = Config::default().fields("type=kubernetes.io/tls");
+    let mut sec_stream =
+        reflector::reflector(sec_writer, watcher::watcher(sec_api, sec_config)).boxed();
 
     loop {
         tokio::select! {
@@ -78,9 +85,10 @@ pub async fn run(
             ev = gw_stream.next() => log_event_err("Gateway", ev.as_ref()),
             ev = hr_stream.next() => log_event_err("HTTPRoute", ev.as_ref()),
             ev = svc_stream.next() => log_event_err("Service", ev.as_ref()),
+            ev = sec_stream.next() => log_event_err("Secret", ev.as_ref()),
         }
 
-        let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store);
+        let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
         let world = translate(&k8s, &controller_name);
         state.publish(&world);
     }
@@ -95,12 +103,14 @@ fn collect_state(
     gw: &ReflectorStore<Gateway>,
     hr: &ReflectorStore<HTTPRoute>,
     svc: &ReflectorStore<Service>,
+    sec: &ReflectorStore<Secret>,
 ) -> K8sState {
     K8sState {
         gateway_classes: gc.state().iter().map(|a| (**a).clone()).collect(),
         gateways: gw.state().iter().map(|a| (**a).clone()).collect(),
         http_routes: hr.state().iter().map(|a| (**a).clone()).collect(),
         services: svc.state().iter().map(|a| (**a).clone()).collect(),
+        secrets: sec.state().iter().map(|a| (**a).clone()).collect(),
     }
 }
 

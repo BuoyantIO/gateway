@@ -70,7 +70,7 @@ message BindKey     { string name = 1; }
 message ListenerKey { string bind = 1; string name = 2; }
 message RouteKey    { string bind = 1; string listener = 2; string name = 3; }
 message BackendKey  { string name = 1; }
-message SecretKey   { string name = 1; }
+message SecretKey   { string namespace = 1; string name = 2; }
 
 // -------- Bind --------
 
@@ -103,16 +103,17 @@ enum TlsMode {
 }
 
 message ListenerTls {
-  TlsMode         mode             = 1;
-  repeated string certificate_refs = 2;  // Secret names
+  TlsMode            mode             = 1;
+  repeated SecretKey certificate_refs = 2;
 }
 
 // -------- Secret --------
 
 message SecretUpsert {
-  string name     = 1;
-  string cert_pem = 2;
-  string key_pem  = 3;
+  string namespace = 1;
+  string name      = 2;
+  string cert_pem  = 3;
+  string key_pem   = 4;
 }
 
 // -------- HttpRoute --------
