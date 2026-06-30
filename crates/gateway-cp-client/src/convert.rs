@@ -12,7 +12,9 @@ use std::net::IpAddr;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
-use gateway_config::listener::{HttpListener, Listener};
+use gateway_config::listener::{
+    CertRef, HttpListener, HttpsListener, Listener, TlsConfig, TlsMode,
+};
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, QueryParamMatch,
     QueryValueMatch,
@@ -51,7 +53,8 @@ pub fn bind(msg: pb::BindUpsert) -> Result<Bind, Error> {
 }
 
 /// # Errors
-/// Returns [`Error::MissingField`] if `key` is unset.
+/// Returns [`Error::MissingField`] if `key` is unset, or
+/// [`Error::UnsupportedEnum`] if a TLS listener carries an unknown mode.
 pub fn listener(msg: pb::ListenerUpsert) -> Result<(BindKey, Listener), Error> {
     let key = msg.key.ok_or(Error::MissingField("ListenerUpsert.key"))?;
     let parent = BindKey::new(key.bind);
@@ -60,13 +63,32 @@ pub fn listener(msg: pb::ListenerUpsert) -> Result<(BindKey, Listener), Error> {
     } else {
         None
     };
-    let http = HttpListener {
-        name: key.name,
-        hostname,
-        // Routes arrive as their own HttpRouteUpsert messages.
-        routes: Vec::new(),
+    // Routes for either variant arrive as their own HttpRouteUpsert messages.
+    let listener = match msg.tls {
+        Some(tls) => Listener::Https(HttpsListener {
+            name: key.name,
+            hostname,
+            tls: TlsConfig {
+                mode: tls_mode(tls.mode)?,
+                certificates: tls
+                    .certificate_refs
+                    .into_iter()
+                    .map(|k| CertRef {
+                        namespace: k.namespace,
+                        name: k.name,
+                        kind: "Secret".into(),
+                    })
+                    .collect(),
+            },
+            routes: Vec::new(),
+        }),
+        None => Listener::Http(HttpListener {
+            name: key.name,
+            hostname,
+            routes: Vec::new(),
+        }),
     };
-    Ok((parent, Listener::Http(http)))
+    Ok((parent, listener))
 }
 
 /// # Errors
@@ -336,6 +358,17 @@ fn backend_protocol(value: i32) -> Result<BackendProtocol, Error> {
     }
 }
 
+fn tls_mode(value: i32) -> Result<TlsMode, Error> {
+    match pb::TlsMode::try_from(value) {
+        Ok(pb::TlsMode::Terminate) => Ok(TlsMode::Terminate),
+        Ok(pb::TlsMode::Passthrough) => Ok(TlsMode::Passthrough),
+        Ok(pb::TlsMode::Unspecified) | Err(_) => Err(Error::UnsupportedEnum {
+            kind: "TlsMode",
+            value,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +598,76 @@ mod tests {
                 panic!("expected ResponseHeaderModifier, got {v:?}")
             }
         }
+    }
+
+    // ---- listener TLS conversion ----
+
+    fn listener_upsert(tls: Option<pb::ListenerTls>) -> pb::ListenerUpsert {
+        pb::ListenerUpsert {
+            key: Some(pb::ListenerKey {
+                bind: "b".into(),
+                name: "l".into(),
+            }),
+            hostname: String::new(),
+            has_hostname: false,
+            tls,
+        }
+    }
+
+    #[test]
+    fn listener_without_tls_builds_http() {
+        let (_, l) = listener(listener_upsert(None)).expect("convert");
+        assert!(matches!(l, Listener::Http(_)), "got {l:?}");
+    }
+
+    #[test]
+    fn listener_with_tls_builds_https() {
+        let (_, l) = listener(listener_upsert(Some(pb::ListenerTls {
+            mode: pb::TlsMode::Terminate as i32,
+            certificate_refs: vec![pb::SecretKey {
+                namespace: "demo".into(),
+                name: "foo".into(),
+            }],
+        })))
+        .expect("convert");
+        match l {
+            Listener::Https(h) => {
+                assert_eq!(h.tls.mode, TlsMode::Terminate);
+                assert_eq!(h.tls.certificates.len(), 1);
+                assert_eq!(h.tls.certificates[0].namespace, "demo");
+                assert_eq!(h.tls.certificates[0].name, "foo");
+                assert_eq!(h.tls.certificates[0].kind, "Secret");
+            }
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_passthrough_mode_maps() {
+        let (_, l) = listener(listener_upsert(Some(pb::ListenerTls {
+            mode: pb::TlsMode::Passthrough as i32,
+            certificate_refs: vec![],
+        })))
+        .expect("convert");
+        match l {
+            Listener::Https(h) => assert_eq!(h.tls.mode, TlsMode::Passthrough),
+            other => panic!("expected Https, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_unspecified_tls_mode_rejected() {
+        let err = listener(listener_upsert(Some(pb::ListenerTls {
+            mode: pb::TlsMode::Unspecified as i32,
+            certificate_refs: vec![],
+        })))
+        .expect_err("unspecified mode should fail");
+        assert!(matches!(
+            err,
+            Error::UnsupportedEnum {
+                kind: "TlsMode",
+                ..
+            }
+        ));
     }
 }
