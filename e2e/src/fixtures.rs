@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutes,
-    GatewayListenersAllowedRoutesNamespaces, GatewaySpec,
+    GatewayListenersAllowedRoutesNamespaces, GatewayListenersTls,
+    GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewaySpec,
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
@@ -18,9 +19,10 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
     HttpRouteRulesMatchesQueryParams, HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
+use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, PodSpec, PodTemplateSpec, Secret, Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -58,6 +60,112 @@ pub fn gateway(ns: &str, name: &str, port: i32, hostname: Option<&str>) -> Gatew
         },
         status: None,
     }
+}
+
+/// Throwaway self-signed EC cert + PKCS#8 key (CN `gateway-test`, no
+/// SANs). The e2e TLS client trusts any cert, so this only needs to be
+/// a structurally valid `kubernetes.io/tls` pair.
+pub const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBgjCCASmgAwIBAgIUW/OT9NoEgpMEra4i2ttY/oSsRe0wCgYIKoZIzj0EAwIw\n\
+FzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MB4XDTI2MDYyNjEwNTEyOFoXDTM2MDYy\n\
+MzEwNTEyOFowFzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MFkwEwYHKoZIzj0CAQYI\n\
+KoZIzj0DAQcDQgAEZoF6gHnR0OJdILhqvT75ZE5oX/NkCobjCPRKQmQAvEFeN8ku\n\
+f+C449e9U2Gq6S7C72DJWjcsr8gaxjiMRie0H6NTMFEwHQYDVR0OBBYEFKmMFFZT\n\
+6oW/R893bFKGDqRaBuoRMB8GA1UdIwQYMBaAFKmMFFZT6oW/R893bFKGDqRaBuoR\n\
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgEdjQ6EJUY9QMrNQy\n\
+YhAYK89fjb5J6TE0AJY4QnmcFR0CIHo7A7WYP2hT7rr6orgxEqAVx7DGbd0aCCqe\n\
+GkIpYyxV\n\
+-----END CERTIFICATE-----\n";
+
+pub const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H\n\
+/hzgYBDdRqvQrz6jRyF1kz8TrcChRANCAARmgXqAedHQ4l0guGq9PvlkTmhf82QK\n\
+huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
+-----END PRIVATE KEY-----\n";
+
+/// Build a `Gateway` with one HTTPS (`Terminate`) listener on `port`,
+/// terminating with the named same-namespace `Secret`.
+pub fn gateway_https(
+    ns: &str,
+    name: &str,
+    port: i32,
+    hostname: Option<&str>,
+    secret: &str,
+) -> Gateway {
+    Gateway {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        spec: GatewaySpec {
+            gateway_class_name: "buoyant-gateway".into(),
+            listeners: vec![GatewayListeners {
+                name: "https".into(),
+                protocol: "HTTPS".into(),
+                port,
+                hostname: hostname.map(String::from),
+                tls: Some(GatewayListenersTls {
+                    mode: Some(GatewayListenersTlsMode::Terminate),
+                    options: None,
+                    certificate_refs: Some(vec![GatewayListenersTlsCertificateRefs {
+                        group: None,
+                        kind: Some("Secret".into()),
+                        name: secret.into(),
+                        namespace: None,
+                    }]),
+                }),
+                allowed_routes: Some(GatewayListenersAllowedRoutes {
+                    namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                        from: Some(gateway_api::apis::standard::gateways::GatewayListenersAllowedRoutesNamespacesFrom::Same),
+                        selector: None,
+                    }),
+                    kinds: None,
+                }),
+            }],
+            ..Default::default()
+        },
+        status: None,
+    }
+}
+
+/// Create a `kubernetes.io/tls` `Secret` carrying `tls.crt` / `tls.key`.
+///
+/// # Errors
+/// Returns an error if the create call fails.
+pub async fn deploy_tls_secret(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<()> {
+    let mut data = BTreeMap::new();
+    data.insert(
+        "tls.crt".to_owned(),
+        ByteString(cert_pem.as_bytes().to_vec()),
+    );
+    data.insert(
+        "tls.key".to_owned(),
+        ByteString(key_pem.as_bytes().to_vec()),
+    );
+
+    let secret = Secret {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        type_: Some("kubernetes.io/tls".into()),
+        data: Some(data),
+        ..Default::default()
+    };
+
+    Api::<Secret>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), &secret)
+        .await
+        .with_context(|| format!("creating TLS secret {name}"))?;
+    Ok(())
 }
 
 /// Chainable builder for an `HTTPRoute` with one rule. Multiple rules

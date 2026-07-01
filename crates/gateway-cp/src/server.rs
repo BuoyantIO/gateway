@@ -224,11 +224,15 @@ fn parse_client_id(s: &str) -> Result<GatewayId, Status> {
 }
 
 /// Flatten a `Snapshot` into a single bootstrap `ConfigUpdate`.
-/// Order: Bind → Backend → Listener → `HttpRoute` — convention only;
-/// the Store handles ordering via its stashing model.
+/// Order: Bind → Backend → Secret → Listener → `HttpRoute` —
+/// convention only; the Store handles ordering via its stashing model.
 fn snapshot_to_bootstrap(snap: &Snapshot) -> pb::ConfigUpdate {
     let mut upserts = Vec::with_capacity(
-        snap.binds.len() + snap.backends.len() + snap.listeners.len() + snap.routes.len(),
+        snap.binds.len()
+            + snap.backends.len()
+            + snap.secrets.len()
+            + snap.listeners.len()
+            + snap.routes.len(),
     );
     for b in snap.binds.values() {
         upserts.push(pb::Upsert {
@@ -238,6 +242,11 @@ fn snapshot_to_bootstrap(snap: &Snapshot) -> pb::ConfigUpdate {
     for b in snap.backends.values() {
         upserts.push(pb::Upsert {
             body: Some(pb::upsert::Body::Backend(b.clone())),
+        });
+    }
+    for s in snap.secrets.values() {
+        upserts.push(pb::Upsert {
+            body: Some(pb::upsert::Body::Secret(s.clone())),
         });
     }
     for l in snap.listeners.values() {
@@ -261,7 +270,7 @@ fn snapshot_to_bootstrap(snap: &Snapshot) -> pb::ConfigUpdate {
 mod tests {
     use super::*;
 
-    use gateway_state::BindKey;
+    use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
 
     fn bind_upsert(name: &str, port: u32) -> pb::BindUpsert {
         pb::BindUpsert {
@@ -276,6 +285,55 @@ mod tests {
         let mut snap = Snapshot::default();
         snap.binds
             .insert(BindKey::new(name), bind_upsert(name, port));
+        snap
+    }
+
+    /// A slice holding exactly one of every entity kind, for asserting
+    /// the bootstrap flattens all of them.
+    fn slice_with_every_entity() -> Snapshot {
+        let mut snap = slice_with_bind("b", 443);
+        snap.backends.insert(
+            BackendKey::new("be"),
+            pb::BackendUpsert {
+                name: "be".into(),
+                endpoints: vec![],
+                protocol: pb::BackendProtocol::Http1 as i32,
+            },
+        );
+        snap.secrets.insert(
+            SecretKey::new("demo", "tls"),
+            pb::SecretUpsert {
+                namespace: "demo".into(),
+                name: "tls".into(),
+                cert_pem: "cert".into(),
+                key_pem: "key".into(),
+            },
+        );
+        snap.listeners.insert(
+            ListenerKey::new(BindKey::new("b"), "l"),
+            pb::ListenerUpsert {
+                key: Some(pb::ListenerKey {
+                    bind: "b".into(),
+                    name: "l".into(),
+                }),
+                hostname: String::new(),
+                has_hostname: false,
+                tls: None,
+            },
+        );
+        snap.routes.insert(
+            RouteKey::new(ListenerKey::new(BindKey::new("b"), "l"), "r"),
+            pb::HttpRouteUpsert {
+                key: Some(pb::RouteKey {
+                    bind: "b".into(),
+                    listener: "l".into(),
+                    name: "r".into(),
+                }),
+                matches: vec![],
+                backend_refs: vec![],
+                filters: vec![],
+            },
+        );
         snap
     }
 
@@ -318,18 +376,35 @@ mod tests {
 
     #[test]
     fn bootstrap_carries_every_entity_in_the_slice() {
+        // One of every entity kind must survive the bootstrap flatten.
+        // Guards against silently dropping a kind — the missing-Secret
+        // bug being the motivating case (an HTTPS listener would stash
+        // forever with no cert on the wire).
         let state = ServerState::new();
         let mut next = HashMap::new();
         next.insert(
             ("demo".to_string(), "api".to_string()),
-            slice_with_bind("b", 80),
+            slice_with_every_entity(),
         );
         state.publish(&next);
 
         let update = state.bootstrap(&("demo".into(), "api".into()));
-        assert_eq!(update.upserts.len(), 1);
         assert!(update.removes.is_empty());
         assert!(update.sync_complete);
+
+        let has = |pred: fn(&pb::upsert::Body) -> bool| {
+            update
+                .upserts
+                .iter()
+                .filter_map(|u| u.body.as_ref())
+                .any(pred)
+        };
+        assert_eq!(update.upserts.len(), 5, "one upsert per entity kind");
+        assert!(has(|b| matches!(b, pb::upsert::Body::Bind(_))), "bind");
+        assert!(has(|b| matches!(b, pb::upsert::Body::Backend(_))), "backend");
+        assert!(has(|b| matches!(b, pb::upsert::Body::Secret(_))), "secret");
+        assert!(has(|b| matches!(b, pb::upsert::Body::Listener(_))), "listener");
+        assert!(has(|b| matches!(b, pb::upsert::Body::HttpRoute(_))), "route");
     }
 
     // --- publish + subscribe ---
