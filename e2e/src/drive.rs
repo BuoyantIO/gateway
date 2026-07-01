@@ -1,6 +1,7 @@
 //! HTTP driver used by tests to send requests through the data
 //! plane and assert responses.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -110,6 +111,56 @@ pub async fn wait_until_routed(
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_routed timed out: host={host} path={path} \
+                 wanted={expected_status} last_seen={last_seen:?}"
+            );
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(2));
+    }
+}
+
+/// An HTTPS client that resolves `host` to the cluster's loopback
+/// `NodePort` and trusts any server cert. The connection sends `host`
+/// as SNI (so the gateway selects the matching TLS listener) and as the
+/// `Host` authority (the gateway strips the port before matching).
+fn tls_client(host: &str) -> Result<reqwest::Client> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, NODE_PORT));
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        // Tests use a throwaway self-signed cert; the point is to
+        // prove termination, not chain validation.
+        .danger_accept_invalid_certs(true)
+        .resolve(host, addr)
+        .build()
+        .context("building TLS reqwest client")
+}
+
+/// Poll the gateway until an HTTPS GET for `(host, path)` terminates
+/// and returns `expected_status`. Same retry/backoff shape as
+/// [`wait_until_routed`], over TLS.
+///
+/// # Errors
+/// Returns an error if the gateway doesn't reach the expected state
+/// within the deadline.
+pub async fn wait_until_routed_tls(
+    host: &str,
+    path: &str,
+    expected_status: StatusCode,
+) -> Result<reqwest::Response> {
+    let client = tls_client(host)?;
+    let url = format!("https://{host}:{NODE_PORT}{path}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(250);
+    let mut last_seen: Option<StatusCode> = None;
+    loop {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status() == expected_status => return Ok(resp),
+            Ok(resp) => last_seen = Some(resp.status()),
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "wait_until_routed_tls timed out: host={host} path={path} \
                  wanted={expected_status} last_seen={last_seen:?}"
             );
         }

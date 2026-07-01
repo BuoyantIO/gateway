@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners};
+use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
@@ -195,13 +195,16 @@ type PortGroup = (pb::BindProtocol, std::collections::HashSet<Option<String>>);
 /// accepted listener. Returns the accepted set (listener name →
 /// port) for the route pass.
 ///
+/// `HTTP` becomes a plaintext listener; `HTTPS` with (defaulted)
+/// `Terminate` mode becomes a TLS listener carrying its cert refs.
+///
 /// Classification is first-listener-wins, per the Gateway API
 /// listener-distinctness rule. A listener is skipped (warn, no
 /// error) when:
-/// * its protocol isn't HTTP — v0 translates HTTP only;
+/// * its protocol is neither HTTP nor HTTPS, or it's HTTPS with
+///   `Passthrough` mode (TLS passthrough is not yet supported);
 /// * its `BindProtocol` disagrees with the listener that established
-///   the port's bind — unreachable while only HTTP is accepted, but
-///   load-bearing once HTTPS translation lands;
+///   the port's bind (HTTP and HTTPS can't share a port);
 /// * its hostname duplicates an accepted listener on the same port
 ///   (two unset hostnames collide too).
 fn emit_gateway_listeners(
@@ -214,16 +217,41 @@ fn emit_gateway_listeners(
     let mut ports: HashMap<i32, PortGroup> = HashMap::new();
 
     for listener in listeners {
-        if listener.protocol != "HTTP" {
-            tracing::warn!(
-                gateway = gw_name,
-                listener = %listener.name,
-                protocol = %listener.protocol,
-                "skipping non-HTTP listener"
-            );
-            continue;
-        }
-        let protocol = pb::BindProtocol::Http;
+        // Classify the listener into a bind protocol and (for HTTPS)
+        // its terminating TLS config. Unsupported protocols/modes are
+        // skipped with a warn, not an error.
+        let (protocol, tls) = match listener.protocol.as_str() {
+            "HTTP" => (pb::BindProtocol::Http, None),
+            "HTTPS" => {
+                // Gateway API defaults an unset mode to Terminate.
+                match listener.tls.as_ref().and_then(|t| t.mode.as_ref()) {
+                    None | Some(GatewayListenersTlsMode::Terminate) => (
+                        pb::BindProtocol::Tls,
+                        Some(pb::ListenerTls {
+                            mode: pb::TlsMode::Terminate as i32,
+                            certificate_refs: listener_cert_refs(gw_ns, listener),
+                        }),
+                    ),
+                    Some(GatewayListenersTlsMode::Passthrough) => {
+                        tracing::warn!(
+                            gateway = gw_name,
+                            listener = %listener.name,
+                            "skipping TLS passthrough listener (not yet supported)"
+                        );
+                        continue;
+                    }
+                }
+            }
+            other => {
+                tracing::warn!(
+                    gateway = gw_name,
+                    listener = %listener.name,
+                    protocol = %other,
+                    "skipping unsupported listener protocol"
+                );
+                continue;
+            }
+        };
 
         let bind_name = bind_name(gw_ns, gw_name, listener.port);
         // First accepted-protocol listener on a port creates the
@@ -273,7 +301,7 @@ fn emit_gateway_listeners(
                 }),
                 hostname: listener.hostname.clone().unwrap_or_default(),
                 has_hostname: listener.hostname.is_some(),
-                tls: None,
+                tls,
             },
         );
         accepted.insert(listener.name.clone(), listener.port);
@@ -282,11 +310,50 @@ fn emit_gateway_listeners(
     accepted
 }
 
-/// Emit a `SecretUpsert` for each `kubernetes.io/tls` Secret referenced
-/// by the gateway's listener `certificateRefs`. Same-namespace only;
-/// cross-namespace refs need a `ReferenceGrant` (not yet supported) and
-/// are skipped. Runs independent of listener acceptance so the material
-/// is already published when HTTPS listeners are translated.
+/// Resolve a listener's `certificateRefs` to the namespaced secret keys
+/// this gateway accepts: core group, `kind: Secret`, same namespace.
+/// Cross-namespace refs (need a `ReferenceGrant`) and other kinds
+/// are skipped with a warn. The returned keys name secrets that may not
+/// be present yet — the DP stashes a listener until they arrive.
+fn listener_cert_refs(gateway_ns: &str, listener: &GatewayListeners) -> Vec<pb::SecretKey> {
+    let Some(refs) = listener
+        .tls
+        .as_ref()
+        .and_then(|t| t.certificate_refs.as_ref())
+    else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for r in refs {
+        // Only core/v1 Secret refs are supported.
+        if r.group.as_deref().is_some_and(|g| !g.is_empty()) {
+            tracing::warn!(name = %r.name, group = ?r.group, "skipping non-core certificateRef");
+            continue;
+        }
+        if r.kind.as_deref().is_some_and(|k| k != "Secret") {
+            tracing::warn!(name = %r.name, kind = ?r.kind, "skipping non-Secret certificateRef");
+            continue;
+        }
+        // Cross-namespace refs require a ReferenceGrant (not yet supported).
+        if r.namespace
+            .as_deref()
+            .is_some_and(|n| !n.is_empty() && n != gateway_ns)
+        {
+            tracing::warn!(name = %r.name, namespace = ?r.namespace,
+                "skipping cross-namespace certificateRef");
+            continue;
+        }
+        keys.push(pb::SecretKey {
+            namespace: gateway_ns.to_string(),
+            name: r.name.clone(),
+        });
+    }
+    keys
+}
+
+/// Emit a `SecretUpsert` for each accepted `certificateRef` whose Secret
+/// material is present. Runs independent of listener acceptance so the
+/// material is already published when HTTPS listeners are translated.
 fn emit_gateway_secrets(
     snapshot: &mut Snapshot,
     gateway_ns: &str,
@@ -294,48 +361,24 @@ fn emit_gateway_secrets(
     secrets_by_id: &HashMap<(&str, &str), &Secret>,
 ) {
     for listener in listeners {
-        let Some(refs) = listener
-            .tls
-            .as_ref()
-            .and_then(|t| t.certificate_refs.as_ref())
-        else {
-            continue;
-        };
-        for r in refs {
-            // Only core/v1 Secret refs are supported.
-            if r.group.as_deref().is_some_and(|g| !g.is_empty()) {
-                tracing::warn!(name = %r.name, group = ?r.group, "skipping non-core certificateRef");
-                continue;
-            }
-            if r.kind.as_deref().is_some_and(|k| k != "Secret") {
-                tracing::warn!(name = %r.name, kind = ?r.kind, "skipping non-Secret certificateRef");
-                continue;
-            }
-            // Cross-namespace refs require a ReferenceGrant (not yet supported).
-            if r.namespace
-                .as_deref()
-                .is_some_and(|n| !n.is_empty() && n != gateway_ns)
-            {
-                tracing::warn!(name = %r.name, namespace = ?r.namespace,
-                    "skipping cross-namespace certificateRef");
-                continue;
-            }
-            let Some(secret) = secrets_by_id.get(&(gateway_ns, r.name.as_str())) else {
-                tracing::warn!(namespace = %gateway_ns, name = %r.name,
+        for key in listener_cert_refs(gateway_ns, listener) {
+            let Some(secret) = secrets_by_id.get(&(key.namespace.as_str(), key.name.as_str()))
+            else {
+                tracing::warn!(namespace = %key.namespace, name = %key.name,
                     "certificateRef Secret not present yet");
                 continue;
             };
             let Some((cert_pem, key_pem)) = tls_material(secret) else {
-                tracing::warn!(namespace = %gateway_ns, name = %r.name,
+                tracing::warn!(namespace = %key.namespace, name = %key.name,
                     "Secret missing or invalid tls.crt / tls.key");
                 continue;
             };
             // HashMap insert dedups a Secret referenced by several listeners.
             snapshot.secrets.insert(
-                SecretKey::new(gateway_ns, r.name.clone()),
+                SecretKey::new(key.namespace.clone(), key.name.clone()),
                 pb::SecretUpsert {
-                    namespace: gateway_ns.to_string(),
-                    name: r.name.clone(),
+                    namespace: key.namespace,
+                    name: key.name,
                     cert_pem,
                     key_pem,
                 },
@@ -826,7 +869,8 @@ mod tests {
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
     use gateway_api::apis::standard::gateways::{
         GatewayListenersAllowedRoutes, GatewayListenersAllowedRoutesNamespaces,
-        GatewayListenersTls, GatewayListenersTlsCertificateRefs, GatewaySpec,
+        GatewayListenersTls, GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode,
+        GatewaySpec,
     };
     use gateway_api::apis::standard::httproutes::{
         HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
@@ -2323,6 +2367,142 @@ mod tests {
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).expect("snapshot");
         assert!(s.secrets.is_empty());
+    }
+
+    // ---- HTTPS listener translation ----
+
+    #[test]
+    fn https_listener_emits_tls_bind_and_refs() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![https_listener(
+                    "https",
+                    443,
+                    Some("a.example.com"),
+                    &[("", "foo")],
+                )],
+            )],
+            secrets: vec![tls_secret("demo", "foo", "CERT", "KEY")],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let snap = out.get(&("demo".into(), "api".into())).expect("slice");
+
+        let bind = snap.binds.get(&BindKey::new("demo/api:443")).expect("bind");
+        assert_eq!(bind.bind_protocol, pb::BindProtocol::Tls as i32);
+
+        let lk = ListenerKey::new(BindKey::new("demo/api:443"), "https");
+        let listener = snap.listeners.get(&lk).expect("listener");
+        let tls = listener.tls.as_ref().expect("tls config");
+        assert_eq!(tls.mode, pb::TlsMode::Terminate as i32);
+        assert_eq!(tls.certificate_refs.len(), 1);
+        assert_eq!(tls.certificate_refs[0].namespace, "demo");
+        assert_eq!(tls.certificate_refs[0].name, "foo");
+    }
+
+    #[test]
+    fn http_and_https_cannot_share_a_port() {
+        // First listener on the port establishes its protocol; a later
+        // listener of the other protocol is skipped (first-wins).
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("plain", 8443, Some("a.example.com")),
+                    https_listener("secure", 8443, Some("b.example.com"), &[("", "foo")]),
+                ],
+            )],
+            secrets: vec![tls_secret("demo", "foo", "CERT", "KEY")],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let snap = out.get(&("demo".into(), "api".into())).expect("slice");
+        let bind = snap
+            .binds
+            .get(&BindKey::new("demo/api:8443"))
+            .expect("bind");
+        assert_eq!(bind.bind_protocol, pb::BindProtocol::Http as i32);
+        assert!(
+            snap.listeners
+                .contains_key(&ListenerKey::new(BindKey::new("demo/api:8443"), "plain"))
+        );
+        assert!(
+            !snap
+                .listeners
+                .contains_key(&ListenerKey::new(BindKey::new("demo/api:8443"), "secure")),
+            "the conflicting HTTPS listener must be skipped"
+        );
+    }
+
+    #[test]
+    fn passthrough_listener_skipped() {
+        let passthrough = GatewayListeners {
+            name: "pass".into(),
+            protocol: "HTTPS".into(),
+            port: 443,
+            hostname: Some("a.example.com".into()),
+            tls: Some(GatewayListenersTls {
+                mode: Some(GatewayListenersTlsMode::Passthrough),
+                options: None,
+                certificate_refs: None,
+            }),
+            allowed_routes: Some(GatewayListenersAllowedRoutes {
+                namespaces: Some(GatewayListenersAllowedRoutesNamespaces {
+                    from: None,
+                    selector: None,
+                }),
+                kinds: None,
+            }),
+        };
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw("demo", "api", "zd", vec![passthrough])],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let snap = out.get(&("demo".into(), "api".into())).expect("slice");
+        assert!(snap.binds.is_empty(), "passthrough creates no bind");
+        assert!(snap.listeners.is_empty(), "passthrough creates no listener");
+    }
+
+    #[test]
+    fn cross_namespace_certref_excluded_from_listener() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![https_listener(
+                    "https",
+                    443,
+                    Some("a.example.com"),
+                    &[("other", "foo")],
+                )],
+            )],
+            ..Default::default()
+        };
+        let out = translate(&state, OURS);
+        let snap = out.get(&("demo".into(), "api".into())).expect("slice");
+        let lk = ListenerKey::new(BindKey::new("demo/api:443"), "https");
+        let tls = snap
+            .listeners
+            .get(&lk)
+            .expect("listener")
+            .tls
+            .as_ref()
+            .expect("tls config");
+        assert!(
+            tls.certificate_refs.is_empty(),
+            "cross-namespace certificateRef must be excluded"
+        );
     }
 
     #[test]
