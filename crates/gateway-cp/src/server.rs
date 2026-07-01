@@ -401,10 +401,19 @@ mod tests {
         };
         assert_eq!(update.upserts.len(), 5, "one upsert per entity kind");
         assert!(has(|b| matches!(b, pb::upsert::Body::Bind(_))), "bind");
-        assert!(has(|b| matches!(b, pb::upsert::Body::Backend(_))), "backend");
+        assert!(
+            has(|b| matches!(b, pb::upsert::Body::Backend(_))),
+            "backend"
+        );
         assert!(has(|b| matches!(b, pb::upsert::Body::Secret(_))), "secret");
-        assert!(has(|b| matches!(b, pb::upsert::Body::Listener(_))), "listener");
-        assert!(has(|b| matches!(b, pb::upsert::Body::HttpRoute(_))), "route");
+        assert!(
+            has(|b| matches!(b, pb::upsert::Body::Listener(_))),
+            "listener"
+        );
+        assert!(
+            has(|b| matches!(b, pb::upsert::Body::HttpRoute(_))),
+            "route"
+        );
     }
 
     // --- publish + subscribe ---
