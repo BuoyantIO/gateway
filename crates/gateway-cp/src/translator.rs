@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesMatches,
-    HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
-    HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
+    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
+    HttpRouteRulesFiltersRequestRedirectPathType, HttpRouteRulesFiltersRequestRedirectScheme,
+    HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
+    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
     HttpRouteRulesMatchesQueryParamsType,
 };
 use gateway_cp_proto::v1 as pb;
@@ -741,6 +742,44 @@ fn translate_filter(f: &HttpRouteRulesFilters) -> Option<pb::HttpFilter> {
                 pb::ResponseHeaderModifier {
                     name: String::new(),
                     response_headers: Some(pb::HeaderOps { add, set, remove }),
+                },
+            )),
+        });
+    }
+    if let Some(rr) = f.request_redirect.as_ref() {
+        let scheme = match rr.scheme {
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Http) => pb::RedirectScheme::Http,
+            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https) => pb::RedirectScheme::Https,
+            None => pb::RedirectScheme::Unspecified,
+        } as i32;
+        let hostname = rr.hostname.clone().unwrap_or_default();
+        let port = rr.port.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
+        let status_code = match rr.status_code {
+            Some(301) => pb::RedirectStatus::MovedPermanently,
+            Some(302) => pb::RedirectStatus::Found,
+            // Gateway API's CRD enum only permits 301/302; anything
+            // else (or unset) falls to the DP's default.
+            _ => pb::RedirectStatus::Unspecified,
+        } as i32;
+        let path = rr.path.as_ref().and_then(|p| match p.r#type {
+            HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => p
+                .replace_full_path
+                .clone()
+                .map(pb::request_redirect::Path::ReplaceFullPath),
+            HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => p
+                .replace_prefix_match
+                .clone()
+                .map(pb::request_redirect::Path::ReplacePrefixMatch),
+        });
+        return Some(pb::HttpFilter {
+            kind: Some(pb::http_filter::Kind::RequestRedirect(
+                pb::RequestRedirect {
+                    name: String::new(),
+                    scheme,
+                    hostname,
+                    port,
+                    status_code,
+                    path,
                 },
             )),
         });
@@ -1660,9 +1699,54 @@ mod tests {
                 assert_eq!(ops.set[0].name, "x-frame-options");
                 assert_eq!(ops.remove, vec!["x-server-version".to_string()]);
             }
-            other @ pb::http_filter::Kind::RequestHeaderModifier(_) => {
-                panic!("expected ResponseHeaderModifier, got {other:?}")
+            other => panic!("expected ResponseHeaderModifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_redirect_filter_translated() {
+        use gateway_api::apis::standard::httproutes::{
+            HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
+            HttpRouteRulesFiltersRequestRedirectPathType,
+            HttpRouteRulesFiltersRequestRedirectScheme,
+        };
+
+        let filter = HttpRouteRulesFilters {
+            r#type:
+                gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersType::RequestRedirect,
+            request_header_modifier: None,
+            response_header_modifier: None,
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                scheme: Some(HttpRouteRulesFiltersRequestRedirectScheme::Https),
+                hostname: None,
+                port: None,
+                status_code: Some(301),
+                path: Some(HttpRouteRulesFiltersRequestRedirectPath {
+                    r#type: HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch,
+                    replace_full_path: None,
+                    replace_prefix_match: Some("/new".into()),
+                }),
+            }),
+            url_rewrite: None,
+            request_mirror: None,
+            cors: None,
+            extension_ref: None,
+        };
+
+        let out = translate_filter(&filter).expect("redirect translated");
+        match out.kind.expect("kind set") {
+            pb::http_filter::Kind::RequestRedirect(rr) => {
+                assert_eq!(rr.scheme, pb::RedirectScheme::Https as i32);
+                assert_eq!(rr.status_code, pb::RedirectStatus::MovedPermanently as i32);
+                assert_eq!(rr.port, 0);
+                assert_eq!(
+                    rr.path,
+                    Some(pb::request_redirect::Path::ReplacePrefixMatch(
+                        "/new".into()
+                    ))
+                );
             }
+            other => panic!("expected RequestRedirect, got {other:?}"),
         }
     }
 
