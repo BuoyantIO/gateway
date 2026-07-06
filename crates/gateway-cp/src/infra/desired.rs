@@ -196,19 +196,43 @@ fn deployment(
     }
 }
 
+/// The Service types the annotation may select. Anything else falls
+/// back to the default with a warning — passing a bad value through
+/// would produce a Service the apiserver never accepts and wedge the
+/// apply loop on permanent retries.
+const SERVICE_TYPES: [&str; 3] = ["ClusterIP", "NodePort", "LoadBalancer"];
+
+const DEFAULT_SERVICE_TYPE: &str = "LoadBalancer";
+
 fn service(
     gw: &Gateway,
     metadata: ObjectMeta,
     selector_labels: &BTreeMap<String, String>,
     ports: &[(String, i32)],
 ) -> Service {
-    let service_type = gw
+    let annotated = gw
         .meta()
         .annotations
         .as_ref()
-        .and_then(|a| a.get(SERVICE_TYPE_ANNOTATION))
-        .cloned()
-        .unwrap_or_else(|| "LoadBalancer".to_string());
+        .and_then(|a| a.get(SERVICE_TYPE_ANNOTATION));
+    let service_type = match annotated {
+        Some(v) if SERVICE_TYPES.contains(&v.as_str()) => v.clone(),
+        Some(v) => {
+            let gateway = format!(
+                "{}/{}",
+                gw.meta().namespace.as_deref().unwrap_or_default(),
+                gw.meta().name.as_deref().unwrap_or_default(),
+            );
+            tracing::warn!(
+                gateway,
+                value = %v,
+                annotation = SERVICE_TYPE_ANNOTATION,
+                "unsupported service type; using {DEFAULT_SERVICE_TYPE}"
+            );
+            DEFAULT_SERVICE_TYPE.to_string()
+        }
+        None => DEFAULT_SERVICE_TYPE.to_string(),
+    };
 
     Service {
         metadata,
@@ -541,6 +565,20 @@ mod tests {
         assert_eq!(
             infra.service.spec.as_ref().unwrap().type_.as_deref(),
             Some("ClusterIP")
+        );
+    }
+
+    #[test]
+    fn unsupported_service_type_annotation_falls_back_to_default() {
+        let mut gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        // Wrong case: Kubernetes Service types are case-sensitive, so
+        // this would be rejected by the apiserver on every apply.
+        gw.metadata.annotations =
+            Some([(SERVICE_TYPE_ANNOTATION.to_string(), "clusterip".to_string())].into());
+        let infra = desired(&gw, &config()).unwrap();
+        assert_eq!(
+            infra.service.spec.as_ref().unwrap().type_.as_deref(),
+            Some("LoadBalancer")
         );
     }
 

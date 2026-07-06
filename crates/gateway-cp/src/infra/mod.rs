@@ -28,6 +28,7 @@ pub const PROVISIONING_ANNOTATION: &str = "gateway.buoyant.io/provisioning";
 /// The only recognized [`PROVISIONING_ANNOTATION`] value.
 pub const PROVISIONING_DISABLED: &str = "disabled";
 
-/// Per-Gateway override for the provisioned `Service`'s type.
-/// Default is `LoadBalancer`.
+/// Per-Gateway override for the provisioned `Service`'s type:
+/// `ClusterIP`, `NodePort`, or `LoadBalancer` (the default). Any
+/// other value falls back to the default with a warning.
 pub const SERVICE_TYPE_ANNOTATION: &str = "gateway.buoyant.io/service-type";
