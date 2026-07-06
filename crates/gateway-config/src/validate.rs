@@ -240,6 +240,8 @@ fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
             HttpFilter::ResponseHeaderModifier {
                 response_headers, ..
             } => response_headers,
+            // No header ops to validate on a redirect.
+            HttpFilter::RequestRedirect { .. } => continue,
         };
         validate_header_ops(&format!("{key}/filters[{i}]"), ops, out);
     }

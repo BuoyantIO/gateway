@@ -119,6 +119,52 @@ pub async fn wait_until_routed(
     }
 }
 
+/// Poll the gateway until a plaintext GET for `(host, path)` returns
+/// `expected_status` **without following the redirect**, then hand back
+/// the response so the caller can inspect the `Location` header. Used
+/// for `RequestRedirect`, which answers with a 3xx.
+///
+/// # Errors
+/// Returns an error if the gateway doesn't reach the expected state
+/// within the deadline.
+pub async fn wait_until_redirected(
+    host: &str,
+    path: &str,
+    expected_status: StatusCode,
+) -> Result<reqwest::Response> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        // Return the 3xx instead of chasing it (the target is https, so
+        // following it would just fail to connect).
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building no-redirect reqwest client")?;
+    let url = format!("http://{NODE_HOST}:{NODE_PORT}{path}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(250);
+    let mut last_seen: Option<StatusCode> = None;
+    loop {
+        match client
+            .get(&url)
+            .header(reqwest::header::HOST, host)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status() == expected_status => return Ok(resp),
+            Ok(resp) => last_seen = Some(resp.status()),
+            Err(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "wait_until_redirected timed out: host={host} path={path} \
+                 wanted={expected_status} last_seen={last_seen:?}"
+            );
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(2));
+    }
+}
+
 /// An HTTPS client that resolves `host` to the cluster's loopback
 /// `NodePort` and trusts any server cert. The connection sends `host`
 /// as SNI (so the gateway selects the matching TLS listener) and as the

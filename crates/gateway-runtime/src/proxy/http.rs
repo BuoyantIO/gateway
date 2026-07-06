@@ -19,7 +19,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
-use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter as HttpFilterConfig};
+use gateway_config::filter::{
+    HeaderOps, HeaderPair, HttpFilter as HttpFilterConfig, RedirectPath, RedirectStatus, Scheme,
+};
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
@@ -95,9 +97,10 @@ impl std::fmt::Debug for HttpClient {
 /// defaults so each concrete filter opts in to only the side(s)
 /// it cares about.
 pub(crate) trait HttpFilter: Send + Sync {
-    fn apply_request_headers(
+    fn apply_request(
         &self,
         _parts: &mut http::request::Parts,
+        _ctx: &RequestFilterCtx<'_>,
     ) -> Result<HttpFilterDecision, FilterError> {
         Ok(HttpFilterDecision::Continue)
     }
@@ -112,9 +115,14 @@ pub(crate) trait HttpFilter: Send + Sync {
     }
 }
 
+pub(crate) struct RequestFilterCtx<'a> {
+    pub matched_path_prefix: Option<&'a str>,
+    pub request_host: Option<&'a str>,
+}
+
 pub(crate) enum HttpFilterDecision {
     Continue,
-    // Future: Respond(LocalHttpResponse),
+    Respond(Response<ResponseBody>),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +146,20 @@ fn build_http_filter(cfg: &HttpFilterConfig) -> Arc<dyn HttpFilter> {
         } => Arc::new(ResponseHeaderModifierFilter {
             ops: response_headers.clone(),
         }),
+        HttpFilterConfig::RequestRedirect {
+            scheme,
+            hostname,
+            port,
+            status_code,
+            path,
+            ..
+        } => Arc::new(RequestRedirectFilter {
+            scheme: *scheme,
+            hostname: hostname.clone(),
+            port: *port,
+            status_code: *status_code,
+            path: path.clone(),
+        }),
     }
 }
 
@@ -146,9 +168,10 @@ struct RequestHeaderModifierFilter {
 }
 
 impl HttpFilter for RequestHeaderModifierFilter {
-    fn apply_request_headers(
+    fn apply_request(
         &self,
         parts: &mut http::request::Parts,
+        _ctx: &RequestFilterCtx<'_>,
     ) -> Result<HttpFilterDecision, FilterError> {
         apply_header_ops(
             &mut parts.headers,
@@ -173,6 +196,119 @@ impl HttpFilter for ResponseHeaderModifierFilter {
             &self.ops.remove,
         )
     }
+}
+
+/// Gateway API `RequestRedirect`: short-circuits the request with a 3xx
+/// and a `Location` built from the request plus the configured
+/// overrides.
+struct RequestRedirectFilter {
+    scheme: Option<Scheme>,
+    hostname: Option<String>,
+    port: Option<u16>,
+    status_code: RedirectStatus,
+    path: Option<RedirectPath>,
+}
+
+impl HttpFilter for RequestRedirectFilter {
+    fn apply_request(
+        &self,
+        parts: &mut http::request::Parts,
+        ctx: &RequestFilterCtx<'_>,
+    ) -> Result<HttpFilterDecision, FilterError> {
+        // Scheme: explicit config wins; else the request's own scheme
+        // (present on h2), else plain http.
+        let scheme = self
+            .scheme
+            .map(Scheme::as_str)
+            .or_else(|| parts.uri.scheme_str())
+            .unwrap_or("http");
+
+        // Host: explicit config wins; else the request host (already
+        // port-stripped by the caller).
+        let host = self
+            .hostname
+            .clone()
+            .or_else(|| ctx.request_host.map(str::to_owned))
+            .unwrap_or_default();
+
+        // Path: full replace, prefix replace against the matched
+        // prefix, or the request path unchanged.
+        let orig_path = parts.uri.path();
+        let new_path = match &self.path {
+            None => orig_path.to_owned(),
+            Some(RedirectPath::ReplaceFullPath(p)) => p.clone(),
+            Some(RedirectPath::ReplacePrefixMatch(replacement)) => {
+                if let Some(prefix) = ctx.matched_path_prefix {
+                    replace_prefix(orig_path, prefix, replacement)
+                } else {
+                    tracing::warn!(
+                        "RequestRedirect ReplacePrefixMatch on a non-prefix route; \
+                         leaving path unchanged"
+                    );
+                    orig_path.to_owned()
+                }
+            }
+        };
+
+        let mut location = format!("{scheme}://{}", authority(&host, scheme, self.port));
+        location.push_str(&new_path);
+        if let Some(q) = parts.uri.query() {
+            location.push('?');
+            location.push_str(q);
+        }
+
+        let location = HeaderValue::try_from(location)
+            .map_err(|_| FilterError::InvalidHeaderValue("location".to_owned()))?;
+        let status = StatusCode::from_u16(self.status_code.code()).unwrap_or(StatusCode::FOUND);
+        Ok(HttpFilterDecision::Respond(redirect_response(
+            status, location,
+        )))
+    }
+}
+
+/// Build the authority (`host` or `host:port`), omitting the port for
+/// the scheme's well-known value per the Gateway API spec.
+fn authority(host: &str, scheme: &str, port: Option<u16>) -> String {
+    let Some(p) = port else {
+        return host.to_owned();
+    };
+    let well_known = (scheme == "http" && p == 80) || (scheme == "https" && p == 443);
+    if well_known {
+        host.to_owned()
+    } else {
+        format!("{host}:{p}")
+    }
+}
+
+/// Replace the matched `PathPrefix` of `path` with `replacement`,
+/// segment-aware: `/foo` + `/foo/bar` → `<replacement>/bar`; `/foo` +
+/// `/foo` → `<replacement>`. Trailing slashes on the prefix and
+/// replacement are trimmed first (per Gateway API).
+fn replace_prefix(path: &str, matched_prefix: &str, replacement: &str) -> String {
+    let matched = matched_prefix.trim_end_matches('/');
+    let replacement = replacement.trim_end_matches('/');
+    let rest = path.strip_prefix(matched).unwrap_or("");
+    if rest.is_empty() {
+        if replacement.is_empty() {
+            "/".to_owned()
+        } else {
+            replacement.to_owned()
+        }
+    } else {
+        // `rest` begins with '/', so this yields e.g. "/xyz" + "/bar".
+        format!("{replacement}{rest}")
+    }
+}
+
+fn redirect_response(status: StatusCode, location: HeaderValue) -> Response<ResponseBody> {
+    let body = Full::new(Bytes::new())
+        .map_err(|never: Infallible| match never {})
+        .boxed();
+    Response::builder()
+        .status(status)
+        .header(http::header::LOCATION, location)
+        .body(body)
+        .expect("redirect response is well-formed")
 }
 
 fn apply_header_ops(
@@ -273,11 +409,16 @@ async fn serve_request(
         Err(e) => return synthesize_error(e),
     };
 
+    let filter_ctx = RequestFilterCtx {
+        matched_path_prefix: resolved.matched_path_prefix.as_deref(),
+        request_host: host_stripped.as_deref(),
+    };
     let (mut parts, body) = req.into_parts();
     for cfg in &resolved.filters {
         let filter = build_http_filter(cfg);
-        match filter.apply_request_headers(&mut parts) {
+        match filter.apply_request(&mut parts, &filter_ctx) {
             Ok(HttpFilterDecision::Continue) => {}
+            Ok(HttpFilterDecision::Respond(resp)) => return resp,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to apply request filter");
                 return synthesize_status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -286,7 +427,12 @@ async fn serve_request(
     }
     let req = Request::from_parts(parts, body);
 
-    let Some((endpoint, info)) = lb.pick_endpoint(&resolved.backend) else {
+    // No filter short-circuited, so this route must proxy — it needs a
+    // backend with a pickable endpoint.
+    let Some(backend) = resolved.backend else {
+        return synthesize_error(RouteResolveError::NoBackend);
+    };
+    let Some((endpoint, info)) = lb.pick_endpoint(&backend) else {
         return synthesize_status(StatusCode::SERVICE_UNAVAILABLE);
     };
     let _active = info.acquire();
@@ -299,7 +445,7 @@ async fn serve_request(
         "http request routed"
     );
 
-    let upstream = forward(&client, resolved.backend.protocol, req, &endpoint, &info).await;
+    let upstream = forward(&client, backend.protocol, req, &endpoint, &info).await;
 
     // Response-filter pipeline: iterate the route's filters in
     // **reverse** order per Area 03 ("response-side runs
@@ -323,9 +469,12 @@ async fn serve_request(
 // =================== route resolution ===================
 
 struct ResolvedRoute {
-    backend: Arc<ActiveBackend>,
+    /// `None` for a route with no backendRefs
+    backend: Option<Arc<ActiveBackend>>,
     filters: Vec<HttpFilterConfig>,
     route_name: String,
+    /// The route's `PathPrefix` value that matched this request
+    matched_path_prefix: Option<String>,
 }
 
 /// Borrow-struct carrying everything route resolution reads from the
@@ -402,19 +551,31 @@ fn resolve_http_route(
 
     let chosen = pick_http_route(&listener.routes, ctx).ok_or(RouteResolveError::NoRoute)?;
 
-    let backend_ref = chosen
-        .backends
-        .first()
-        .ok_or(RouteResolveError::NoBackend)?;
-    if backend_ref.backend.endpoints.is_empty() {
-        return Err(RouteResolveError::NoEndpoint);
-    }
+    // Backend and endpoint availability are enforced later, on the
+    // proxy path — a redirect route legitimately has neither.
+    let backend = chosen.backends.first().map(|br| Arc::clone(&br.backend));
 
     Ok(ResolvedRoute {
-        backend: Arc::clone(&backend_ref.backend),
+        backend,
         filters: chosen.filters.clone(),
         route_name: chosen.key.name.clone(),
+        matched_path_prefix: matched_prefix(&chosen.matches, ctx.path).map(str::to_owned),
     })
+}
+
+/// The longest `PathPrefix` match on the route whose value is a
+/// segment-prefix of `path` — the prefix a redirect's
+/// `ReplacePrefixMatch` strips.
+fn matched_prefix<'a>(matches: &'a [HttpMatch], path: &str) -> Option<&'a str> {
+    matches
+        .iter()
+        .filter_map(|m| match &m.path {
+            pp @ PathMatch::PathPrefix { value } if score_path(pp, path).is_some() => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+        .max_by_key(|v| v.len())
 }
 
 /// Pick the listener whose hostname best matches `host`: exact >
@@ -763,8 +924,6 @@ enum RouteResolveError {
     NoRoute,
     #[error("route has no backend refs")]
     NoBackend,
-    #[error("backend has no endpoints")]
-    NoEndpoint,
 }
 
 fn synthesize_error(err: RouteResolveError) -> Response<ResponseBody> {
@@ -773,9 +932,7 @@ fn synthesize_error(err: RouteResolveError) -> Response<ResponseBody> {
             StatusCode::MISDIRECTED_REQUEST
         }
         RouteResolveError::NoRoute => StatusCode::NOT_FOUND,
-        RouteResolveError::NoBackend | RouteResolveError::NoEndpoint => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        RouteResolveError::NoBackend => StatusCode::SERVICE_UNAVAILABLE,
     };
     synthesize_status(status)
 }
@@ -899,7 +1056,11 @@ mod tests {
             .body(())
             .unwrap();
         let (mut parts, ()) = req.into_parts();
-        let decision = rsp_filter.apply_request_headers(&mut parts).unwrap();
+        let ctx = RequestFilterCtx {
+            matched_path_prefix: None,
+            request_host: None,
+        };
+        let decision = rsp_filter.apply_request(&mut parts, &ctx).unwrap();
         assert!(matches!(decision, HttpFilterDecision::Continue));
         assert_eq!(parts.headers.get("x-keep").unwrap(), "value");
         // The response-only add must NOT have leaked onto the
@@ -1523,5 +1684,127 @@ mod tests {
         let ls = [listener("catchall", None)];
         assert_eq!(picked(&ls, Some("anything.com")), Some("catchall"));
         assert_eq!(picked(&ls, None), Some("catchall"));
+    }
+
+    // --- RequestRedirect ---
+
+    fn redirect(
+        scheme: Option<Scheme>,
+        host: Option<&str>,
+        port: Option<u16>,
+        status: RedirectStatus,
+        path: Option<RedirectPath>,
+    ) -> RequestRedirectFilter {
+        RequestRedirectFilter {
+            scheme,
+            hostname: host.map(str::to_owned),
+            port,
+            status_code: status,
+            path,
+        }
+    }
+
+    fn run_redirect(
+        f: &RequestRedirectFilter,
+        uri: &str,
+        req_host: Option<&str>,
+        matched_prefix: Option<&str>,
+    ) -> (StatusCode, String) {
+        let req = http::Request::builder().uri(uri).body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+        let ctx = RequestFilterCtx {
+            matched_path_prefix: matched_prefix,
+            request_host: req_host,
+        };
+        match f.apply_request(&mut parts, &ctx).expect("redirect ok") {
+            HttpFilterDecision::Respond(resp) => {
+                let loc = resp
+                    .headers()
+                    .get(http::header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                (resp.status(), loc)
+            }
+            HttpFilterDecision::Continue => panic!("expected a redirect response"),
+        }
+    }
+
+    #[test]
+    fn redirect_scheme_only_keeps_host_and_path() {
+        let f = redirect(
+            Some(Scheme::Https),
+            None,
+            None,
+            RedirectStatus::MovedPermanently,
+            None,
+        );
+        let (status, loc) = run_redirect(&f, "/foo/bar?x=1", Some("app.example"), None);
+        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(loc, "https://app.example/foo/bar?x=1");
+    }
+
+    #[test]
+    fn redirect_omits_well_known_port() {
+        let f = redirect(
+            Some(Scheme::Https),
+            Some("h"),
+            Some(443),
+            RedirectStatus::Found,
+            None,
+        );
+        assert_eq!(run_redirect(&f, "/", None, None).1, "https://h/");
+        let f2 = redirect(
+            Some(Scheme::Https),
+            Some("h"),
+            Some(8443),
+            RedirectStatus::Found,
+            None,
+        );
+        assert_eq!(run_redirect(&f2, "/", None, None).1, "https://h:8443/");
+    }
+
+    #[test]
+    fn redirect_replace_full_path() {
+        let f = redirect(
+            Some(Scheme::Https),
+            Some("h"),
+            None,
+            RedirectStatus::Found,
+            Some(RedirectPath::ReplaceFullPath("/new".into())),
+        );
+        assert_eq!(
+            run_redirect(&f, "/old/thing", None, None).1,
+            "https://h/new"
+        );
+    }
+
+    #[test]
+    fn redirect_replace_prefix_match() {
+        let f = redirect(
+            Some(Scheme::Https),
+            Some("h"),
+            None,
+            RedirectStatus::Found,
+            Some(RedirectPath::ReplacePrefixMatch("/new".into())),
+        );
+        assert_eq!(
+            run_redirect(&f, "/foo/bar", None, Some("/foo")).1,
+            "https://h/new/bar"
+        );
+        assert_eq!(
+            run_redirect(&f, "/foo", None, Some("/foo")).1,
+            "https://h/new"
+        );
+    }
+
+    #[test]
+    fn replace_prefix_helper_cases() {
+        assert_eq!(replace_prefix("/foo/bar", "/foo", "/xyz"), "/xyz/bar");
+        assert_eq!(replace_prefix("/foo", "/foo", "/xyz"), "/xyz");
+        assert_eq!(replace_prefix("/foo/", "/foo", "/xyz"), "/xyz/");
+        assert_eq!(replace_prefix("/foo/bar", "/foo", "/"), "/bar");
+        assert_eq!(replace_prefix("/foo", "/foo", "/"), "/");
     }
 }

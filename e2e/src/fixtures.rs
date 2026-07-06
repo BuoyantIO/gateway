@@ -13,7 +13,8 @@ use gateway_api::apis::standard::gateways::{
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
     HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
-    HttpRouteRulesFiltersRequestHeaderModifierAdd, HttpRouteRulesFiltersResponseHeaderModifier,
+    HttpRouteRulesFiltersRequestHeaderModifierAdd, HttpRouteRulesFiltersRequestRedirect,
+    HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesFiltersResponseHeaderModifier,
     HttpRouteRulesFiltersResponseHeaderModifierAdd, HttpRouteRulesFiltersType,
     HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
@@ -362,6 +363,39 @@ impl HttpRouteBuilder {
     pub fn filter_response_header_remove(mut self, name: &str) -> Self {
         let m = self.resp_header_mod();
         m.remove.get_or_insert_with(Vec::new).push(name.into());
+        self
+    }
+
+    /// Attach a `RequestRedirect` filter. `scheme` is `"http"` or
+    /// `"https"`; a redirect route needs no backend.
+    ///
+    /// # Panics
+    /// Panics if `scheme` is not `"http"` or `"https"`.
+    pub fn filter_request_redirect(mut self, scheme: &str, status_code: i64) -> Self {
+        let scheme = match scheme {
+            "http" => HttpRouteRulesFiltersRequestRedirectScheme::Http,
+            "https" => HttpRouteRulesFiltersRequestRedirectScheme::Https,
+            other => panic!("unsupported redirect scheme {other}"),
+        };
+        self.pending
+            .filters
+            .get_or_insert_with(Vec::new)
+            .push(HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::RequestRedirect,
+                request_header_modifier: None,
+                response_header_modifier: None,
+                request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                    scheme: Some(scheme),
+                    hostname: None,
+                    port: None,
+                    path: None,
+                    status_code: Some(status_code),
+                }),
+                url_rewrite: None,
+                request_mirror: None,
+                cors: None,
+                extension_ref: None,
+            });
         self
     }
 

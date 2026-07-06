@@ -185,6 +185,7 @@ message HttpFilter {
   oneof kind {
     RequestHeaderModifier  request_header_modifier  = 1;
     ResponseHeaderModifier response_header_modifier = 2;
+    RequestRedirect        request_redirect         = 3;
   }
 }
 
@@ -196,6 +197,30 @@ message RequestHeaderModifier {
 message ResponseHeaderModifier {
   string    name             = 1;
   HeaderOps response_headers = 2;
+}
+
+enum RedirectScheme {
+  REDIRECT_SCHEME_UNSPECIFIED = 0;  // keep the request's scheme
+  REDIRECT_SCHEME_HTTP        = 1;
+  REDIRECT_SCHEME_HTTPS       = 2;
+}
+
+enum RedirectStatus {
+  REDIRECT_STATUS_UNSPECIFIED       = 0;  // 302 (the default)
+  REDIRECT_STATUS_MOVED_PERMANENTLY = 1;  // 301
+  REDIRECT_STATUS_FOUND             = 2;  // 302
+}
+
+message RequestRedirect {
+  string         name        = 1;
+  RedirectScheme scheme      = 2;
+  string         hostname    = 3;  // "" = keep the request Host
+  uint32         port        = 4;  // 0  = derive/omit per scheme
+  RedirectStatus status_code = 5;
+  oneof path {
+    string replace_full_path    = 6;
+    string replace_prefix_match = 7;
+  }
 }
 
 message HeaderOps {
