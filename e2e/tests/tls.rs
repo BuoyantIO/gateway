@@ -10,7 +10,7 @@
 use anyhow::Result;
 use gateway_e2e::fixtures::{TEST_CERT_PEM, TEST_KEY_PEM, apply_gateway, apply_http_route};
 use gateway_e2e::{
-    Scope, deploy_dp, deploy_echo, deploy_tls_secret, gateway_https, http_route,
+    Scope, deploy_echo, deploy_tls_secret, expose_dp, gateway_https, http_route,
     wait_until_routed_tls,
 };
 use http::StatusCode;
@@ -22,7 +22,7 @@ async fn https_listener_terminates_and_routes() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    deploy_dp(client, ns, "gw").await?;
+    expose_dp(client, ns, "gw").await?;
     deploy_echo(client, ns, "echo", None).await?;
     deploy_tls_secret(client, ns, "app-tls", TEST_CERT_PEM, TEST_KEY_PEM).await?;
 

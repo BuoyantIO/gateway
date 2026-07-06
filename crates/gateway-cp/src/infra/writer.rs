@@ -145,22 +145,36 @@ impl Reconciler {
     }
 
     /// Apply the whole desired set, `ServiceAccount` then `Service`
-    /// then `Deployment` per Gateway. Fails on the first apiserver
-    /// error; the caller retries the whole pass (applies are
-    /// idempotent).
+    /// then `Deployment` per Gateway. A failing object is logged and
+    /// skipped so it can never wedge the rest of the set; the first
+    /// error is returned at the end and the caller retries the pass
+    /// (applies are idempotent).
     async fn reconcile(&mut self, desired: &[GatewayInfra]) -> Result<(), kube::Error> {
+        let mut first_err: Option<kube::Error> = None;
         for infra in desired {
             let observed = lookup(&self.service_accounts, &infra.service_account);
-            self.apply_one("ServiceAccount", &infra.service_account, observed)
-                .await?;
-            let observed = lookup(&self.services, &infra.service);
-            self.apply_one("Service", &infra.service, observed).await?;
-            let observed = lookup(&self.deployments, &infra.deployment);
-            self.apply_one("Deployment", &infra.deployment, observed)
-                .await?;
+            let results = [
+                self.apply_one("ServiceAccount", &infra.service_account, observed)
+                    .await,
+                {
+                    let observed = lookup(&self.services, &infra.service);
+                    self.apply_one("Service", &infra.service, observed).await
+                },
+                {
+                    let observed = lookup(&self.deployments, &infra.deployment);
+                    self.apply_one("Deployment", &infra.deployment, observed)
+                        .await
+                },
+            ];
+            for result in results {
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "infra object apply failed; continuing with the rest");
+                    first_err.get_or_insert(e);
+                }
+            }
         }
         self.prune_last_applied(desired);
-        Ok(())
+        first_err.map_or(Ok(()), Err)
     }
 
     async fn apply_one<K>(
@@ -180,6 +194,17 @@ impl Reconciler {
         let namespace = desired.meta().namespace.clone().unwrap_or_default();
         let name = desired.meta().name.clone().unwrap_or_default();
         let key = (kind, namespace.clone(), name.clone());
+        let api: Api<K> = Api::namespaced(self.client.clone(), &namespace);
+
+        // The child watches are label-filtered to managed objects, so
+        // an unmanaged object squatting on our name is invisible to
+        // the cache. On a cache miss, ask the cluster directly before
+        // the first apply — otherwise the adoption guard could never
+        // fire for exactly the objects it exists to protect.
+        let observed = match observed {
+            Some(o) => Some(o),
+            None => api.get_opt(&name).await?,
+        };
 
         let desired_json = serde_json::to_value(desired).map_err(kube::Error::SerdeError)?;
         let observed_json = observed
@@ -202,7 +227,6 @@ impl Reconciler {
                 );
             }
             Action::Apply => {
-                let api: Api<K> = Api::namespaced(self.client.clone(), &namespace);
                 api.patch(
                     &name,
                     &PatchParams::apply(FIELD_MANAGER).force(),
@@ -454,25 +478,73 @@ mod tests {
         desired(&gateway(ns, name), &cfg).expect("provisioned")
     }
 
-    /// Mock apiserver: echoes every PATCH body back and records
-    /// `METHOD path` lines.
-    fn mock_client(requests: Arc<Mutex<Vec<String>>>) -> Client {
+    /// Per-path-substring scripting for the mock apiserver.
+    #[derive(Default)]
+    struct MockBehavior {
+        /// `GET`s whose path contains the key return this object;
+        /// everything else 404s (kube maps that to `None`).
+        get: HashMap<&'static str, Value>,
+        /// `PATCH`es whose path contains the key fail with this
+        /// status code; everything else echoes the body back.
+        patch_fail: HashMap<&'static str, u16>,
+    }
+
+    fn status_json(code: u16, reason: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "metadata": {},
+            "status": "Failure",
+            "message": reason,
+            "reason": reason,
+            "code": code,
+        }))
+        .unwrap()
+    }
+
+    /// Mock apiserver: records `METHOD path` lines; behavior per
+    /// [`MockBehavior`].
+    fn mock_client(requests: Arc<Mutex<Vec<String>>>, behavior: MockBehavior) -> Client {
         let (service, mut handle) =
             tower_test::mock::pair::<http::Request<Body>, http::Response<Body>>();
         tokio::spawn(async move {
             while let Some((req, respond)) = handle.next_request().await {
+                let path = req.uri().path().to_string();
                 requests
                     .lock()
                     .unwrap()
-                    .push(format!("{} {}", req.method(), req.uri().path()));
-                let body = req.into_body().collect().await.unwrap().to_bytes();
-                respond.send_response(
+                    .push(format!("{} {path}", req.method()));
+
+                let response = if req.method() == http::Method::GET {
+                    match behavior.get.iter().find(|(k, _)| path.contains(*k)) {
+                        Some((_, obj)) => http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(obj).unwrap()))
+                            .unwrap(),
+                        None => http::Response::builder()
+                            .status(404)
+                            .header("content-type", "application/json")
+                            .body(Body::from(status_json(404, "NotFound")))
+                            .unwrap(),
+                    }
+                } else if let Some((_, code)) =
+                    behavior.patch_fail.iter().find(|(k, _)| path.contains(*k))
+                {
+                    http::Response::builder()
+                        .status(*code)
+                        .header("content-type", "application/json")
+                        .body(Body::from(status_json(*code, "Invalid")))
+                        .unwrap()
+                } else {
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
                     http::Response::builder()
                         .status(200)
                         .header("content-type", "application/json")
                         .body(Body::from(body.to_vec()))
-                        .unwrap(),
-                );
+                        .unwrap()
+                };
+                respond.send_response(response);
             }
         });
         Client::new(service, "default")
@@ -487,8 +559,12 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with(MockBehavior::default())
+    }
+
+    fn fixture_with(behavior: MockBehavior) -> Fixture {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = mock_client(requests.clone());
+        let client = mock_client(requests.clone(), behavior);
         let (sa_store, sa_writer) = reflector::store();
         let (svc_store, svc_writer) = reflector::store();
         let (dep_store, dep_writer) = reflector::store();
@@ -509,12 +585,17 @@ mod tests {
             .await
             .unwrap();
 
+        // Each cache miss checks the cluster (adoption guard) before
+        // the apply.
         let requests = fx.requests.lock().unwrap().clone();
         assert_eq!(
             requests,
             vec![
+                "GET /api/v1/namespaces/demo/serviceaccounts/web-gatewayd".to_string(),
                 "PATCH /api/v1/namespaces/demo/serviceaccounts/web-gatewayd".to_string(),
+                "GET /api/v1/namespaces/demo/services/web-gatewayd".to_string(),
                 "PATCH /api/v1/namespaces/demo/services/web-gatewayd".to_string(),
+                "GET /apis/apps/v1/namespaces/demo/deployments/web-gatewayd".to_string(),
                 "PATCH /apis/apps/v1/namespaces/demo/deployments/web-gatewayd".to_string(),
             ]
         );
@@ -525,7 +606,7 @@ mod tests {
         let mut fx = fixture();
         let set = vec![infra("demo", "web")];
         fx.reconciler.reconcile(&set).await.unwrap();
-        assert_eq!(fx.requests.lock().unwrap().len(), 3);
+        assert_eq!(fx.requests.lock().unwrap().len(), 6);
 
         // Feed the reflector caches what the "cluster" now holds —
         // exactly what we applied.
@@ -539,8 +620,8 @@ mod tests {
         fx.reconciler.reconcile(&set).await.unwrap();
         assert_eq!(
             fx.requests.lock().unwrap().len(),
-            3,
-            "steady-state pass must be write-free"
+            6,
+            "steady-state pass must be request-free"
         );
     }
 
@@ -562,9 +643,9 @@ mod tests {
 
         fx.reconciler.reconcile(&set).await.unwrap();
         let requests = fx.requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 7);
         assert_eq!(
-            requests[3],
+            requests[6],
             "PATCH /apis/apps/v1/namespaces/demo/deployments/web-gatewayd"
         );
     }
@@ -594,10 +675,72 @@ mod tests {
         assert_eq!(
             requests,
             vec![
+                "GET /api/v1/namespaces/demo/serviceaccounts/web-gatewayd".to_string(),
                 "PATCH /api/v1/namespaces/demo/serviceaccounts/web-gatewayd".to_string(),
+                "GET /apis/apps/v1/namespaces/demo/deployments/web-gatewayd".to_string(),
                 "PATCH /apis/apps/v1/namespaces/demo/deployments/web-gatewayd".to_string(),
             ],
             "the squatted Service must not be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn squatter_invisible_to_the_filtered_cache_is_still_refused() {
+        // The child watches filter on the managed-by label, so an
+        // unmanaged Service on our name never enters the cache. The
+        // pre-apply live GET must catch it.
+        let squatter = Service {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some("web-gatewayd".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut behavior = MockBehavior::default();
+        behavior
+            .get
+            .insert("/services/", serde_json::to_value(&squatter).unwrap());
+        let mut fx = fixture_with(behavior);
+
+        fx.reconciler
+            .reconcile(&[infra("demo", "web")])
+            .await
+            .unwrap();
+
+        let requests = fx.requests.lock().unwrap().clone();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.starts_with("PATCH") && r.contains("/services/")),
+            "squatted Service must not be applied over: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.starts_with("PATCH") && r.contains("/deployments/")),
+            "siblings must still apply: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_object_does_not_block_the_rest() {
+        // The Service apply is rejected by the apiserver (as a real
+        // 422 would); the Deployment must still be applied and the
+        // pass must report the error for retry.
+        let mut behavior = MockBehavior::default();
+        behavior.patch_fail.insert("/services/", 422);
+        let mut fx = fixture_with(behavior);
+
+        let result = fx.reconciler.reconcile(&[infra("demo", "web")]).await;
+        assert!(result.is_err(), "the failed apply must surface for retry");
+
+        let requests = fx.requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.starts_with("PATCH") && r.contains("/deployments/")),
+            "objects after the failure must still apply: {requests:?}"
         );
     }
 }
