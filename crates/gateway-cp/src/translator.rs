@@ -137,7 +137,10 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
     slices
 }
 
-fn collect_owned_classes<'a>(
+/// Names of the `GatewayClass`es whose `controllerName` is ours.
+/// Shared with the infra provisioner so "owned Gateway" means the
+/// same thing on both paths.
+pub(crate) fn collect_owned_classes<'a>(
     state: &'a K8sState,
     controller_name: &str,
 ) -> std::collections::HashSet<&'a str> {

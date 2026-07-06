@@ -8,11 +8,15 @@ rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses", "gateways", "httproutes"]
     verbs: ["get", "list", "watch"]
-  # Services back HTTPRoute backendRefs. v0 resolves backends via
-  # Service.spec.clusterIP; no EndpointSlice watching yet.
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "patch"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "patch"]
