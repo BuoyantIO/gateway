@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, deploy_dp, deploy_echo, gateway, http_route, wait_until_routed};
+use gateway_e2e::{Scope, deploy_echo, expose_dp, gateway, http_route, wait_until_routed};
 use http::StatusCode;
 
 #[tokio::test(flavor = "current_thread")]
@@ -13,7 +13,7 @@ async fn h2c_backend() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    deploy_dp(client, ns, "gw").await?;
+    expose_dp(client, ns, "gw").await?;
     // appProtocol: h2c — the translator should recognize this and
     // emit BackendProtocol::Http2. The gateway then dials the echo
     // backend over h2c (HTTP/2 prior-knowledge). The echo's

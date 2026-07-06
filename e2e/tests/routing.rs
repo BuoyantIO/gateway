@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, deploy_dp, deploy_echo, gateway, http_route, wait_until_routed};
+use gateway_e2e::{Scope, deploy_echo, expose_dp, gateway, http_route, wait_until_routed};
 use http::StatusCode;
 
 #[tokio::test(flavor = "current_thread")]
@@ -23,7 +23,7 @@ async fn hostname_routes_isolate_traffic() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    deploy_dp(client, ns, "gw").await?;
+    expose_dp(client, ns, "gw").await?;
     deploy_echo(client, ns, "echo", None).await?;
 
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
@@ -66,7 +66,7 @@ async fn exact_beats_prefix() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    deploy_dp(client, ns, "gw").await?;
+    expose_dp(client, ns, "gw").await?;
     deploy_echo(client, ns, "echo", None).await?;
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
 
@@ -101,7 +101,7 @@ async fn regex_path_matches() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    deploy_dp(client, ns, "gw").await?;
+    expose_dp(client, ns, "gw").await?;
     deploy_echo(client, ns, "echo", None).await?;
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
 

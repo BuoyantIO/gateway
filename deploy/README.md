@@ -21,9 +21,13 @@ deploy/
             ├── namespace.yaml               # demo namespace
             ├── gateway.yaml                 # demo/api-gateway, HTTP :80
             ├── httproute.yaml               # PathPrefix / -> echo:8080
-            ├── echo.yaml                    # hashicorp/http-echo backend
-            └── dataplane.yaml               # gatewayd Deployment + Service
+            └── echo.yaml                    # hashicorp/http-echo backend
 ```
+
+The data plane is not part of the sample: the control plane
+provisions a gatewayd `Deployment` + `Service`
+(`api-gateway-gatewayd`) in the Gateway's namespace when the Gateway
+is applied.
 
 ## Build the images
 
@@ -52,7 +56,8 @@ kubectl apply -f deploy/manifests/examples/sample-app/
 ## Verify
 
 ```sh
-kubectl -n demo port-forward svc/api-gateway 8080:80
+kubectl -n demo wait --for=condition=available deployment/api-gateway-gatewayd --timeout=120s
+kubectl -n demo port-forward svc/api-gateway-gatewayd 8080:80
 curl -H 'Host: app.example.com'   http://localhost:8080/         # -> "hello from echo" (catch-all PathPrefix `/`)
 curl -H 'Host: app.example.com'   http://localhost:8080/healthz  # -> "hello from echo" (Exact `/healthz`)
 curl -H 'Host: app.example.com'   http://localhost:8080/healthzz # -> "hello from echo" (falls back to PathPrefix, NOT Exact)
@@ -70,11 +75,16 @@ prefix-match (it falls through to the PathPrefix instead).
 
 ## Notes
 
-- v0 expects the user to pre-deploy a data-plane `Deployment` per
-  `Gateway`, with `--client-id={ns}/{gw-name}` matching the Gateway's
-  K8s reference. Operator-managed Deployment creation is deferred
-  (see the deferred-work section of the plan).
-- Status writeback is **not** implemented in v0; `Gateway.status` will
+- The control plane provisions the data plane: applying an owned
+  `Gateway` yields a gatewayd `Deployment`, `Service`, and
+  `ServiceAccount` named `{gateway}-gatewayd` in the Gateway's
+  namespace, owner-referenced so deleting the Gateway cleans them
+  up. Two per-Gateway annotations steer it:
+  `gateway.buoyant.io/service-type: ClusterIP|NodePort|LoadBalancer`
+  (default `LoadBalancer`) and
+  `gateway.buoyant.io/provisioning: disabled` to opt a Gateway out
+  and deploy gatewayd by hand (`--client-id={ns}/{gw-name}`).
+- Status writeback is **not** implemented yet; `Gateway.status` will
   not be populated by this controller.
 - The control plane reads `Service.spec.clusterIP` to resolve backend
   endpoints. `EndpointSlice` watching and per-pod LB land later.

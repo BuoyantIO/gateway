@@ -1,9 +1,11 @@
 # gateway-e2e
 
 End-to-end test harness. Stands up a real kind cluster with the
-control plane + CRDs, then each test deploys its own Gateway, data
-plane, HTTPRoute, and backend in a unique namespace and drives
-HTTP through.
+control plane + CRDs, then each test applies its own Gateway,
+HTTPRoute, and backend in a unique namespace and drives HTTP
+through. The control plane provisions the data plane from the
+Gateway; the harness only adds a fixed-`NodePort` Service over the
+provisioned pods so tests can reach them from the host.
 
 ## Prerequisites
 
@@ -44,11 +46,13 @@ async fn my_feature_works() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    // 2. Deploy a DP for a Gateway named "gw" and an echo backend.
-    deploy_dp(client, ns, "gw").await?;
+    // 2. Expose the (to-be-provisioned) DP on the host NodePort and
+    //    deploy an echo backend.
+    expose_dp(client, ns, "gw").await?;
     deploy_echo(client, ns, "echo", None).await?;
 
-    // 3. Apply the Gateway. Typed; no YAML.
+    // 3. Apply the Gateway. Typed; no YAML. The CP provisions the
+    //    gatewayd Deployment + Service from it.
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
 
     // 4. Apply the HTTPRoute via the chainable builder.

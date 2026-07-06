@@ -1,7 +1,8 @@
 //! End-to-end test harness for the gateway. Drives a real kind
-//! cluster: each test creates its own namespace, `Gateway`, DP
-//! `Deployment`, `HTTPRoute`, and backend, then sends real HTTP
-//! through the data plane and asserts the response.
+//! cluster: each test creates its own namespace, `Gateway`,
+//! `HTTPRoute`, and backend; the CP provisions the data plane from
+//! the Gateway. Tests send real HTTP through it and assert the
+//! response.
 
 pub mod cluster;
 pub mod drive;
@@ -10,7 +11,7 @@ pub mod fixtures;
 pub use cluster::{Scope, kube_client};
 pub use drive::{Driver, wait_until_redirected, wait_until_routed, wait_until_routed_tls};
 pub use fixtures::{
-    HttpRouteBuilder, deploy_dp, deploy_echo, deploy_tls_secret, gateway, gateway_https, http_route,
+    HttpRouteBuilder, deploy_echo, deploy_tls_secret, expose_dp, gateway, gateway_https, http_route,
 };
 
 /// Fixed `NodePort` exposed by every test's DP `Service`. Tests run

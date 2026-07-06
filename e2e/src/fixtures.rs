@@ -23,8 +23,7 @@ use gateway_api::apis::standard::httproutes::{
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, HTTPGetAction, PodSpec, PodTemplateSpec, Probe, Secret, Service,
-    ServicePort, ServiceSpec,
+    Container, ContainerPort, PodSpec, PodTemplateSpec, Secret, Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -33,16 +32,22 @@ use kube::{Api, Client};
 
 use crate::NODE_PORT;
 
-/// Admin port on the DP container; serves `/healthz/ready`.
-const ADMIN_PORT: i32 = 15021;
-
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
-/// `GatewayClass`, with one HTTP listener on `port`.
+/// `GatewayClass`, with one HTTP listener on `port`. Asks the
+/// provisioner for a `ClusterIP` Service — the default
+/// `LoadBalancer` pends forever on kind.
 pub fn gateway(ns: &str, name: &str, port: i32, hostname: Option<&str>) -> Gateway {
     Gateway {
         metadata: ObjectMeta {
             namespace: Some(ns.into()),
             name: Some(name.into()),
+            annotations: Some(
+                [(
+                    "gateway.buoyant.io/service-type".to_owned(),
+                    "ClusterIP".to_owned(),
+                )]
+                .into(),
+            ),
             ..Default::default()
         },
         spec: GatewaySpec {
@@ -101,6 +106,13 @@ pub fn gateway_https(
         metadata: ObjectMeta {
             namespace: Some(ns.into()),
             name: Some(name.into()),
+            annotations: Some(
+                [(
+                    "gateway.buoyant.io/service-type".to_owned(),
+                    "ClusterIP".to_owned(),
+                )]
+                .into(),
+            ),
             ..Default::default()
         },
         spec: GatewaySpec {
@@ -471,88 +483,38 @@ impl HttpRouteBuilder {
     }
 }
 
-/// Deploy a DP (`gatewayd`) `Deployment` + `NodePort` `Service` for
-/// the named `Gateway`. `--client-id` is set to
-/// `{ns}/{gateway_name}`. The `Service` binds the cluster-wide
-/// `NODE_PORT` (30080); tests run `--test-threads=1`.
+/// Expose the *provisioned* data plane for `gw_name` on the
+/// cluster-wide `NODE_PORT` (30080). The CP provisioner owns the
+/// gatewayd `Deployment`, `ServiceAccount`, and `ClusterIP`
+/// `Service`; this extra `NodePort` `Service` only selects the DP
+/// pods by the standard gateway-name label so tests can reach them
+/// from the host. Tests run `--test-threads=1` because the port is
+/// cluster-scoped.
 ///
 /// # Errors
-/// Returns an error if any create call fails.
-pub async fn deploy_dp(client: &Client, ns: &str, gw_name: &str) -> Result<()> {
-    let dp_name = format!("dp-{gw_name}");
-    let labels: BTreeMap<String, String> =
-        [("app".to_owned(), dp_name.clone())].into_iter().collect();
-
-    let deployment = Deployment {
-        metadata: ObjectMeta {
-            namespace: Some(ns.into()),
-            name: Some(dp_name.clone()),
-            labels: Some(labels.clone()),
-            ..Default::default()
-        },
-        spec: Some(DeploymentSpec {
-            replicas: Some(1),
-            selector: LabelSelector {
-                match_labels: Some(labels.clone()),
-                ..Default::default()
-            },
-            template: PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels.clone()),
-                    ..Default::default()
-                }),
-                spec: Some(PodSpec {
-                    containers: vec![Container {
-                        name: "gatewayd".into(),
-                        image: Some("gateway-data-plane:latest".into()),
-                        image_pull_policy: Some("IfNotPresent".into()),
-                        args: Some(vec![
-                            "--control-plane=http://gateway-cp.gateway-system.svc:8443".into(),
-                            format!("--client-id={ns}/{gw_name}"),
-                            format!("--admin-addr=0.0.0.0:{ADMIN_PORT}"),
-                        ]),
-                        ports: Some(vec![
-                            ContainerPort {
-                                name: Some("http".into()),
-                                container_port: 80,
-                                ..Default::default()
-                            },
-                            ContainerPort {
-                                name: Some("admin".into()),
-                                container_port: ADMIN_PORT,
-                                ..Default::default()
-                            },
-                        ]),
-                        readiness_probe: Some(readiness_probe(10, None)),
-                        startup_probe: Some(readiness_probe(1, Some(60))),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    Api::<Deployment>::namespaced(client.clone(), ns)
-        .create(&PostParams::default(), &deployment)
-        .await
-        .with_context(|| format!("creating DP deployment {dp_name}"))?;
+/// Returns an error if the create call fails.
+pub async fn expose_dp(client: &Client, ns: &str, gw_name: &str) -> Result<()> {
+    let svc_name = format!("dp-{gw_name}");
+    // The standard label the provisioner puts on the DP pods.
+    let selector: BTreeMap<String, String> = [(
+        "gateway.networking.k8s.io/gateway-name".to_owned(),
+        gw_name.to_owned(),
+    )]
+    .into();
 
     let svc = Service {
         metadata: ObjectMeta {
             namespace: Some(ns.into()),
-            name: Some(dp_name.clone()),
+            name: Some(svc_name.clone()),
             ..Default::default()
         },
         spec: Some(ServiceSpec {
             type_: Some("NodePort".into()),
-            selector: Some(labels),
+            selector: Some(selector),
             ports: Some(vec![ServicePort {
                 name: Some("http".into()),
                 port: 80,
-                target_port: Some(IntOrString::String("http".into())),
+                target_port: Some(IntOrString::Int(80)),
                 node_port: Some(i32::from(NODE_PORT)),
                 protocol: Some("TCP".into()),
                 ..Default::default()
@@ -565,23 +527,9 @@ pub async fn deploy_dp(client: &Client, ns: &str, gw_name: &str) -> Result<()> {
     Api::<Service>::namespaced(client.clone(), ns)
         .create(&PostParams::default(), &svc)
         .await
-        .with_context(|| format!("creating DP service {dp_name}"))?;
+        .with_context(|| format!("creating DP exposure service {svc_name}"))?;
 
     Ok(())
-}
-
-/// HTTP probe against the DP admin readiness endpoint.
-fn readiness_probe(period_seconds: i32, failure_threshold: Option<i32>) -> Probe {
-    Probe {
-        http_get: Some(HTTPGetAction {
-            path: Some("/healthz/ready".into()),
-            port: IntOrString::Int(ADMIN_PORT),
-            ..Default::default()
-        }),
-        period_seconds: Some(period_seconds),
-        failure_threshold,
-        ..Default::default()
-    }
 }
 
 /// Deploy an echo backend `Deployment` + `Service` in `ns`.
