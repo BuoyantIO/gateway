@@ -9,7 +9,7 @@ use gateway_cp_proto::v1 as pb;
 use gateway_cp_proto::v1::config_stream_client::ConfigStreamClient;
 use gateway_state::{RegisteredKeys, Store};
 use rand::Rng;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
@@ -30,12 +30,17 @@ const REQUEST_CHANNEL_CAPACITY: usize = 4;
 /// `client_id` is `"{namespace}/{gateway-name}"`; the CP filters
 /// every `ConfigUpdate` on this stream to that one Gateway.
 ///
+/// `ready` latches to `true` once the first `sync_complete` batch
+/// has been applied. It is never set back to `false`: on reconnect
+/// the store keeps serving its last state while the stream resyncs.
+///
 /// # Errors
 /// Non-recoverable startup error before the backoff loop engages.
 pub async fn run(
     endpoint: Endpoint,
     client_id: String,
     store: Store,
+    ready: watch::Sender<bool>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     let mut shutdown = pin!(shutdown);
@@ -45,7 +50,7 @@ pub async fn run(
         tokio::select! {
             biased;
             () = &mut shutdown => return Ok(()),
-            res = run_session(&endpoint, &client_id, &store) => {
+            res = run_session(&endpoint, &client_id, &store, &ready) => {
                 match res {
                     Ok(()) => {
                         tracing::info!("control-plane stream closed; reconnecting");
@@ -67,7 +72,12 @@ pub async fn run(
     }
 }
 
-async fn run_session(endpoint: &Endpoint, client_id: &str, store: &Store) -> Result<(), Error> {
+async fn run_session(
+    endpoint: &Endpoint,
+    client_id: &str,
+    store: &Store,
+    ready: &watch::Sender<bool>,
+) -> Result<(), Error> {
     let channel = endpoint.connect().await?;
     let mut client = ConfigStreamClient::new(channel);
 
@@ -119,6 +129,7 @@ async fn run_session(endpoint: &Endpoint, client_id: &str, store: &Store) -> Res
             if let Some(seen) = bootstrap_seen.take() {
                 store.retain(&seen);
             }
+            ready.send_replace(true);
             tracing::info!("control-plane sync complete");
         }
     }

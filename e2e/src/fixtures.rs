@@ -23,7 +23,8 @@ use gateway_api::apis::standard::httproutes::{
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, PodSpec, PodTemplateSpec, Secret, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, HTTPGetAction, PodSpec, PodTemplateSpec, Probe, Secret, Service,
+    ServicePort, ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -31,6 +32,9 @@ use kube::api::{ObjectMeta, PostParams};
 use kube::{Api, Client};
 
 use crate::NODE_PORT;
+
+/// Admin port on the DP container; serves `/healthz/ready`.
+const ADMIN_PORT: i32 = 15021;
 
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
 /// `GatewayClass`, with one HTTP listener on `port`.
@@ -505,12 +509,22 @@ pub async fn deploy_dp(client: &Client, ns: &str, gw_name: &str) -> Result<()> {
                         args: Some(vec![
                             "--control-plane=http://gateway-cp.gateway-system.svc:8443".into(),
                             format!("--client-id={ns}/{gw_name}"),
+                            format!("--admin-addr=0.0.0.0:{ADMIN_PORT}"),
                         ]),
-                        ports: Some(vec![ContainerPort {
-                            name: Some("http".into()),
-                            container_port: 80,
-                            ..Default::default()
-                        }]),
+                        ports: Some(vec![
+                            ContainerPort {
+                                name: Some("http".into()),
+                                container_port: 80,
+                                ..Default::default()
+                            },
+                            ContainerPort {
+                                name: Some("admin".into()),
+                                container_port: ADMIN_PORT,
+                                ..Default::default()
+                            },
+                        ]),
+                        readiness_probe: Some(readiness_probe(10, None)),
+                        startup_probe: Some(readiness_probe(1, Some(60))),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -554,6 +568,20 @@ pub async fn deploy_dp(client: &Client, ns: &str, gw_name: &str) -> Result<()> {
         .with_context(|| format!("creating DP service {dp_name}"))?;
 
     Ok(())
+}
+
+/// HTTP probe against the DP admin readiness endpoint.
+fn readiness_probe(period_seconds: i32, failure_threshold: Option<i32>) -> Probe {
+    Probe {
+        http_get: Some(HTTPGetAction {
+            path: Some("/healthz/ready".into()),
+            port: IntOrString::Int(ADMIN_PORT),
+            ..Default::default()
+        }),
+        period_seconds: Some(period_seconds),
+        failure_threshold,
+        ..Default::default()
+    }
 }
 
 /// Deploy an echo backend `Deployment` + `Service` in `ns`.

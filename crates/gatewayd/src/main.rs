@@ -1,7 +1,10 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
 use tokio::sync::watch;
+
+mod admin;
 
 #[derive(Parser)]
 #[command(version, about = "HTTP gateway daemon")]
@@ -18,6 +21,11 @@ struct Args {
     /// Required with --control-plane.
     #[arg(long)]
     client_id: Option<String>,
+
+    /// Admin HTTP listen address (readiness endpoint). No admin
+    /// server when unset.
+    #[arg(long)]
+    admin_addr: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -36,8 +44,13 @@ async fn main() -> anyhow::Result<()> {
 
     let store = gateway_state::Store::new();
 
+    // Readiness latch for the admin endpoint: flipped once the
+    // config bootstrap has been applied, never flipped back.
+    let (ready_tx, ready_rx) = watch::channel(false);
+
     if let Some(path) = &args.config {
         load_yaml_into_store(path, &store)?;
+        ready_tx.send_replace(true);
     }
 
     // Shared shutdown flag. ctrl-c flips it; both the CP client task
@@ -50,6 +63,17 @@ async fn main() -> anyhow::Result<()> {
         let _ = signal_tx.send(true);
     });
 
+    let admin_handle = if let Some(addr) = args.admin_addr {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(%addr, "admin server listening");
+        let mut rx = shutdown_rx.clone();
+        Some(tokio::spawn(admin::serve(listener, ready_rx, async move {
+            let _ = rx.wait_for(|v| *v).await;
+        })))
+    } else {
+        None
+    };
+
     let cp_handle = if let Some(cp_url) = args.control_plane {
         let client_id = args.client_id.expect("required by clap");
         let endpoint = tonic::transport::Endpoint::try_from(cp_url)
@@ -58,10 +82,11 @@ async fn main() -> anyhow::Result<()> {
         let mut rx = shutdown_rx.clone();
         tracing::info!(?endpoint, client_id, "connecting to control plane");
         Some(tokio::spawn(async move {
-            if let Err(e) = gateway_cp_client::run(endpoint, client_id, store_clone, async move {
-                let _ = rx.wait_for(|v| *v).await;
-            })
-            .await
+            if let Err(e) =
+                gateway_cp_client::run(endpoint, client_id, store_clone, ready_tx, async move {
+                    let _ = rx.wait_for(|v| *v).await;
+                })
+                .await
             {
                 tracing::error!(error = %e, "control-plane client exited with error");
             }
@@ -79,6 +104,9 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     if let Some(handle) = cp_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = admin_handle {
         let _ = handle.await;
     }
 

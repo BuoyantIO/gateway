@@ -22,9 +22,23 @@ spec:
           args:
             - --control-plane=http://gateway-cp.gateway-system.svc:8443
             - --client-id=demo/api-gateway
+            - --admin-addr=0.0.0.0:15021
           ports:
             - name: http
               containerPort: 80
+            - name: admin
+              containerPort: 15021
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: admin
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /healthz/ready
+              port: admin
+            periodSeconds: 1
+            failureThreshold: 60
           env:
             - name: RUST_LOG
               value: info
