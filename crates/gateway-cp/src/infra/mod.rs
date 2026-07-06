@@ -2,12 +2,25 @@
 //!
 //! The CP provisions a gatewayd `Deployment`, a fronting `Service`,
 //! and a `ServiceAccount` in each owned Gateway's namespace.
-//! [`desired`] is the pure half — Gateway in, objects out; the
-//! apiserver writer is a follow-up.
+//! [`desired`] is the pure half — Gateway in, objects out;
+//! [`writer`] owns the apiserver writes. The watch loop connects
+//! them through an [`InfraPublisher`].
 
 pub mod desired;
+pub mod writer;
 
-pub use desired::{GatewayInfra, InfraConfig, desired};
+pub use desired::{GatewayInfra, InfraConfig, desired, desired_set};
+pub use writer::FIELD_MANAGER;
+
+use tokio::sync::watch;
+
+/// Watch-loop side of the provisioner: carries the config used to
+/// compute the desired set per translate pass and the channel the
+/// writer task listens on.
+pub struct InfraPublisher {
+    pub config: InfraConfig,
+    pub tx: watch::Sender<Vec<GatewayInfra>>,
+}
 
 /// Standard Gateway API label naming the owning Gateway. Selector
 /// for the DP pods and the filter for the CP's child watches.

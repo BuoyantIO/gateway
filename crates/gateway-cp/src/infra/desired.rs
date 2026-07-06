@@ -28,7 +28,7 @@ const MAX_NAME: usize = 63;
 const READY_PATH: &str = "/healthz/ready";
 
 /// Everything the CP provisions for one Gateway.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatewayInfra {
     pub service_account: ServiceAccount,
     pub deployment: Deployment,
@@ -45,6 +45,30 @@ pub struct InfraConfig {
     pub cp_url: String,
     /// Admin port for the readiness probe.
     pub admin_port: u16,
+}
+
+/// The full desired set for one translate pass: infra for every
+/// Gateway owned by `controller_name`, sorted by `(namespace, name)`
+/// so equal states compare equal and the publish channel can dedup.
+pub fn desired_set(
+    state: &crate::translator::K8sState,
+    controller_name: &str,
+    cfg: &InfraConfig,
+) -> Vec<GatewayInfra> {
+    let owned = crate::translator::collect_owned_classes(state, controller_name);
+    let mut set: Vec<GatewayInfra> = state
+        .gateways
+        .iter()
+        .filter(|gw| owned.contains(gw.spec.gateway_class_name.as_str()))
+        .filter_map(|gw| desired(gw, cfg))
+        .collect();
+    set.sort_by_key(|i| {
+        (
+            i.deployment.metadata.namespace.clone(),
+            i.deployment.metadata.name.clone(),
+        )
+    });
+    set
 }
 
 /// Build the desired infra for `gw`. Returns `None` when the
@@ -321,9 +345,12 @@ fn ready_probe(admin_port: i32, period_seconds: i32, failure_threshold: Option<i
 mod tests {
     use super::*;
 
+    use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassSpec};
     use gateway_api::apis::standard::gateways::{
         GatewayInfrastructure, GatewayListeners, GatewaySpec,
     };
+
+    use crate::translator::K8sState;
 
     fn listener(name: &str, protocol: &str, port: i32) -> GatewayListeners {
         GatewayListeners {
@@ -370,6 +397,47 @@ mod tests {
             .as_ref()
             .unwrap()
             .containers[0]
+    }
+
+    #[test]
+    fn desired_set_filters_by_class_ownership_and_sorts() {
+        let ours = "gateway.buoyant.io/controller";
+        let gc = |name: &str, controller: &str| GatewayClass {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: controller.into(),
+                ..Default::default()
+            },
+            status: None,
+        };
+        let gw_of_class = |ns: &str, name: &str, class: &str| {
+            let mut gw = gateway(ns, name, vec![listener("http", "HTTP", 80)]);
+            gw.spec.gateway_class_name = class.into();
+            gw
+        };
+
+        let state = K8sState {
+            gateway_classes: vec![
+                gc("buoyant-gateway", ours),
+                gc("other", "example.com/other"),
+            ],
+            gateways: vec![
+                gw_of_class("zz", "late", "buoyant-gateway"),
+                gw_of_class("demo", "foreign", "other"),
+                gw_of_class("aa", "early", "buoyant-gateway"),
+            ],
+            ..Default::default()
+        };
+
+        let set = desired_set(&state, ours, &config());
+        let names: Vec<&str> = set
+            .iter()
+            .map(|i| i.deployment.metadata.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, vec!["early-gatewayd", "late-gatewayd"]);
     }
 
     #[test]

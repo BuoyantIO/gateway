@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use gateway_cp::infra::{InfraConfig, InfraPublisher, writer};
 use gateway_cp::{ConfigStreamService, ServerState, run_watch};
 use gateway_cp_proto::v1::config_stream_server::ConfigStreamServer;
 use tokio::sync::watch;
@@ -22,6 +23,21 @@ struct Args {
     /// ours.
     #[arg(long, default_value = "gateway.buoyant.io/controller")]
     controller_name: String,
+
+    /// gatewayd image for provisioned data planes. Data-plane
+    /// provisioning is active only when this and --cp-url are both
+    /// set.
+    #[arg(long, requires = "cp_url")]
+    dp_image: Option<String>,
+
+    /// Control-plane gRPC URL provisioned data planes dial (e.g.
+    /// `http://gateway-cp.gateway-system.svc:8443`).
+    #[arg(long, requires = "dp_image")]
+    cp_url: Option<String>,
+
+    /// Admin (readiness) port on provisioned data planes.
+    #[arg(long, default_value_t = 15021)]
+    dp_admin_port: u16,
 }
 
 #[tokio::main]
@@ -47,6 +63,32 @@ async fn main() -> anyhow::Result<()> {
         let _ = signal_tx.send(true);
     });
 
+    // Data-plane provisioning: the watch loop publishes desired
+    // infra into a channel and the writer task owns the apiserver
+    // writes. Inactive unless both flags are set.
+    let (infra_publisher, writer_handle) =
+        if let (Some(dp_image), Some(cp_url)) = (args.dp_image, args.cp_url) {
+            let config = InfraConfig {
+                dp_image,
+                cp_url,
+                admin_port: args.dp_admin_port,
+            };
+            let (tx, rx) = watch::channel(Vec::new());
+            let writer_client = client.clone();
+            let mut shutdown = shutdown_rx.clone();
+            let handle = tokio::spawn(async move {
+                writer::run(writer_client, rx, async move {
+                    let _ = shutdown.wait_for(|v| *v).await;
+                })
+                .await;
+            });
+            tracing::info!("data-plane provisioning enabled");
+            (Some(InfraPublisher { config, tx }), Some(handle))
+        } else {
+            tracing::info!("data-plane provisioning disabled (--dp-image / --cp-url unset)");
+            (None, None)
+        };
+
     let watch_handle = {
         let state = state.clone();
         let controller_name = args.controller_name.clone();
@@ -55,7 +97,9 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = async move {
                 let _ = rx.wait_for(|v| *v).await;
             };
-            if let Err(e) = run_watch(client, controller_name, state, shutdown).await {
+            if let Err(e) =
+                run_watch(client, controller_name, state, infra_publisher, shutdown).await
+            {
                 tracing::error!(error = %e, "watch loop exited with error");
             }
         })
@@ -76,5 +120,8 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let _ = watch_handle.await;
+    if let Some(handle) = writer_handle {
+        let _ = handle.await;
+    }
     Ok(())
 }

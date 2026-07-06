@@ -25,6 +25,7 @@ use kube::runtime::reflector::{self, Store as ReflectorStore};
 use kube::runtime::watcher::{self, Config};
 use thiserror::Error;
 
+use crate::infra::{self, InfraPublisher};
 use crate::server::ServerState;
 use crate::translator::{K8sState, translate};
 
@@ -47,6 +48,7 @@ pub async fn run(
     client: kube::Client,
     controller_name: String,
     state: Arc<ServerState>,
+    infra: Option<InfraPublisher>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), WatchError> {
     let mut shutdown = pin!(shutdown);
@@ -91,6 +93,20 @@ pub async fn run(
         let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
         let world = translate(&k8s, &controller_name);
         state.publish(&world);
+
+        // Desired data-plane infra rides the same pass; the channel
+        // dedups so the writer only wakes on real changes.
+        if let Some(publisher) = &infra {
+            let set = infra::desired_set(&k8s, &controller_name, &publisher.config);
+            publisher.tx.send_if_modified(|current| {
+                if *current == set {
+                    false
+                } else {
+                    *current = set;
+                    true
+                }
+            });
+        }
     }
 
     Ok(())
