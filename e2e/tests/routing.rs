@@ -3,9 +3,9 @@
 //!
 //! Each test:
 //! - Creates a per-test namespace (auto-deleted on scope drop).
-//! - Applies a `Gateway`, an `HTTPRoute` (or multiple), a DP
-//!   `Deployment` + `NodePort` `Service`, and one or more echo
-//!   backends.
+//! - Applies a `Gateway` (the CP provisions the data plane from it),
+//!   an `HTTPRoute` (or multiple), the `NodePort` exposure `Service`,
+//!   and one or more echo backends.
 //! - Polls the data path until the gateway routes (status
 //!   writeback isn't wired yet, so we probe directly).
 //! - Drives requests through `127.0.0.1:30080` and asserts on the
