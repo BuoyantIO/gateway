@@ -258,21 +258,26 @@ fn listener_ports(gw: &Gateway) -> Vec<(String, i32)> {
     out
 }
 
+/// `{protocol}-{port}`, lowercased and sanitized into the 15-char
+/// IANA service-name cap. Only the protocol part is truncated — the
+/// port suffix always survives, so two ports sharing a long
+/// (implementation-specific) protocol can never collide on the name.
 fn port_name(protocol: &str, port: i32) -> String {
-    let mut name: String = format!("{}-{port}", protocol.to_ascii_lowercase())
+    let suffix = port.to_string();
+    let budget = 15 - suffix.len() - 1;
+    let mut proto: String = protocol
+        .to_ascii_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    while name.len() > 15 {
-        name.pop();
+    proto.truncate(budget);
+    let proto = proto.trim_matches('-');
+    // A port name must contain a letter; an all-symbol protocol
+    // (nothing left after sanitizing) gets a neutral stand-in.
+    if proto.is_empty() {
+        return format!("port-{suffix}");
     }
-    name.trim_end_matches('-').to_string()
+    format!("{proto}-{suffix}")
 }
 
 fn ready_probe(admin_port: i32, period_seconds: i32, failure_threshold: Option<i32>) -> Probe {
@@ -448,6 +453,22 @@ mod tests {
                 (Some("https-443"), 443, &IntOrString::Int(443)),
             ]
         );
+    }
+
+    #[test]
+    fn long_protocol_port_names_keep_the_port_suffix() {
+        // Implementation-specific protocols can exceed the 15-char
+        // port-name cap; truncation must never eat the port suffix
+        // or two such ports collide on the same name.
+        let a = port_name("example.com/custom-proto", 8080);
+        let b = port_name("example.com/custom-proto", 8443);
+        assert_eq!(a, "example-co-8080");
+        assert_eq!(b, "example-co-8443");
+    }
+
+    #[test]
+    fn symbol_only_protocol_gets_a_neutral_port_name() {
+        assert_eq!(port_name("///", 80), "port-80");
     }
 
     #[test]
