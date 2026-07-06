@@ -10,7 +10,7 @@ use gateway_cp_proto::v1 as pb;
 use gateway_cp_proto::v1::config_stream_server::{ConfigStream, ConfigStreamServer};
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, Store};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Endpoint, Server};
@@ -199,8 +199,9 @@ where
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let cid = client_id.to_string();
     let store_clone = store.clone();
+    let (ready_tx, _ready_rx) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = gateway_cp_client::run(endpoint, cid, store_clone, async {
+        let _ = gateway_cp_client::run(endpoint, cid, store_clone, ready_tx, async {
             let _ = shutdown_rx.await;
         })
         .await;
@@ -335,6 +336,79 @@ async fn empty_initial_snapshot_leaves_store_empty() {
 
     sleep(Duration::from_millis(100)).await;
     assert_eq!(store.read().binds().count(), 0);
+
+    let _ = client_stop.send(());
+    let _ = server_stop.send(());
+}
+
+#[tokio::test]
+async fn readiness_latches_on_sync_complete_and_survives_reconnect() {
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    {
+        let mut s = state.lock().await;
+        s.scripts.insert(
+            "ns/ready".to_string(),
+            vec![
+                // Session 1: a batch without sync_complete, then the
+                // stream closes. Readiness must not flip.
+                vec![batch(vec![], vec![], false)],
+                // Session 2 (after reconnect): the sync batch.
+                vec![batch(vec![], vec![], true)],
+                // Later sessions fall back to the empty default,
+                // closing immediately and forcing more reconnects.
+            ],
+        );
+    }
+
+    let (endpoint, server_stop) = spawn_server(state.clone()).await;
+    let store = Store::new();
+    let (ready_tx, ready_rx) = watch::channel(false);
+    let (client_stop, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = gateway_cp_client::run(endpoint, "ns/ready".to_string(), store, ready_tx, async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+
+    let connected = |n: usize| {
+        let state = state.clone();
+        async move {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if state.lock().await.connect_count >= n {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("connect count not reached within deadline");
+        }
+    };
+
+    // Session 1 applied a batch but never sent sync_complete; the
+    // reconnect backoff (>= 400ms) leaves ample room to observe the
+    // still-unready state right after the first connect.
+    connected(1).await;
+    assert!(!*ready_rx.borrow(), "ready before any sync_complete");
+
+    // Session 2 sends sync_complete: the latch flips.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if *ready_rx.borrow() {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("never became ready");
+
+    // Two more reconnects (empty scripts, no sync_complete): the
+    // latch must hold.
+    connected(4).await;
+    assert!(*ready_rx.borrow(), "readiness lost across reconnects");
 
     let _ = client_stop.send(());
     let _ = server_stop.send(());
