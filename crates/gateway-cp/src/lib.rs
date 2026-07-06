@@ -3,6 +3,7 @@
 //! gRPC channel.
 
 pub mod diff;
+pub mod infra;
 pub mod server;
 pub mod snapshot;
 pub mod translator;
