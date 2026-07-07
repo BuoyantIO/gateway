@@ -3,11 +3,14 @@ kind: ClusterRole
 metadata:
   name: gateway-cp
 rules:
-  # Gateway API resources we translate from. Read-only — v0 does no
-  # status writeback.
+  # Gateway API resources we translate from.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses", "gateways", "httproutes"]
     verbs: ["get", "list", "watch"]
+  # Status writeback on owned objects.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status"]
+    verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "patch"]
