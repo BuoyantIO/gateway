@@ -55,7 +55,7 @@ pub fn desired_set(
     controller_name: &str,
     cfg: &InfraConfig,
 ) -> Vec<GatewayInfra> {
-    let owned = crate::translator::collect_owned_classes(state, controller_name);
+    let owned = crate::resolve::collect_owned_classes(state, controller_name);
     let mut set: Vec<GatewayInfra> = state
         .gateways
         .iter()
@@ -283,8 +283,9 @@ fn service(
 
 /// `{gateway-name}-gatewayd`, capped at 63 chars with no trailing
 /// `-` (the suffix avoids colliding with a user Service that shares
-/// the Gateway's name).
-fn object_name(gateway_name: &str) -> String {
+/// the Gateway's name). `pub(crate)`: the resolution pass uses it to
+/// find the managed Service a Gateway's address comes from.
+pub(crate) fn object_name(gateway_name: &str) -> String {
     let mut name = format!("{gateway_name}-gatewayd");
     while name.len() > MAX_NAME {
         name.pop();

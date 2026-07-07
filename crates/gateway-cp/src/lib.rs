@@ -4,6 +4,7 @@
 
 pub mod diff;
 pub mod infra;
+pub mod resolve;
 pub mod server;
 pub mod snapshot;
 pub mod translator;

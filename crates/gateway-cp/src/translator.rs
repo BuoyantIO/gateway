@@ -1,26 +1,44 @@
-//! K8s resources -> per-Gateway snapshots.
+//! Resolved graph -> per-Gateway snapshots.
 //!
 //! One `Gateway` = one snapshot keyed by `(namespace, name)`.
 //! `HTTPRoute`s attach to multiple snapshots if they list multiple
 //! parent Gateways. Services are duplicated across slices that
 //! reference them.
+//!
+//! Every accept/reject decision is made by [`crate::resolve`]; this
+//! module only maps the surviving graph onto proto messages. If you
+//! are looking for classification, attachment, hostname, or
+//! backend-resolution logic, it lives there.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
+use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
-    HttpRouteRulesFiltersRequestRedirectPathType, HttpRouteRulesFiltersRequestRedirectScheme,
-    HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
+    HTTPRoute, HttpRouteRulesFilters, HttpRouteRulesFiltersRequestRedirectPathType,
+    HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesMatches,
+    HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
+    HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
     HttpRouteRulesMatchesQueryParamsType,
 };
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
 use k8s_openapi::api::core::v1::{Secret, Service};
 
+use crate::resolve::{
+    BackendOutcome, BackendResolution, GatewayResolution, ListenerOutcome, Resolution, RouteEdge,
+    RouteResolution, resolve,
+};
 use crate::snapshot::{GatewayId, Snapshot};
+
+// The hostname primitives moved to `resolve`; re-imported here for
+// the test module only (`use super::*`), so the pre-refactor tests
+// keep proving their behavior unchanged. Same for the listener spec
+// types the test fixtures build.
+#[cfg(test)]
+use crate::resolve::{effective_hostnames, hostnames_overlap, wildcard_covers};
+#[cfg(test)]
+use gateway_api::apis::standard::gateways::GatewayListeners;
 
 #[derive(Debug, Default)]
 pub struct K8sState {
@@ -31,105 +49,36 @@ pub struct K8sState {
     pub secrets: Vec<Secret>,
 }
 
-/// Build per-Gateway snapshots from a static K8s state.
-///
-/// Two passes:
-/// 1. Walk Gateways whose class is one we control; group their
-///    listeners by port and emit one `BindUpsert` per (Gateway,
-///    port) plus one `ListenerUpsert` per accepted listener.
-/// 2. Walk `HTTPRoute`s; for each `parentRef` pointing at a controlled
-///    Gateway, emit one `HttpRouteUpsert` per (matched listener × rule)
-///    plus a `BackendUpsert` for every referenced Service.
-///
-/// Skips (with a warn log, no error): non-HTTP listeners, listeners
-/// conflicting on a shared port, foreign `GatewayClass`es, unknown
-/// filter types, cross-namespace backendRefs, headless / missing
-/// Services.
+/// Build per-Gateway snapshots from a static K8s state: resolve the
+/// attachment graph, then emit it.
 pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, Snapshot> {
-    // Index everything keyed by lookup paths the passes need.
-    let owned_classes = collect_owned_classes(state, controller_name);
-    let gateways_by_id = index_gateways(state);
-    let services_by_id = index_services(state);
-    let secrets_by_id = index_secrets(state);
+    translate_resolution(&resolve(state, controller_name))
+}
 
+/// Map an already-resolved graph onto per-Gateway snapshots. Pure
+/// emission: no decisions are made here.
+pub fn translate_resolution(resolution: &Resolution<'_>) -> HashMap<GatewayId, Snapshot> {
     let mut slices: HashMap<GatewayId, Snapshot> = HashMap::new();
-    // Listeners that survived pass-1 classification, per gateway:
-    // listener name -> port. Pass 2 attaches routes only to these.
-    let mut accepted_listeners: HashMap<GatewayId, HashMap<String, i32>> = HashMap::new();
 
-    // Pass 1: one Bind per (Gateway, port), N Listeners under it.
-    for gw in &state.gateways {
-        let Some(ns) = gw.metadata.namespace.as_deref() else {
-            continue;
-        };
-        let Some(name) = gw.metadata.name.as_deref() else {
-            continue;
-        };
-        if !owned_classes.contains(gw.spec.gateway_class_name.as_str()) {
-            continue;
-        }
-        let id: GatewayId = (ns.to_string(), name.to_string());
-        let snapshot = slices.entry(id.clone()).or_default();
-
-        let accepted = emit_gateway_listeners(snapshot, ns, name, &gw.spec.listeners);
-        emit_gateway_secrets(snapshot, ns, &gw.spec.listeners, &secrets_by_id);
-        accepted_listeners.insert(id, accepted);
+    for gw in &resolution.gateways {
+        let snapshot = slices.entry(gw.id.clone()).or_default();
+        emit_gateway_listeners(snapshot, gw);
+        emit_gateway_secrets(snapshot, gw);
     }
 
-    // Pass 2: HTTPRoutes attach to their parent Gateways.
-    for hr in &state.http_routes {
-        let Some(route_ns) = hr.metadata.namespace.as_deref() else {
+    for route in &resolution.routes {
+        let Some(id) = route.gateway_id.as_ref() else {
             continue;
         };
-        let Some(route_name) = hr.metadata.name.as_deref() else {
-            continue;
-        };
-        let parent_refs = hr.spec.parent_refs.as_deref().unwrap_or(&[]);
-        for parent_ref in parent_refs {
-            let parent_ns = parent_ref.namespace.as_deref().unwrap_or(route_ns);
-            let parent_name = parent_ref.name.as_str();
-            let Some(gw) = gateways_by_id.get(&(parent_ns, parent_name)) else {
-                continue;
-            };
-            if !owned_classes.contains(gw.spec.gateway_class_name.as_str()) {
-                continue;
-            }
-
-            // sectionName narrows the parentRef to a single listener
-            // on the gateway; unset == attach to all.
-            let section = parent_ref.section_name.as_deref();
-            let target_listeners: Vec<&GatewayListeners> = gw
-                .spec
-                .listeners
-                .iter()
-                .filter(|l| section.is_none_or(|s| s == l.name.as_str()))
-                .collect();
-
-            let id: GatewayId = (parent_ns.to_string(), parent_name.to_string());
-            let accepted = accepted_listeners.get(&id);
-            let snapshot = slices.entry(id).or_default();
-
-            for listener in target_listeners {
-                // Listeners classified out in pass 1 (non-HTTP,
-                // conflicted) take no route attachments.
-                let Some(&port) = accepted.and_then(|m| m.get(listener.name.as_str())) else {
-                    continue;
-                };
-                emit_routes_under_listener(
-                    snapshot,
-                    &bind_name(parent_ns, parent_name, port),
-                    listener,
-                    hr,
-                    route_ns,
-                    route_name,
-                );
-            }
-
-            // Backends referenced anywhere in this route, in this Gateway's slice.
-            for rule in hr.spec.rules.as_deref().unwrap_or(&[]) {
-                for br in rule.backend_refs.as_deref().unwrap_or(&[]) {
-                    emit_backend(snapshot, route_ns, br, &services_by_id);
-                }
+        let snapshot = slices.entry(id.clone()).or_default();
+        for edge in &route.edges {
+            emit_routes_under_edge(snapshot, id, edge, route);
+        }
+        // Backends referenced anywhere in this route, in this
+        // Gateway's slice — independent of listener attachment.
+        for rule in &route.rule_backends {
+            for backend in rule {
+                emit_backend(snapshot, backend);
             }
         }
     }
@@ -137,170 +86,52 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
     slices
 }
 
-/// Names of the `GatewayClass`es whose `controllerName` is ours.
-/// Shared with the infra provisioner so "owned Gateway" means the
-/// same thing on both paths.
-pub(crate) fn collect_owned_classes<'a>(
-    state: &'a K8sState,
-    controller_name: &str,
-) -> std::collections::HashSet<&'a str> {
-    state
-        .gateway_classes
-        .iter()
-        .filter(|gc| gc.spec.controller_name == controller_name)
-        .filter_map(|gc| gc.metadata.name.as_deref())
-        .collect()
-}
+/// Emit one `BindUpsert` per port carrying an accepted listener plus
+/// one `ListenerUpsert` per accepted listener. The first accepted
+/// listener on a port establishes the bind and its protocol
+/// (resolution guarantees later listeners on the port agree).
+fn emit_gateway_listeners(snapshot: &mut Snapshot, gw: &GatewayResolution<'_>) {
+    let (ns, name) = (gw.id.0.as_str(), gw.id.1.as_str());
+    let mut bound_ports: HashSet<i32> = HashSet::new();
 
-fn index_gateways(state: &K8sState) -> HashMap<(&str, &str), &Gateway> {
-    state
-        .gateways
-        .iter()
-        .filter_map(|g| {
-            let ns = g.metadata.namespace.as_deref()?;
-            let name = g.metadata.name.as_deref()?;
-            Some(((ns, name), g))
-        })
-        .collect()
-}
-
-fn index_services(state: &K8sState) -> HashMap<(&str, &str), &Service> {
-    state
-        .services
-        .iter()
-        .filter_map(|s| {
-            let ns = s.metadata.namespace.as_deref()?;
-            let name = s.metadata.name.as_deref()?;
-            Some(((ns, name), s))
-        })
-        .collect()
-}
-
-fn index_secrets(state: &K8sState) -> HashMap<(&str, &str), &Secret> {
-    state
-        .secrets
-        .iter()
-        .filter_map(|s| {
-            let ns = s.metadata.namespace.as_deref()?;
-            let name = s.metadata.name.as_deref()?;
-            Some(((ns, name), s))
-        })
-        .collect()
-}
-
-/// Per-port classification state while grouping a Gateway's
-/// listeners: the `BindProtocol` established by the first accepted
-/// listener on the port (every later listener must agree) and the
-/// hostnames already taken (None == catch-all; duplicates conflict).
-type PortGroup = (pb::BindProtocol, std::collections::HashSet<Option<String>>);
-
-/// Walk a Gateway's listeners in spec order, group them by port, and
-/// emit one `BindUpsert` per port plus one `ListenerUpsert` per
-/// accepted listener. Returns the accepted set (listener name →
-/// port) for the route pass.
-///
-/// `HTTP` becomes a plaintext listener; `HTTPS` with (defaulted)
-/// `Terminate` mode becomes a TLS listener carrying its cert refs.
-///
-/// Classification is first-listener-wins, per the Gateway API
-/// listener-distinctness rule. A listener is skipped (warn, no
-/// error) when:
-/// * its protocol is neither HTTP nor HTTPS, or it's HTTPS with
-///   `Passthrough` mode (TLS passthrough is not yet supported);
-/// * its `BindProtocol` disagrees with the listener that established
-///   the port's bind (HTTP and HTTPS can't share a port);
-/// * its hostname duplicates an accepted listener on the same port
-///   (two unset hostnames collide too).
-fn emit_gateway_listeners(
-    snapshot: &mut Snapshot,
-    gw_ns: &str,
-    gw_name: &str,
-    listeners: &[GatewayListeners],
-) -> HashMap<String, i32> {
-    let mut accepted: HashMap<String, i32> = HashMap::new();
-    let mut ports: HashMap<i32, PortGroup> = HashMap::new();
-
-    for listener in listeners {
-        // Classify the listener into a bind protocol and (for HTTPS)
-        // its terminating TLS config. Unsupported protocols/modes are
-        // skipped with a warn, not an error.
-        let (protocol, tls) = match listener.protocol.as_str() {
-            "HTTP" => (pb::BindProtocol::Http, None),
-            "HTTPS" => {
-                // Gateway API defaults an unset mode to Terminate.
-                match listener.tls.as_ref().and_then(|t| t.mode.as_ref()) {
-                    None | Some(GatewayListenersTlsMode::Terminate) => (
-                        pb::BindProtocol::Tls,
-                        Some(pb::ListenerTls {
-                            mode: pb::TlsMode::Terminate as i32,
-                            certificate_refs: listener_cert_refs(gw_ns, listener),
-                        }),
-                    ),
-                    Some(GatewayListenersTlsMode::Passthrough) => {
-                        tracing::warn!(
-                            gateway = gw_name,
-                            listener = %listener.name,
-                            "skipping TLS passthrough listener (not yet supported)"
-                        );
-                        continue;
-                    }
-                }
-            }
-            other => {
-                tracing::warn!(
-                    gateway = gw_name,
-                    listener = %listener.name,
-                    protocol = %other,
-                    "skipping unsupported listener protocol"
-                );
-                continue;
-            }
+    for lr in &gw.listeners {
+        let ListenerOutcome::Accepted {
+            protocol,
+            terminate_tls,
+        } = lr.outcome
+        else {
+            continue;
         };
-
-        let bind_name = bind_name(gw_ns, gw_name, listener.port);
-        // First accepted-protocol listener on a port creates the
-        // bind and establishes its protocol. The listener itself
-        // can't conflict yet (no hostnames recorded), so a bind is
-        // never emitted empty.
-        let (bind_protocol, hostnames) = ports.entry(listener.port).or_insert_with(|| {
+        let listener = lr.listener;
+        let bind = bind_name(ns, name, listener.port);
+        if bound_ports.insert(listener.port) {
             snapshot.binds.insert(
-                BindKey::new(&bind_name),
+                BindKey::new(&bind),
                 pb::BindUpsert {
-                    name: bind_name.clone(),
+                    name: bind.clone(),
                     address: "0.0.0.0".into(),
                     port: listener.port.unsigned_abs(),
                     bind_protocol: protocol as i32,
                 },
             );
-            (protocol, std::collections::HashSet::new())
+        }
+
+        let tls = terminate_tls.then(|| pb::ListenerTls {
+            mode: pb::TlsMode::Terminate as i32,
+            certificate_refs: lr
+                .cert_refs
+                .iter()
+                .map(|c| pb::SecretKey {
+                    namespace: c.namespace.clone(),
+                    name: c.name.clone(),
+                })
+                .collect(),
         });
-
-        if *bind_protocol != protocol {
-            tracing::warn!(
-                gateway = gw_name,
-                listener = %listener.name,
-                port = listener.port,
-                "skipping listener: protocol conflicts with the port's bind"
-            );
-            continue;
-        }
-        if !hostnames.insert(listener.hostname.clone()) {
-            tracing::warn!(
-                gateway = gw_name,
-                listener = %listener.name,
-                port = listener.port,
-                hostname = listener.hostname.as_deref().unwrap_or("<none>"),
-                "skipping listener: hostname conflicts on a shared port"
-            );
-            continue;
-        }
-
-        let lk = ListenerKey::new(BindKey::new(&bind_name), &listener.name);
         snapshot.listeners.insert(
-            lk,
+            ListenerKey::new(BindKey::new(&bind), &listener.name),
             pb::ListenerUpsert {
                 key: Some(pb::ListenerKey {
-                    bind: bind_name.clone(),
+                    bind: bind.clone(),
                     name: listener.name.clone(),
                 }),
                 hostname: listener.hostname.clone().unwrap_or_default(),
@@ -308,81 +139,32 @@ fn emit_gateway_listeners(
                 tls,
             },
         );
-        accepted.insert(listener.name.clone(), listener.port);
     }
-
-    accepted
 }
 
-/// Resolve a listener's `certificateRefs` to the namespaced secret keys
-/// this gateway accepts: core group, `kind: Secret`, same namespace.
-/// Cross-namespace refs (need a `ReferenceGrant`) and other kinds
-/// are skipped with a warn. The returned keys name secrets that may not
-/// be present yet — the DP stashes a listener until they arrive.
-fn listener_cert_refs(gateway_ns: &str, listener: &GatewayListeners) -> Vec<pb::SecretKey> {
-    let Some(refs) = listener
-        .tls
-        .as_ref()
-        .and_then(|t| t.certificate_refs.as_ref())
-    else {
-        return Vec::new();
-    };
-    let mut keys = Vec::new();
-    for r in refs {
-        // Only core/v1 Secret refs are supported.
-        if r.group.as_deref().is_some_and(|g| !g.is_empty()) {
-            tracing::warn!(name = %r.name, group = ?r.group, "skipping non-core certificateRef");
-            continue;
-        }
-        if r.kind.as_deref().is_some_and(|k| k != "Secret") {
-            tracing::warn!(name = %r.name, kind = ?r.kind, "skipping non-Secret certificateRef");
-            continue;
-        }
-        // Cross-namespace refs require a ReferenceGrant (not yet supported).
-        if r.namespace
-            .as_deref()
-            .is_some_and(|n| !n.is_empty() && n != gateway_ns)
-        {
-            tracing::warn!(name = %r.name, namespace = ?r.namespace,
-                "skipping cross-namespace certificateRef");
-            continue;
-        }
-        keys.push(pb::SecretKey {
-            namespace: gateway_ns.to_string(),
-            name: r.name.clone(),
-        });
-    }
-    keys
-}
-
-/// Emit a `SecretUpsert` for each accepted `certificateRef` whose Secret
-/// material is present. Runs independent of listener acceptance so the
-/// material is already published when HTTPS listeners are translated.
-fn emit_gateway_secrets(
-    snapshot: &mut Snapshot,
-    gateway_ns: &str,
-    listeners: &[GatewayListeners],
-    secrets_by_id: &HashMap<(&str, &str), &Secret>,
-) {
-    for listener in listeners {
-        for key in listener_cert_refs(gateway_ns, listener) {
-            let Some(secret) = secrets_by_id.get(&(key.namespace.as_str(), key.name.as_str()))
-            else {
-                tracing::warn!(namespace = %key.namespace, name = %key.name,
+/// Emit a `SecretUpsert` for each accepted `certificateRef` whose
+/// Secret material is present. Runs over every listener regardless
+/// of acceptance so the material is already published when HTTPS
+/// listeners are translated.
+fn emit_gateway_secrets(snapshot: &mut Snapshot, gw: &GatewayResolution<'_>) {
+    for lr in &gw.listeners {
+        for cert in &lr.cert_refs {
+            let Some(secret) = cert.secret else {
+                tracing::warn!(namespace = %cert.namespace, name = %cert.name,
                     "certificateRef Secret not present yet");
                 continue;
             };
             let Some((cert_pem, key_pem)) = tls_material(secret) else {
-                tracing::warn!(namespace = %key.namespace, name = %key.name,
+                tracing::warn!(namespace = %cert.namespace, name = %cert.name,
                     "Secret missing or invalid tls.crt / tls.key");
                 continue;
             };
             // HashMap insert dedups a Secret referenced by several listeners.
             snapshot.secrets.insert(
-                SecretKey::new(key.namespace.clone(), key.name.clone()),
+                SecretKey::new(cert.namespace.clone(), cert.name.clone()),
                 pb::SecretUpsert {
-                    namespace: key.namespace,
-                    name: key.name,
+                    namespace: cert.namespace.clone(),
+                    name: cert.name.clone(),
                     cert_pem,
                     key_pem,
                 },
@@ -401,31 +183,21 @@ fn tls_material(secret: &Secret) -> Option<(String, String)> {
     Some((cert, key))
 }
 
-fn emit_routes_under_listener(
+/// Emit one `HttpRouteUpsert` per rule under one emission edge,
+/// fanning matches out across the edge's effective hostnames.
+fn emit_routes_under_edge(
     snapshot: &mut Snapshot,
-    bind_name: &str,
-    listener: &GatewayListeners,
-    hr: &HTTPRoute,
-    route_ns: &str,
-    route_name: &str,
+    gw_id: &GatewayId,
+    edge: &RouteEdge<'_>,
+    route: &RouteResolution<'_>,
 ) {
-    // Intersect listener.hostname with route.spec.hostnames. If the
-    // intersection is empty, the route doesn't attach to this
-    // listener and we emit nothing.
-    let route_hostnames = hr.spec.hostnames.as_deref().unwrap_or(&[]);
-    let Some(effective) = effective_hostnames(listener.hostname.as_deref(), route_hostnames) else {
-        tracing::debug!(
-            route = route_name,
-            listener = %listener.name,
-            "route hostnames don't intersect listener hostname; skipping"
-        );
-        return;
-    };
+    let bind = bind_name(&gw_id.0, &gw_id.1, edge.port);
+    let listener_key = ListenerKey::new(BindKey::new(&bind), &edge.listener.name);
+    let effective = &edge.effective_hostnames;
 
-    let listener_key = ListenerKey::new(BindKey::new(bind_name), &listener.name);
-
-    for (rule_idx, rule) in hr.spec.rules.as_deref().unwrap_or(&[]).iter().enumerate() {
-        let route_full_name = format!("{route_ns}/{route_name}/rule{rule_idx}");
+    let rules = route.route.spec.rules.as_deref().unwrap_or(&[]);
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        let route_full_name = format!("{}/{}/rule{rule_idx}", route.route_ns, route.route_name);
         let route_key = RouteKey::new(listener_key.clone(), &route_full_name);
 
         let base_matches: Vec<pb::HttpMatch> = rule
@@ -436,7 +208,7 @@ fn emit_routes_under_listener(
             .map(translate_match)
             .collect();
 
-        // Fan-out: one HttpMatch per (effective hostname × user
+        // Fan-out: one HttpMatch per (effective hostname x user
         // match). Empty `effective` means catch-all — keep the base
         // matches with `has_host: false`.
         let matches: Vec<pb::HttpMatch> = if effective.is_empty() {
@@ -457,13 +229,11 @@ fn emit_routes_under_listener(
                 .collect()
         };
 
-        let backend_refs = rule
-            .backend_refs
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|br| translate_backend_ref(br, route_ns))
-            .collect();
+        let backend_refs = route
+            .rule_backends
+            .get(rule_idx)
+            .map(|refs| refs.iter().filter_map(backend_ref_proto).collect())
+            .unwrap_or_default();
 
         let filters = rule
             .filters
@@ -477,8 +247,8 @@ fn emit_routes_under_listener(
             route_key,
             pb::HttpRouteUpsert {
                 key: Some(pb::RouteKey {
-                    bind: bind_name.to_string(),
-                    listener: listener.name.clone(),
+                    bind: bind.clone(),
+                    listener: edge.listener.name.clone(),
                     name: route_full_name,
                 }),
                 matches,
@@ -489,70 +259,72 @@ fn emit_routes_under_listener(
     }
 }
 
-/// Intersect a listener's hostname with an `HTTPRoute`'s hostnames
-/// per the Gateway API. Returns:
-/// * `Some(vec![])` — no host constraint (both sides empty);
-///   `HttpMatch.has_host` stays false.
-/// * `Some(non-empty)` — the set of effective hostnames; the route
-///   fans out across them.
-/// * `None` — the listener has a hostname and none of the route's
-///   hostnames overlap; the attachment is dropped.
-fn effective_hostnames(listener: Option<&str>, route: &[String]) -> Option<Vec<String>> {
-    match (listener, route.is_empty()) {
-        (None, true) => Some(Vec::new()),
-        (None, false) => Some(route.to_vec()),
-        (Some(l), true) => Some(vec![l.to_string()]),
-        (Some(l), false) => {
-            let kept: Vec<String> = route
-                .iter()
-                .filter(|r| hostnames_overlap(l, r))
-                .cloned()
-                .collect();
-            if kept.is_empty() { None } else { Some(kept) }
-        }
-    }
-}
-
-/// Two hostnames overlap if they're equal (case-insensitive) or one
-/// is a wildcard pattern that covers the other.
-fn hostnames_overlap(a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case(b) {
-        return true;
-    }
-    if let Some(suffix) = a.strip_prefix("*.")
-        && wildcard_covers(suffix, b)
-    {
-        return true;
-    }
-    if let Some(suffix) = b.strip_prefix("*.")
-        && wildcard_covers(suffix, a)
-    {
-        return true;
-    }
-    false
-}
-
-/// Per Gateway API: `*.example.com` is a **suffix match** — it
-/// covers `app.example.com`, `foo.bar.example.com`, and any other
-/// hostname ending in `.example.com`. It does NOT cover
-/// `example.com` itself (the wildcard requires at least one label
-/// before the suffix). Case-insensitive.
-///
-/// `host` may itself be a wildcard pattern — `*.sub.example.com`
-/// is covered by `*.example.com` because `foo.sub.example.com` is in
-/// both their concrete sets.
-fn wildcard_covers(pattern_suffix: &str, host: &str) -> bool {
-    if host.len() <= pattern_suffix.len() {
-        return false;
-    }
-    let (head, tail) = host.split_at(host.len() - pattern_suffix.len());
-    if !tail.eq_ignore_ascii_case(pattern_suffix) {
-        return false;
-    }
-    let Some(prefix) = head.strip_suffix('.') else {
-        return false;
+/// The proto ref a rule carries for one resolved backendRef. Missing
+/// and headless Services keep their ref (the DP stashes the route
+/// until the backend lands); dropped refs (cross-namespace, no port)
+/// emit nothing.
+fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> {
+    let key = match &backend.outcome {
+        BackendOutcome::Resolved { key, .. }
+        | BackendOutcome::MissingService { key }
+        | BackendOutcome::Headless { key } => key.clone(),
+        BackendOutcome::CrossNamespace | BackendOutcome::NoPort => return None,
     };
-    !prefix.is_empty()
+    Some(pb::BackendRef {
+        name: key,
+        weight: backend.backend_ref.weight.unwrap_or(1).unsigned_abs(),
+    })
+}
+
+/// Emit one `BackendUpsert` per resolved (svc, port). Idempotent —
+/// the same key reached by multiple rules only produces one entry
+/// per slice. Only `Resolved` outcomes emit; missing/headless
+/// Services emit nothing and the DP-side Store stashes dependent
+/// routes until the backend lands.
+///
+/// Protocol is derived from `Service.spec.ports[*].appProtocol` for
+/// the port matching `backendRef.port`. Port names are intentionally
+/// not inspected — the K8s API treats name as an operator-facing
+/// label only; `appProtocol` is the standard hint. See
+/// [`map_app_protocol`] for recognized values.
+fn emit_backend(snapshot: &mut Snapshot, backend: &BackendResolution<'_>) {
+    let BackendOutcome::Resolved { key, service } = &backend.outcome else {
+        return;
+    };
+    let bk = BackendKey::new(key);
+    if snapshot.backends.contains_key(&bk) {
+        return;
+    }
+    let Some(port) = backend.backend_ref.port else {
+        return;
+    };
+    let spec = service.spec.as_ref();
+    let cluster_ip = spec
+        .and_then(|s| s.cluster_ip.as_deref())
+        .unwrap_or_default();
+    let port_app_protocol = spec
+        .and_then(|s| s.ports.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .find(|p| p.port == port)
+        .and_then(|p| p.app_protocol.as_deref());
+    let protocol = map_app_protocol(port_app_protocol);
+    let (svc_ns, svc_name) = (
+        service.metadata.namespace.as_deref().unwrap_or_default(),
+        service.metadata.name.as_deref().unwrap_or_default(),
+    );
+    snapshot.backends.insert(
+        bk,
+        pb::BackendUpsert {
+            name: key.clone(),
+            endpoints: vec![pb::Endpoint {
+                name: format!("{svc_ns}/{svc_name}"),
+                address: cluster_ip.to_string(),
+                port: port.unsigned_abs(),
+            }],
+            protocol: protocol as i32,
+        },
+    );
 }
 
 /// Translate one `HttpRouteRulesMatches` to the proto. Path,
@@ -624,7 +396,7 @@ fn translate_method(m: Option<&HttpRouteRulesMatchesMethod>) -> pb::HttpMethod {
 /// Dedup header matches by lowercase name (Gateway API "first entry
 /// wins" rule for repeated header names) and emit proto messages.
 fn translate_header_matches(headers: &[HttpRouteRulesMatchesHeaders]) -> Vec<pb::HeaderMatch> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(headers.len());
     for h in headers {
         let key = h.name.to_ascii_lowercase();
@@ -653,7 +425,7 @@ fn translate_header_matches(headers: &[HttpRouteRulesMatchesHeaders]) -> Vec<pb:
 fn translate_query_param_matches(
     qs: &[HttpRouteRulesMatchesQueryParams],
 ) -> Vec<pb::QueryParamMatch> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(qs.len());
     for q in qs {
         if !seen.insert(q.name.clone()) {
@@ -674,24 +446,6 @@ fn translate_query_param_matches(
         });
     }
     out
-}
-
-fn translate_backend_ref(br: &HttpRouteRulesBackendRefs, route_ns: &str) -> Option<pb::BackendRef> {
-    let port = br.port?;
-    let backend_ns = br.namespace.as_deref().unwrap_or(route_ns);
-    if backend_ns != route_ns {
-        tracing::warn!(
-            ns = backend_ns,
-            "skipping cross-namespace backendRef (ReferenceGrant not supported in v0)"
-        );
-        return None;
-    }
-    let key = backend_key_string(backend_ns, &br.name, port);
-    let weight = br.weight.unwrap_or(1);
-    Some(pb::BackendRef {
-        name: key,
-        weight: weight.unsigned_abs(),
-    })
 }
 
 fn translate_filter(f: &HttpRouteRulesFilters) -> Option<pb::HttpFilter> {
@@ -814,65 +568,6 @@ where
     )
 }
 
-/// Emit one `BackendUpsert` per (svc, port) referenced by a route in
-/// this slice. Idempotent — same (svc, port) reached by multiple rules
-/// only produces one entry per slice. Missing or headless Services
-/// emit nothing; the DP-side Store stashes any dependent route until
-/// the backend lands.
-///
-/// Protocol is derived from `Service.spec.ports[*].appProtocol` for
-/// the port matching `backendRef.port`. Port names are intentionally
-/// not inspected — the K8s API treats name as an operator-facing
-/// label only; `appProtocol` is the standard hint. See
-/// [`map_app_protocol`] for recognized values.
-fn emit_backend(
-    snapshot: &mut Snapshot,
-    route_ns: &str,
-    br: &HttpRouteRulesBackendRefs,
-    services_by_id: &HashMap<(&str, &str), &Service>,
-) {
-    let Some(port) = br.port else { return };
-    let backend_ns = br.namespace.as_deref().unwrap_or(route_ns);
-    if backend_ns != route_ns {
-        return; // cross-ns; ReferenceGrant not supported in v0
-    }
-    let key_str = backend_key_string(backend_ns, &br.name, port);
-    let bk = BackendKey::new(&key_str);
-    if snapshot.backends.contains_key(&bk) {
-        return;
-    }
-    let Some(svc) = services_by_id.get(&(backend_ns, br.name.as_str())) else {
-        return;
-    };
-    let Some(spec) = svc.spec.as_ref() else {
-        return;
-    };
-    let cluster_ip = spec.cluster_ip.as_deref().unwrap_or("");
-    if cluster_ip.is_empty() || cluster_ip == "None" {
-        return; // headless / unassigned
-    }
-    let port_app_protocol = spec
-        .ports
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|p| p.port == port)
-        .and_then(|p| p.app_protocol.as_deref());
-    let protocol = map_app_protocol(port_app_protocol);
-    snapshot.backends.insert(
-        bk,
-        pb::BackendUpsert {
-            name: key_str,
-            endpoints: vec![pb::Endpoint {
-                name: format!("{backend_ns}/{}", br.name),
-                address: cluster_ip.to_string(),
-                port: port.unsigned_abs(),
-            }],
-            protocol: protocol as i32,
-        },
-    );
-}
-
 /// Recognized HTTP/2 indicators on `Service.spec.ports[*].appProtocol`.
 ///
 /// `kubernetes.io/h2c` is the Kubernetes-registered value;
@@ -899,11 +594,6 @@ fn map_app_protocol(app_protocol: Option<&str>) -> pb::BackendProtocol {
 fn bind_name(gw_ns: &str, gw_name: &str, port: i32) -> String {
     format!("{gw_ns}/{gw_name}:{port}")
 }
-
-fn backend_key_string(svc_ns: &str, svc_name: &str, port: i32) -> String {
-    format!("{svc_ns}/{svc_name}:{port}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
