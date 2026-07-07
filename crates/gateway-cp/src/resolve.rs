@@ -8,11 +8,13 @@
 //! data-plane snapshots; the status builder consumes the outcomes.
 //! Neither re-derives a decision.
 //!
-//! Two counts are deliberately distinct, because the spec is:
-//! *attachment* (`attachedRoutes`) is based solely on parentRef
-//! selection (plus `allowedRoutes`, once enforced), while *emission*
-//! (what programs the data plane) additionally requires listener
-//! acceptance and a non-empty hostname intersection.
+//! `attachedRoutes` counting follows the CRD text precisely: it
+//! counts *distinct routes* whose parent attachment is Accepted, on
+//! every listener the parentRef selects (plus `allowedRoutes`, once
+//! enforced) — even a listener that is itself conflicted. Routes not
+//! Accepted (no matching parent, no hostname intersection anywhere)
+//! MUST NOT be counted; unresolved backends don't subtract (that's
+//! `ResolvedRefs`, not `Accepted`).
 
 use std::collections::HashMap;
 
@@ -53,10 +55,9 @@ pub struct GatewayResolution<'a> {
 pub struct ListenerResolution<'a> {
     pub listener: &'a GatewayListeners,
     pub outcome: ListenerOutcome,
-    /// Routes attached per the spec's attachment rule (parentRef
-    /// selection; `allowedRoutes` once enforced). Counted regardless
-    /// of listener acceptance, hostname intersection, or backend
-    /// validity.
+    /// Distinct routes with an Accepted parent attachment whose
+    /// parentRef selects this listener (see the module doc). Counted
+    /// regardless of this listener's own validity.
     pub attached_routes: u32,
     /// Accepted certificateRefs, with the Secret if present.
     pub cert_refs: Vec<CertRef<'a>>,
@@ -223,6 +224,11 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         ) else {
             continue;
         };
+        // (gateway idx, listener idx) pairs this route was already
+        // counted on: several parentRefs of one route may select the
+        // same listener, but `attachedRoutes` counts distinct routes.
+        let mut counted: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
         for parent_ref in hr.spec.parent_refs.as_deref().unwrap_or(&[]) {
             let parent_ns = parent_ref.namespace.as_deref().unwrap_or(route_ns);
             let gw_idx = by_id
@@ -233,7 +239,8 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
                 route_ns,
                 route_name,
                 parent_ref,
-                gw_idx.map(|i| &mut gateways[i]),
+                gw_idx.map(|i| (i, &mut gateways[i])),
+                &mut counted,
                 &services_by_id,
             ));
         }
@@ -383,20 +390,22 @@ fn resolve_cert_refs<'a>(
     (accepted, rejected)
 }
 
-/// Evaluate one (route x parentRef). Bumps attachment counts on the
-/// parent's selected listeners; computes emission edges over the
-/// accepted ones.
+/// Evaluate one (route x parentRef): compute emission edges over the
+/// accepted listeners, then — when the attachment is Accepted —
+/// count the route once per selected listener (`counted` carries the
+/// per-route memory across this route's parentRefs).
 fn resolve_route_parent<'a>(
     hr: &'a HTTPRoute,
     route_ns: &'a str,
     route_name: &'a str,
     parent_ref: &'a HttpRouteParentRefs,
-    gateway: Option<&mut GatewayResolution<'a>>,
+    gateway: Option<(usize, &mut GatewayResolution<'a>)>,
+    counted: &mut std::collections::HashSet<(usize, usize)>,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
 ) -> RouteResolution<'a> {
     let rule_backends = resolve_rule_backends(hr, route_ns, services_by_id);
 
-    let Some(gateway) = gateway else {
+    let Some((gw_idx, gateway)) = gateway else {
         return RouteResolution {
             route: hr,
             route_ns,
@@ -414,17 +423,14 @@ fn resolve_route_parent<'a>(
     let section = parent_ref.section_name.as_deref();
     let route_hostnames = hr.spec.hostnames.as_deref().unwrap_or(&[]);
 
-    let mut selected_any = false;
+    let mut selected: Vec<usize> = Vec::new();
     let mut accepted_any = false;
     let mut edges = Vec::new();
-    for lr in &mut gateway.listeners {
+    for (idx, lr) in gateway.listeners.iter().enumerate() {
         if section.is_some_and(|s| s != lr.listener.name.as_str()) {
             continue;
         }
-        selected_any = true;
-        // Attachment counts on selection alone (spec: AllowedRoutes +
-        // parentRefs) — acceptance and hostname do not subtract.
-        lr.attached_routes += 1;
+        selected.push(idx);
         if !lr.outcome.is_accepted() {
             continue;
         }
@@ -446,13 +452,25 @@ fn resolve_route_parent<'a>(
         }
     }
 
-    let outcome = if !selected_any || !accepted_any {
+    let outcome = if selected.is_empty() || !accepted_any {
         RouteParentOutcome::NoMatchingParent
     } else if edges.is_empty() {
         RouteParentOutcome::NoMatchingListenerHostname
     } else {
         RouteParentOutcome::Accepted
     };
+
+    // Only Accepted routes count (CRD: "Routes with any other value
+    // for the Accepted condition MUST NOT be included"), once per
+    // distinct route, on every listener the parentRef selects —
+    // including listeners that are themselves conflicted.
+    if outcome == RouteParentOutcome::Accepted {
+        for idx in selected {
+            if counted.insert((gw_idx, idx)) {
+                gateway.listeners[idx].attached_routes += 1;
+            }
+        }
+    }
 
     RouteResolution {
         route: hr,
@@ -898,7 +916,7 @@ mod tests {
     // ----- attachment vs emission -----
 
     #[test]
-    fn attachment_counts_on_selection_alone() {
+    fn attached_routes_counts_accepted_routes_once() {
         // One accepted listener plus a hostname-conflicted duplicate.
         let listeners = vec![
             http_listener("http", 80, Some("a.example")),
@@ -907,7 +925,8 @@ mod tests {
         let s = state(
             vec![gw("demo", "gw", "zd", listeners)],
             vec![
-                // Hostnames don't intersect: attached, never emitted.
+                // No hostname intersection anywhere: not Accepted, so
+                // it MUST NOT count (and takes no edge).
                 route(
                     "demo",
                     "miss",
@@ -915,8 +934,9 @@ mod tests {
                     Some(vec!["b.example"]),
                     vec![],
                 ),
-                // Hostnames intersect: attached and emitted — but only
-                // the accepted listener takes an edge.
+                // Accepted: counts on both selected listeners — the
+                // conflicted dup included — but edges only on the
+                // accepted one.
                 route(
                     "demo",
                     "hit",
@@ -924,32 +944,48 @@ mod tests {
                     Some(vec!["a.example"]),
                     vec![],
                 ),
+                // Two parentRefs to the same Gateway: a distinct
+                // route counts once per listener, not once per
+                // parentRef.
+                route(
+                    "demo",
+                    "twice",
+                    vec![parent("gw", None), parent("gw", Some("http"))],
+                    Some(vec!["a.example"]),
+                    vec![],
+                ),
             ],
         );
         let r = resolve(&s, OURS);
 
-        // Both routes count on both listeners: neither hostname
-        // mismatch nor listener conflict subtracts from attachment.
         let counts: Vec<u32> = r.gateways[0]
             .listeners
             .iter()
             .map(|l| l.attached_routes)
             .collect();
-        assert_eq!(counts, vec![2, 2]);
-
-        let by_name: HashMap<&str, &RouteResolution<'_>> =
-            r.routes.iter().map(|rr| (rr.route_name, rr)).collect();
         assert_eq!(
-            by_name["miss"].outcome,
+            counts,
+            vec![2, 2],
+            "hit + twice; miss excluded; no double count"
+        );
+
+        let by_name: HashMap<&str, Vec<&RouteResolution<'_>>> =
+            r.routes.iter().fold(HashMap::new(), |mut m, rr| {
+                m.entry(rr.route_name).or_default().push(rr);
+                m
+            });
+        assert_eq!(
+            by_name["miss"][0].outcome,
             RouteParentOutcome::NoMatchingListenerHostname
         );
-        assert!(by_name["miss"].edges.is_empty());
-        assert_eq!(by_name["hit"].outcome, RouteParentOutcome::Accepted);
+        assert!(by_name["miss"][0].edges.is_empty());
+        assert_eq!(by_name["hit"][0].outcome, RouteParentOutcome::Accepted);
         assert_eq!(
-            by_name["hit"].edges.len(),
+            by_name["hit"][0].edges.len(),
             1,
             "no edge on the conflicted dup"
         );
+        assert_eq!(by_name["twice"].len(), 2, "one resolution per parentRef");
     }
 
     #[test]
