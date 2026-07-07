@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use gateway_cp::infra::{InfraConfig, InfraPublisher, writer};
+use gateway_cp::infra::{InfraConfig, InfraPublisher, writer as infra_writer};
+use gateway_cp::status::{StatusWork, writer as status_writer};
 use gateway_cp::{ConfigStreamService, ServerState, run_watch};
 use gateway_cp_proto::v1::config_stream_server::ConfigStreamServer;
 use tokio::sync::watch;
@@ -77,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             let writer_client = client.clone();
             let mut shutdown = shutdown_rx.clone();
             let handle = tokio::spawn(async move {
-                writer::run(writer_client, rx, async move {
+                infra_writer::run(writer_client, rx, async move {
                     let _ = shutdown.wait_for(|v| *v).await;
                 })
                 .await;
@@ -89,6 +90,21 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
+    // Status writeback: the watch loop publishes desired status per
+    // pass; this task owns the apiserver writes. Always on — writing
+    // status is a controller duty, not an optional feature.
+    let (status_tx, status_rx) = watch::channel(StatusWork::default());
+    let status_handle = {
+        let writer_client = client.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            status_writer::run(writer_client, status_rx, async move {
+                let _ = rx.wait_for(|v| *v).await;
+            })
+            .await;
+        })
+    };
+
     let watch_handle = {
         let state = state.clone();
         let controller_name = args.controller_name.clone();
@@ -97,8 +113,15 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = async move {
                 let _ = rx.wait_for(|v| *v).await;
             };
-            if let Err(e) =
-                run_watch(client, controller_name, state, infra_publisher, shutdown).await
+            if let Err(e) = run_watch(
+                client,
+                controller_name,
+                state,
+                infra_publisher,
+                status_tx,
+                shutdown,
+            )
+            .await
             {
                 tracing::error!(error = %e, "watch loop exited with error");
             }
@@ -120,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let _ = watch_handle.await;
+    let _ = status_handle.await;
     if let Some(handle) = writer_handle {
         let _ = handle.await;
     }

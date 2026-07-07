@@ -25,9 +25,14 @@ use kube::runtime::reflector::{self, Store as ReflectorStore};
 use kube::runtime::watcher::{self, Config};
 use thiserror::Error;
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use tokio::sync::watch as tokio_watch;
+
 use crate::infra::{self, InfraPublisher};
+use crate::resolve::resolve;
 use crate::server::ServerState;
-use crate::translator::{K8sState, translate};
+use crate::status::{StatusWork, build_work};
+use crate::translator::{K8sState, translate_resolution};
 
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -49,6 +54,7 @@ pub async fn run(
     controller_name: String,
     state: Arc<ServerState>,
     infra: Option<InfraPublisher>,
+    status_tx: tokio_watch::Sender<StatusWork>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), WatchError> {
     let mut shutdown = pin!(shutdown);
@@ -91,8 +97,14 @@ pub async fn run(
         }
 
         let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
-        let world = translate(&k8s, &controller_name);
+        let resolution = resolve(&k8s, &controller_name);
+        let world = translate_resolution(&resolution);
         state.publish(&world);
+
+        // Desired status rides the same pass; the writer task on the
+        // other side of the channel owns the apiserver writes.
+        let now = Time(k8s_openapi::jiff::Timestamp::now());
+        let _ = status_tx.send(build_work(&resolution, &now));
 
         // Desired data-plane infra rides the same pass; the channel
         // dedups so the writer only wakes on real changes.

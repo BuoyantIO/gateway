@@ -9,7 +9,7 @@
 
 use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use gateway_api::apis::standard::gateways::{
-    GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
+    Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
     GatewayStatusListenersSupportedKinds,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -25,6 +25,33 @@ pub struct StatusSet {
     /// `GatewayClass` name -> desired status.
     pub gateway_classes: Vec<(String, GatewayClassStatus)>,
     pub gateways: Vec<(GatewayId, GatewayStatus)>,
+}
+
+/// One translate pass's status work for the writer: each desired
+/// status paired with the observed object it was computed from (the
+/// writer reconciles against its status, and the conflict-checked
+/// write needs the full object with its `resourceVersion`).
+#[derive(Debug, Clone, Default)]
+pub struct StatusWork {
+    pub gateway_classes: Vec<(GatewayClass, GatewayClassStatus)>,
+    pub gateways: Vec<(Gateway, GatewayStatus)>,
+}
+
+/// [`build`], with each desired status paired to a clone of the
+/// observed object it was computed from.
+pub fn build_work(resolution: &Resolution<'_>, now: &Time) -> StatusWork {
+    StatusWork {
+        gateway_classes: resolution
+            .gateway_classes
+            .iter()
+            .map(|gc| ((*gc).clone(), gateway_class_status(gc, now)))
+            .collect(),
+        gateways: resolution
+            .gateways
+            .iter()
+            .map(|g| (g.gateway.clone(), gateway_status(g, now)))
+            .collect(),
+    }
 }
 
 /// Build the desired status for every owned object in `resolution`.
@@ -498,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_skips_when_semantically_equal() {
+    fn reconcile_skips_when_equal_and_writes_when_fresh() {
         let state = fixture_state();
         let resolution = resolve(&state, OURS);
 
@@ -513,6 +540,11 @@ mod tests {
             reconcile_gateway_class_status(desired_class, Some(&observed_class)),
             None
         );
+
+        // Nothing observed at all: the first write goes out as built.
+        let desired = build(&resolution, &t(100)).gateways.remove(0).1;
+        let written = reconcile_gateway_status(desired.clone(), None).expect("first write");
+        assert_eq!(written, desired);
     }
 
     #[test]
@@ -542,14 +574,5 @@ mod tests {
             find(written.conditions.as_deref().unwrap(), "Programmed").last_transition_time,
             t(100)
         );
-    }
-
-    #[test]
-    fn reconcile_writes_fresh_status_when_nothing_observed() {
-        let state = fixture_state();
-        let resolution = resolve(&state, OURS);
-        let desired = build(&resolution, &t(100)).gateways.remove(0).1;
-        let written = reconcile_gateway_status(desired.clone(), None).expect("first write");
-        assert_eq!(written, desired);
     }
 }
