@@ -5,6 +5,10 @@ DP_IMAGE := "gateway-data-plane:latest"
 CP_IMAGE := "gateway-control-plane:latest"
 ECHO_IMAGE := "gateway-test-echo:e2e"
 GATEWAY_API_CRDS := "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml"
+# Assigns docker-network IPs to LoadBalancer Services in the kind
+# cluster (host-routable on Linux). Runs as a container beside the
+# cluster; no toolchain requirement.
+CPK_IMAGE := "registry.k8s.io/cloud-provider-kind/cloud-controller-manager:v0.9.0"
 
 default: list
 
@@ -49,6 +53,9 @@ images: image-dp image-cp image-echo
 up: images
     kind create cluster --name {{CLUSTER}} --config e2e/kind.yaml
     kind load docker-image {{DP_IMAGE}} {{CP_IMAGE}} {{ECHO_IMAGE}} --name {{CLUSTER}}
+    docker rm -f cloud-provider-kind 2>/dev/null || true
+    docker run -d --name cloud-provider-kind --network kind \
+        -v /var/run/docker.sock:/var/run/docker.sock {{CPK_IMAGE}}
     kubectl apply -f {{GATEWAY_API_CRDS}}
     kubectl apply -f deploy/manifests/gatewayclass.yaml
     kubectl create namespace gateway-system --dry-run=client -o yaml | kubectl apply -f -
@@ -57,6 +64,7 @@ up: images
 
 [group('e2e')]
 down:
+    docker rm -f cloud-provider-kind 2>/dev/null || true
     kind delete cluster --name {{CLUSTER}}
 
 [group('e2e')]
