@@ -68,9 +68,8 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         // Synchronously delete the namespace and wait until it's
-        // fully gone. `NodePort` allocations are cluster-scoped, so
-        // fire-and-forget teardown would race the next test's
-        // `Service` create.
+        // fully gone, keeping the cluster quiet between tests.
+        // Parallel e2e (and async teardown) is tracked separately.
         let name = std::mem::take(&mut self.name);
         let handle = std::thread::Builder::new()
             .name(format!("ns-drop-{name}"))

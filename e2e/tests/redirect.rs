@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, expose_dp, gateway, http_route, wait_until_redirected};
+use gateway_e2e::{Scope, gateway, gateway_address, http_route, wait_until_redirected};
 use http::StatusCode;
 
 #[tokio::test(flavor = "current_thread")]
@@ -16,8 +16,8 @@ async fn request_redirect_answers_301_to_https() -> Result<()> {
 
     // Just a data plane and a Gateway with a plaintext listener — no
     // echo backend, since the redirect short-circuits.
-    expose_dp(client, ns, "gw").await?;
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
 
     apply_http_route(
         client,
@@ -29,8 +29,13 @@ async fn request_redirect_answers_301_to_https() -> Result<()> {
     )
     .await?;
 
-    let resp =
-        wait_until_redirected("app.example", "/foo?x=1", StatusCode::MOVED_PERMANENTLY).await?;
+    let resp = wait_until_redirected(
+        &addr,
+        "app.example",
+        "/foo?x=1",
+        StatusCode::MOVED_PERMANENTLY,
+    )
+    .await?;
     let location = resp
         .headers()
         .get(http::header::LOCATION)

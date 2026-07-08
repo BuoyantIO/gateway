@@ -107,8 +107,8 @@ async fn gateway_provisions_ready_dp_and_gc_cleans_up() -> Result<()> {
     let service = wait_for(&svc_api, "gw-gatewayd", "provisioned service", |_| true).await?;
     assert_managed(&service.metadata, "gw");
     let spec = service.spec.as_ref().expect("service spec");
-    // The e2e Gateway fixture asks for ClusterIP via the annotation.
-    assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
+    // The provisioner's default Service type.
+    assert_eq!(spec.type_.as_deref(), Some("LoadBalancer"));
     let ports: Vec<i32> = spec.ports.iter().flatten().map(|p| p.port).collect();
     assert_eq!(ports, vec![80]);
 

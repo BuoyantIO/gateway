@@ -1,34 +1,47 @@
 //! HTTP driver used by tests to send requests through the data
 //! plane and assert responses.
+//!
+//! Every entrypoint takes the gateway address the test read from
+//! `Gateway.status.addresses` (see `fixtures::gateway_address`) —
+//! the same way an external client finds the gateway. All e2e
+//! listeners bind port 80, so URLs carry the bare address.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use http::StatusCode;
 use reqwest::header::HeaderMap;
 
-use crate::{NODE_HOST, NODE_PORT};
+/// Outer deadline for the wait loops. Generous because a fresh
+/// cluster's first test pays every cold start at once: data-plane
+/// pod, config bootstrap, and the `LoadBalancer` proxy behind the
+/// gateway address.
+const WAIT_DEADLINE: Duration = Duration::from_mins(1);
 
-/// Thin wrapper over `reqwest::Client` that always targets the kind
-/// cluster's `NodePort`. Each request sets a custom `Host` header so
-/// the gateway can listener-match by hostname.
+/// Thin wrapper over `reqwest::Client` targeting one gateway
+/// address. Each request sets a custom `Host` header so the gateway
+/// can listener-match by hostname.
 pub struct Driver {
     client: reqwest::Client,
+    addr: String,
 }
 
 impl Driver {
     #[allow(clippy::missing_panics_doc)]
-    pub fn new() -> Self {
+    pub fn new(gateway_addr: &str) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("reqwest client builds");
-        Self { client }
+        Self {
+            client,
+            addr: gateway_addr.to_string(),
+        }
     }
 
-    /// Build a GET against the gateway's `NodePort` with the given
-    /// virtual `Host` header and request path.
+    /// Build a GET against the gateway with the given virtual `Host`
+    /// header and request path.
     ///
     /// # Errors
     /// Returns an error if the request fails to send (network or
@@ -40,7 +53,7 @@ impl Driver {
         path: &str,
         extra_headers: HeaderMap,
     ) -> Result<reqwest::Response> {
-        let url = format!("http://{NODE_HOST}:{NODE_PORT}{path}");
+        let url = format!("http://{}{path}", self.addr);
         let resp = self
             .client
             .get(&url)
@@ -63,7 +76,7 @@ impl Driver {
         path: &str,
         extra_headers: HeaderMap,
     ) -> Result<reqwest::Response> {
-        let url = format!("http://{NODE_HOST}:{NODE_PORT}{path}");
+        let url = format!("http://{}{path}", self.addr);
         let resp = self
             .client
             .request(method.clone(), &url)
@@ -76,42 +89,33 @@ impl Driver {
     }
 }
 
-impl Default for Driver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Poll the gateway until a GET for `(host, path)` returns
 /// `expected_status`. Retries with backoff for up to ~30 seconds.
-///
-/// Until the control plane writes back `.status.conditions` on
-/// `Gateway` / `HTTPRoute`, tests don't have a `Programmed` signal
-/// to wait on, so we probe the data path directly. When status
-/// writeback lands, callers can switch to condition-based waits.
 ///
 /// # Errors
 /// Returns an error if the gateway doesn't reach the expected state
 /// within the deadline.
 pub async fn wait_until_routed(
+    gateway_addr: &str,
     host: &str,
     path: &str,
     expected_status: StatusCode,
 ) -> Result<reqwest::Response> {
-    let driver = Driver::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let driver = Driver::new(gateway_addr);
+    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
     let mut backoff = Duration::from_millis(250);
     let mut last_seen: Option<StatusCode> = None;
+    let mut last_err: Option<String> = None;
     loop {
         match driver.get(host, path, HeaderMap::new()).await {
             Ok(resp) if resp.status() == expected_status => return Ok(resp),
             Ok(resp) => last_seen = Some(resp.status()),
-            Err(_) => {}
+            Err(e) => last_err = Some(format!("{e:#}")),
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_routed timed out: host={host} path={path} \
-                 wanted={expected_status} last_seen={last_seen:?}"
+                 wanted={expected_status} last_seen={last_seen:?} last_err={last_err:?}"
             );
         }
         tokio::time::sleep(backoff).await;
@@ -128,6 +132,7 @@ pub async fn wait_until_routed(
 /// Returns an error if the gateway doesn't reach the expected state
 /// within the deadline.
 pub async fn wait_until_redirected(
+    gateway_addr: &str,
     host: &str,
     path: &str,
     expected_status: StatusCode,
@@ -139,10 +144,11 @@ pub async fn wait_until_redirected(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building no-redirect reqwest client")?;
-    let url = format!("http://{NODE_HOST}:{NODE_PORT}{path}");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let url = format!("http://{gateway_addr}{path}");
+    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
     let mut backoff = Duration::from_millis(250);
     let mut last_seen: Option<StatusCode> = None;
+    let mut last_err: Option<String> = None;
     loop {
         match client
             .get(&url)
@@ -152,12 +158,12 @@ pub async fn wait_until_redirected(
         {
             Ok(resp) if resp.status() == expected_status => return Ok(resp),
             Ok(resp) => last_seen = Some(resp.status()),
-            Err(_) => {}
+            Err(e) => last_err = Some(format!("{e:#}")),
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_redirected timed out: host={host} path={path} \
-                 wanted={expected_status} last_seen={last_seen:?}"
+                 wanted={expected_status} last_seen={last_seen:?} last_err={last_err:?}"
             );
         }
         tokio::time::sleep(backoff).await;
@@ -165,49 +171,55 @@ pub async fn wait_until_redirected(
     }
 }
 
-/// An HTTPS client that resolves `host` to the cluster's loopback
-/// `NodePort` and trusts any server cert. The connection sends `host`
-/// as SNI (so the gateway selects the matching TLS listener) and as the
-/// `Host` authority (the gateway strips the port before matching).
-fn tls_client(host: &str) -> Result<reqwest::Client> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, NODE_PORT));
+/// An HTTPS client that resolves `host` to the gateway address and
+/// trusts any server cert. The connection sends `host` as SNI (so
+/// the gateway selects the matching TLS listener) and as the `Host`
+/// authority (the gateway strips the port before matching).
+fn tls_client(host: &str, gateway_addr: &str) -> Result<reqwest::Client> {
+    let ip: IpAddr = gateway_addr
+        .parse()
+        .with_context(|| format!("gateway address {gateway_addr} is not an IP"))?;
     reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         // Tests use a throwaway self-signed cert; the point is to
         // prove termination, not chain validation.
         .danger_accept_invalid_certs(true)
-        .resolve(host, addr)
+        // The port comes from the request URL; resolve only pins the IP.
+        .resolve(host, SocketAddr::from((ip, 0)))
         .build()
         .context("building TLS reqwest client")
 }
 
 /// Poll the gateway until an HTTPS GET for `(host, path)` terminates
 /// and returns `expected_status`. Same retry/backoff shape as
-/// [`wait_until_routed`], over TLS.
+/// [`wait_until_routed`], over TLS. The e2e HTTPS listeners bind
+/// port 80, hence the explicit port in the URL.
 ///
 /// # Errors
 /// Returns an error if the gateway doesn't reach the expected state
 /// within the deadline.
 pub async fn wait_until_routed_tls(
+    gateway_addr: &str,
     host: &str,
     path: &str,
     expected_status: StatusCode,
 ) -> Result<reqwest::Response> {
-    let client = tls_client(host)?;
-    let url = format!("https://{host}:{NODE_PORT}{path}");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let client = tls_client(host, gateway_addr)?;
+    let url = format!("https://{host}:80{path}");
+    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
     let mut backoff = Duration::from_millis(250);
     let mut last_seen: Option<StatusCode> = None;
+    let mut last_err: Option<String> = None;
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status() == expected_status => return Ok(resp),
             Ok(resp) => last_seen = Some(resp.status()),
-            Err(_) => {}
+            Err(e) => last_err = Some(format!("{e:#}")),
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_routed_tls timed out: host={host} path={path} \
-                 wanted={expected_status} last_seen={last_seen:?}"
+                 wanted={expected_status} last_seen={last_seen:?} last_err={last_err:?}"
             );
         }
         tokio::time::sleep(backoff).await;

@@ -30,24 +30,15 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{ObjectMeta, PostParams};
 use kube::{Api, Client};
 
-use crate::NODE_PORT;
-
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
-/// `GatewayClass`, with one HTTP listener on `port`. Asks the
-/// provisioner for a `ClusterIP` Service — the default
-/// `LoadBalancer` pends forever on kind.
+/// `GatewayClass`, with one HTTP listener on `port`. The provisioned
+/// Service takes its `LoadBalancer` default; the cluster's
+/// `LoadBalancer` implementation assigns the address.
 pub fn gateway(ns: &str, name: &str, port: i32, hostname: Option<&str>) -> Gateway {
     Gateway {
         metadata: ObjectMeta {
             namespace: Some(ns.into()),
             name: Some(name.into()),
-            annotations: Some(
-                [(
-                    "gateway.buoyant.io/service-type".to_owned(),
-                    "ClusterIP".to_owned(),
-                )]
-                .into(),
-            ),
             ..Default::default()
         },
         spec: GatewaySpec {
@@ -106,13 +97,6 @@ pub fn gateway_https(
         metadata: ObjectMeta {
             namespace: Some(ns.into()),
             name: Some(name.into()),
-            annotations: Some(
-                [(
-                    "gateway.buoyant.io/service-type".to_owned(),
-                    "ClusterIP".to_owned(),
-                )]
-                .into(),
-            ),
             ..Default::default()
         },
         spec: GatewaySpec {
@@ -483,53 +467,31 @@ impl HttpRouteBuilder {
     }
 }
 
-/// Expose the *provisioned* data plane for `gw_name` on the
-/// cluster-wide `NODE_PORT` (30080). The CP provisioner owns the
-/// gatewayd `Deployment`, `ServiceAccount`, and `ClusterIP`
-/// `Service`; this extra `NodePort` `Service` only selects the DP
-/// pods by the standard gateway-name label so tests can reach them
-/// from the host. Tests run `--test-threads=1` because the port is
-/// cluster-scoped.
+/// Wait for the Gateway's `LoadBalancer` address — the same read any
+/// external client (or the gateway-api-bench harness) performs
+/// before sending traffic.
 ///
 /// # Errors
-/// Returns an error if the create call fails.
-pub async fn expose_dp(client: &Client, ns: &str, gw_name: &str) -> Result<()> {
-    let svc_name = format!("dp-{gw_name}");
-    // The standard label the provisioner puts on the DP pods.
-    let selector: BTreeMap<String, String> = [(
-        "gateway.networking.k8s.io/gateway-name".to_owned(),
-        gw_name.to_owned(),
-    )]
-    .into();
-
-    let svc = Service {
-        metadata: ObjectMeta {
-            namespace: Some(ns.into()),
-            name: Some(svc_name.clone()),
-            ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            type_: Some("NodePort".into()),
-            selector: Some(selector),
-            ports: Some(vec![ServicePort {
-                name: Some("http".into()),
-                port: 80,
-                target_port: Some(IntOrString::Int(80)),
-                node_port: Some(i32::from(NODE_PORT)),
-                protocol: Some("TCP".into()),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }),
-        status: None,
-    };
-
-    Api::<Service>::namespaced(client.clone(), ns)
-        .create(&PostParams::default(), &svc)
-        .await
-        .with_context(|| format!("creating DP exposure service {svc_name}"))?;
-
-    Ok(())
+/// Returns an error if no address appears within the deadline.
+pub async fn gateway_address(client: &Client, ns: &str, gw_name: &str) -> Result<String> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        if let Some(gw) = api.get_opt(gw_name).await?
+            && let Some(addr) = gw
+                .status
+                .as_ref()
+                .and_then(|s| s.addresses.as_ref())
+                .and_then(|a| a.first())
+        {
+            return Ok(addr.value.clone());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for an address on gateway {ns}/{gw_name}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// Deploy an echo backend `Deployment` + `Service` in `ns`.

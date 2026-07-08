@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, deploy_echo, expose_dp, gateway, http_route, wait_until_routed};
+use gateway_e2e::{Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed};
 use http::StatusCode;
 
 #[tokio::test(flavor = "current_thread")]
@@ -13,9 +13,9 @@ async fn request_and_response_modifiers() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    expose_dp(client, ns, "gw").await?;
     deploy_echo(client, ns, "echo", None).await?;
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
 
     apply_http_route(
         client,
@@ -35,7 +35,7 @@ async fn request_and_response_modifiers() -> Result<()> {
     )
     .await?;
 
-    let resp = wait_until_routed("app.example", "/", StatusCode::OK).await?;
+    let resp = wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
 
     // Request-side filter took effect (request was tagged, echo
     // reflected it back).
