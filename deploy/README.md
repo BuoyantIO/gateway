@@ -84,7 +84,9 @@ prefix-match (it falls through to the PathPrefix instead).
   (default `LoadBalancer`) and
   `gateway.buoyant.io/provisioning: disabled` to opt a Gateway out
   and deploy gatewayd by hand (`--client-id={ns}/{gw-name}`).
-- Status writeback is **not** implemented yet; `Gateway.status` will
-  not be populated by this controller.
+- The controller writes status: `kubectl get gtw` shows ADDRESS
+  (from the provisioned Service) and PROGRAMMED, listener entries
+  carry `attachedRoutes`, and the GatewayClass is marked `Accepted`.
+  `HTTPRoute.status.parents` is not written yet.
 - The control plane reads `Service.spec.clusterIP` to resolve backend
   endpoints. `EndpointSlice` watching and per-pod LB land later.

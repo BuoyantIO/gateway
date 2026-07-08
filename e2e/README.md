@@ -19,7 +19,7 @@ provisioned pods so tests can reach them from the host.
 
 ```sh
 just up        # build images, create kind cluster, deploy CP + CRDs
-just test      # run the e2e suite (currently 6 tests)
+just test      # run the e2e suite
 just down      # tear everything down
 ```
 
