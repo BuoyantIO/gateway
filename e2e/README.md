@@ -15,6 +15,14 @@ provisioned pods so tests can reach them from the host.
 - `just` (`cargo install just`)
 - A Rust toolchain (pinned by `rust-toolchain.toml`).
 
+`just up` also starts a
+[cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind)
+container so `LoadBalancer` Services in the cluster get IPs from the
+docker network. Those IPs are host-routable on Linux; on macOS
+cloud-provider-kind needs its sudo tunnel mode instead of the
+container, which this setup doesn't automate — Linux is the primary
+target.
+
 ## Running locally
 
 ```sh
