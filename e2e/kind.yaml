@@ -3,13 +3,3 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: gateway-e2e
 nodes:
   - role: control-plane
-    extraPortMappings:
-      # The data plane Service is type: NodePort and binds 30080.
-      # This mapping exposes it as 127.0.0.1:30080 on the host so
-      # tests can drive HTTP through the gateway over loopback.
-      # Tests run serially (`--test-threads=1`) because the port
-      # is cluster-scoped.
-      # TODO: Decvise a smarter strategy for parallel tests that need to share ports.
-      - containerPort: 30080
-        hostPort: 30080
-        protocol: TCP

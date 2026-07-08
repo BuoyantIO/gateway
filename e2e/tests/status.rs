@@ -65,7 +65,7 @@ async fn gateway_status_reflects_the_world() -> Result<()> {
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
 
     // Fresh gateway: accepted, programmed, addressed (the managed
-    // Service's ClusterIP), listeners present with zero routes.
+    // Service's LoadBalancer IP), listeners present with zero routes.
     let gw = wait_for_status(&gw_api, "gw", "fresh gateway status", |gw| {
         condition_true(gw, "Accepted")
             && condition_true(gw, "Programmed")

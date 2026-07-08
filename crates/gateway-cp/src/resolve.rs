@@ -542,7 +542,8 @@ fn resolve_backend<'a>(
 
 /// The address(es) a Gateway is reachable at, read from the
 /// provisioner-managed Service: `LoadBalancer` ingress when present,
-/// else the `ClusterIP`. The Service is verified by the managed-by
+/// the `ClusterIP` for non-`LoadBalancer` Services, and nothing while
+/// a `LoadBalancer` assignment is pending. The Service is verified by the managed-by
 /// label and a controller ownerReference with the Gateway's uid —
 /// never by name alone.
 fn managed_service_addresses(
@@ -592,9 +593,17 @@ fn managed_service_addresses(
         return out;
     }
 
-    // No LB ingress (ClusterIP/NodePort Service, or LB pending):
-    // report the cluster IPs.
     let spec = svc.spec.as_ref();
+    // A LoadBalancer Service without ingress is still waiting for its
+    // address; publishing the ClusterIP in the meantime would hand
+    // clients an address that stops being the right one moments
+    // later. Report nothing until the LB assigns.
+    if spec.and_then(|s| s.type_.as_deref()) == Some("LoadBalancer") {
+        return Vec::new();
+    }
+
+    // No LB ingress and not a LoadBalancer (ClusterIP/NodePort
+    // Service): report the cluster IPs.
     let cluster_ips: Vec<&str> = spec
         .and_then(|s| s.cluster_ips.as_deref())
         .map(|ips| ips.iter().map(String::as_str).collect())
@@ -829,6 +838,7 @@ mod tests {
     fn managed_service(
         gw_ns: &str,
         gw_name: &str,
+        svc_type: &str,
         ingress: Vec<LoadBalancerIngress>,
         cluster_ips: Vec<&str>,
     ) -> Service {
@@ -851,6 +861,7 @@ mod tests {
                 ..Default::default()
             },
             spec: Some(ServiceSpec {
+                type_: Some(svc_type.into()),
                 cluster_ips: Some(cluster_ips.into_iter().map(String::from).collect()),
                 ..Default::default()
             }),
@@ -1139,13 +1150,21 @@ mod tests {
     #[test]
     fn addresses_come_from_the_managed_service_only() {
         // gw-lb: managed Service with LB ingress -> typed entries.
-        // gw-cluster: managed Service without ingress -> ClusterIP.
+        // gw-pending: LoadBalancer Service without ingress yet -> none
+        //   (the ClusterIP must not leak out as a transient address).
+        // gw-cluster: ClusterIP Service -> its cluster IP.
         // gw-squat: same-name Service without our label/owner -> none.
         let mut squatter = service("demo", &object_name("gw-squat"), Some("10.96.0.99"));
         squatter.metadata.labels = None;
         let mut s = state(
             vec![
                 gw("demo", "gw-lb", "zd", vec![http_listener("h", 80, None)]),
+                gw(
+                    "demo",
+                    "gw-pending",
+                    "zd",
+                    vec![http_listener("h", 80, None)],
+                ),
                 gw(
                     "demo",
                     "gw-cluster",
@@ -1160,6 +1179,7 @@ mod tests {
             managed_service(
                 "demo",
                 "gw-lb",
+                "LoadBalancer",
                 vec![
                     LoadBalancerIngress {
                         ip: Some("203.0.113.7".into()),
@@ -1172,7 +1192,20 @@ mod tests {
                 ],
                 vec!["10.96.0.10"],
             ),
-            managed_service("demo", "gw-cluster", vec![], vec!["10.96.0.10"]),
+            managed_service(
+                "demo",
+                "gw-pending",
+                "LoadBalancer",
+                vec![],
+                vec!["10.96.0.10"],
+            ),
+            managed_service(
+                "demo",
+                "gw-cluster",
+                "ClusterIP",
+                vec![],
+                vec!["10.96.0.10"],
+            ),
             squatter,
         ];
         let r = resolve(&s, OURS);
@@ -1190,13 +1223,14 @@ mod tests {
                 },
             ]
         );
+        assert!(r.gateways[1].addresses.is_empty());
         assert_eq!(
-            r.gateways[1].addresses,
+            r.gateways[2].addresses,
             vec![GatewayAddress {
                 value: "10.96.0.10".into(),
                 kind: AddressKind::Ip
             }]
         );
-        assert!(r.gateways[2].addresses.is_empty());
+        assert!(r.gateways[3].addresses.is_empty());
     }
 }

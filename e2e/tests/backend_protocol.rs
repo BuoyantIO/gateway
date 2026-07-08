@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, deploy_echo, expose_dp, gateway, http_route, wait_until_routed};
+use gateway_e2e::{Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed};
 use http::StatusCode;
 
 #[tokio::test(flavor = "current_thread")]
@@ -13,13 +13,13 @@ async fn h2c_backend() -> Result<()> {
     let ns = scope.name();
     let client = scope.client();
 
-    expose_dp(client, ns, "gw").await?;
     // appProtocol: h2c — the translator should recognize this and
     // emit BackendProtocol::Http2. The gateway then dials the echo
     // backend over h2c (HTTP/2 prior-knowledge). The echo's
     // hyper_util auto::Builder serves both H1 and H2.
     deploy_echo(client, ns, "echo", Some("h2c")).await?;
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
 
     apply_http_route(
         client,
@@ -34,7 +34,7 @@ async fn h2c_backend() -> Result<()> {
     // Drive over HTTP/1.1 client-side. The gateway speaks H2 to the
     // backend regardless — the echo's reflected x-server-version
     // header tells us which wire version it received.
-    let resp = wait_until_routed("app.example", "/hello", StatusCode::OK).await?;
+    let resp = wait_until_routed(&addr, "app.example", "/hello", StatusCode::OK).await?;
 
     let server_version = resp
         .headers()

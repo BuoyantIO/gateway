@@ -56,7 +56,7 @@ up: images
     docker rm -f cloud-provider-kind 2>/dev/null || true
     docker run -d --name cloud-provider-kind --network kind \
         -v /var/run/docker.sock:/var/run/docker.sock {{CPK_IMAGE}}
-    kubectl apply -f {{GATEWAY_API_CRDS}}
+    kubectl apply --server-side -f {{GATEWAY_API_CRDS}}
     kubectl apply -f deploy/manifests/gatewayclass.yaml
     kubectl create namespace gateway-system --dry-run=client -o yaml | kubectl apply -f -
     kubectl apply -f deploy/manifests/controlplane/
