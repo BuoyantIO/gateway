@@ -473,9 +473,12 @@ impl HttpRouteBuilder {
 ///
 /// # Errors
 /// Returns an error if no address appears within the deadline.
+/// The deadline is sized for CI, where the cluster's `LoadBalancer`
+/// implementation has been observed to take well over a minute to
+/// assign an address under container churn.
 pub async fn gateway_address(client: &Client, ns: &str, gw_name: &str) -> Result<String> {
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(3);
     loop {
         if let Some(gw) = api.get_opt(gw_name).await?
             && let Some(addr) = gw
