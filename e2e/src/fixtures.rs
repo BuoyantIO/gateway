@@ -218,6 +218,13 @@ impl HttpRouteBuilder {
         self
     }
 
+    /// Drop the rule's `matches` entirely — the spec-default catch-all
+    /// shape (`backendRefs` only) that tooling commonly generates.
+    pub fn no_matches(mut self) -> Self {
+        self.pending.matches = None;
+        self
+    }
+
     fn current_match(&mut self) -> &mut HttpRouteRulesMatches {
         let matches = self.pending.matches.as_mut().expect("matches initialized");
         matches.first_mut().expect("at least one match entry")
