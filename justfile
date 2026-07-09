@@ -32,7 +32,7 @@ test-unit:
 
 [group('test')]
 test-e2e:
-    cargo test -p gateway-e2e -- --ignored --test-threads=1
+    cargo test -p gateway-e2e -- --ignored
 
 [group('e2e')]
 image-dp:

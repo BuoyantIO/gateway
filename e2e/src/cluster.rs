@@ -68,8 +68,10 @@ impl Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         // Synchronously delete the namespace and wait until it's
-        // fully gone, keeping the cluster quiet between tests.
-        // Parallel e2e (and async teardown) is tracked separately.
+        // fully gone. Tests run in parallel; the sync wait bounds this
+        // test's namespace lifetime so its teardown never leaks into a
+        // concurrent test's world — the blocked thread only idles its
+        // own test slot.
         let name = std::mem::take(&mut self.name);
         let handle = std::thread::Builder::new()
             .name(format!("ns-drop-{name}"))
