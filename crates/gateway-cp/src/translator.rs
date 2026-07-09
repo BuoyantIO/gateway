@@ -200,13 +200,13 @@ fn emit_routes_under_edge(
         let route_full_name = format!("{}/{}/rule{rule_idx}", route.route_ns, route.route_name);
         let route_key = RouteKey::new(listener_key.clone(), &route_full_name);
 
-        let base_matches: Vec<pb::HttpMatch> = rule
-            .matches
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(translate_match)
-            .collect();
+        // An absent (or empty) `matches` defaults to one `PathPrefix /`
+        // catch-all per the Gateway API spec — `translate_match`
+        // supplies that default for an empty match entry.
+        let base_matches: Vec<pb::HttpMatch> = match rule.matches.as_deref() {
+            None | Some([]) => vec![translate_match(&HttpRouteRulesMatches::default())],
+            Some(ms) => ms.iter().map(translate_match).collect(),
+        };
 
         // Fan-out: one HttpMatch per (effective hostname x user
         // match). Empty `effective` means catch-all — keep the base
@@ -2329,5 +2329,44 @@ mod tests {
             pb::BackendProtocol::Http1,
             "unmatched port must fall back to H1"
         );
+    }
+    // ---------- Catch-all for rules with no matches ----------
+
+    #[test]
+    fn rule_without_matches_emits_path_prefix_catchall() {
+        // Per spec an absent `matches` defaults to `PathPrefix /`.
+        // The route has a hostname, so the fan-out must apply to the
+        // synthesized match too.
+        let mut r = rule(None, vec![backend_ref("svc", 8080)], vec![]);
+        r.matches = None;
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route_with_hostnames(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![r],
+                vec!["app.example.com".into()],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            secrets: vec![],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().expect("one route");
+
+        assert_eq!(route.matches.len(), 1);
+        let m = &route.matches[0];
+        assert!(m.has_host);
+        assert_eq!(m.host, "app.example.com");
+        let path = m.path.as_ref().expect("path set");
+        assert_eq!(path.kind, pb::PathMatchKind::PathPrefix as i32);
+        assert_eq!(path.value, "/");
     }
 }

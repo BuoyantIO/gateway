@@ -68,3 +68,34 @@ async fn method_and_header_match() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn rule_without_matches_is_a_catchall() -> Result<()> {
+    let scope = Scope::new("nomatch").await?;
+    let ns = scope.name();
+    let client = scope.client();
+
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+
+    // backendRefs only — per spec this rule defaults to PathPrefix /.
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .no_matches()
+            .backend("echo", 8080)
+            .build(),
+    )
+    .await?;
+
+    wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+    let resp = Driver::new(&addr)
+        .get("app.example", "/some/deep/path", HeaderMap::new())
+        .await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    Ok(())
+}
