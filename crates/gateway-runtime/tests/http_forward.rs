@@ -325,7 +325,9 @@ async fn host_routing_picks_matching_listener() {
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
-    assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+    // An unmatched host answers 404 — the same status whether or not
+    // any listener on the bind is active.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(2), gw_handle)

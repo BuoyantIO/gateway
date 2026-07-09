@@ -10,7 +10,9 @@
 
 use anyhow::Result;
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed};
+use gateway_e2e::{
+    Driver, Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed,
+};
 use http::StatusCode;
 
 #[tokio::test(flavor = "current_thread")]
@@ -122,6 +124,43 @@ async fn regex_path_matches() -> Result<()> {
 
     let unmatched = wait_until_routed(&addr, "app.example", "/api/v", StatusCode::OK).await?;
     assert_eq!(unmatched.headers().get("x-echo-rule").unwrap(), "prefix");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn unmatched_request_is_404_before_and_after_first_route() -> Result<()> {
+    let scope = Scope::new("notready").await?;
+    let ns = scope.name();
+    let client = scope.client();
+
+    // A Gateway with zero routes: its listener is not active yet, but
+    // an unmatched request must already answer 404 — the status never
+    // changes across listener activation.
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+
+    wait_until_routed(&addr, "unmatched.example", "/", StatusCode::NOT_FOUND).await?;
+
+    // Activate the listener with a real route, then re-check: the
+    // unmatched host still gets exactly 404.
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .path_prefix("/")
+            .backend("echo", 8080)
+            .build(),
+    )
+    .await?;
+    wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+
+    let resp = Driver::new(&addr)
+        .get("unmatched.example", "/", reqwest::header::HeaderMap::new())
+        .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     Ok(())
 }

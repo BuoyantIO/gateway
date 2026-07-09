@@ -928,10 +928,9 @@ enum RouteResolveError {
 
 fn synthesize_error(err: RouteResolveError) -> Response<ResponseBody> {
     let status = match err {
-        RouteResolveError::BindGone | RouteResolveError::NoListener => {
-            StatusCode::MISDIRECTED_REQUEST
-        }
-        RouteResolveError::NoRoute => StatusCode::NOT_FOUND,
+        RouteResolveError::BindGone
+        | RouteResolveError::NoListener
+        | RouteResolveError::NoRoute => StatusCode::NOT_FOUND,
         RouteResolveError::NoBackend => StatusCode::SERVICE_UNAVAILABLE,
     };
     synthesize_status(status)
