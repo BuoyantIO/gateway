@@ -218,6 +218,13 @@ impl HttpRouteBuilder {
         self
     }
 
+    /// Drop the rule's `matches` entirely — the spec-default catch-all
+    /// shape (`backendRefs` only) that tooling commonly generates.
+    pub fn no_matches(mut self) -> Self {
+        self.pending.matches = None;
+        self
+    }
+
     fn current_match(&mut self) -> &mut HttpRouteRulesMatches {
         let matches = self.pending.matches.as_mut().expect("matches initialized");
         matches.first_mut().expect("at least one match entry")
@@ -473,9 +480,12 @@ impl HttpRouteBuilder {
 ///
 /// # Errors
 /// Returns an error if no address appears within the deadline.
+/// The deadline is sized for CI, where the cluster's `LoadBalancer`
+/// implementation has been observed to take well over a minute to
+/// assign an address under container churn.
 pub async fn gateway_address(client: &Client, ns: &str, gw_name: &str) -> Result<String> {
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(3);
     loop {
         if let Some(gw) = api.get_opt(gw_name).await?
             && let Some(addr) = gw
