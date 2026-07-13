@@ -3,14 +3,28 @@
 //! Five `kube_runtime::reflector` instances keep an in-memory view of
 //! `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`, and
 //! `core/v1 Secret` (filtered to `type: kubernetes.io/tls`). A single
-//! `tokio::select!` over the watcher streams drives the loop: every
-//! event triggers a `translate` + `ServerState::publish`.
+//! `tokio::select!` over the watcher streams drives the loop: each
+//! relevant event triggers one pass (resolve, translate, publish,
+//! status, infra).
 //!
-//! Currently publishes on every event. `diff` returns `None` when nothing
-//! changed, so spurious publishes are no-ops at the broadcast layer
-//! and never reach the data planes. Add debouncing back when
-//! translate cost during config bursts becomes measurable.
+//! Not every event is relevant. A status-only write does not bump
+//! `metadata.generation` and changes nothing the pass reads, so it is
+//! skipped. This matters because we write status ourselves: without
+//! the skip, every one of our own writes would echo back as an event
+//! and trigger a useless pass. Other controllers writing status to
+//! the same objects are filtered the same way.
+//!
+//! Per kind:
+//! - `GatewayClass`, `HTTPRoute`: skip unless the generation changed.
+//! - `Gateway`: skip unless the generation or the annotations changed
+//!   (the provisioner reads the self-managed opt-out annotation).
+//! - `Service`, `Secret`: never skipped. Service status carries the
+//!   `LoadBalancer` address; Secret data has no generation.
+//!
+//! A watcher resync replays every object; the replay runs one pass at
+//! the end (`InitDone`) instead of one per object.
 
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
@@ -85,15 +99,22 @@ pub async fn run(
     let mut sec_stream =
         reflector::reflector(sec_writer, watcher::watcher(sec_api, sec_config)).boxed();
 
+    let mut gc_filter = EventFilter::generation_only();
+    let mut gw_filter = EventFilter::generation_and_annotations();
+    let mut hr_filter = EventFilter::generation_only();
+
     loop {
-        tokio::select! {
+        let relevant = tokio::select! {
             biased;
             () = &mut shutdown => break,
-            ev = gc_stream.next() => log_event_err("GatewayClass", ev.as_ref()),
-            ev = gw_stream.next() => log_event_err("Gateway", ev.as_ref()),
-            ev = hr_stream.next() => log_event_err("HTTPRoute", ev.as_ref()),
-            ev = svc_stream.next() => log_event_err("Service", ev.as_ref()),
-            ev = sec_stream.next() => log_event_err("Secret", ev.as_ref()),
+            ev = gc_stream.next() => gc_filter.relevant("GatewayClass", ev),
+            ev = gw_stream.next() => gw_filter.relevant("Gateway", ev),
+            ev = hr_stream.next() => hr_filter.relevant("HTTPRoute", ev),
+            ev = svc_stream.next() => EventFilter::always("Service", ev),
+            ev = sec_stream.next() => EventFilter::always("Secret", ev),
+        };
+        if !relevant {
+            continue;
         }
 
         let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
@@ -142,8 +163,210 @@ fn collect_state(
     }
 }
 
-fn log_event_err<T, E: std::fmt::Display>(kind: &str, ev: Option<&Result<T, E>>) {
-    if let Some(Err(e)) = ev {
-        tracing::warn!(kind, error = %e, "watcher emitted error");
+/// The parts of an object the pass reads: generation, and (for
+/// Gateways) the annotations.
+type Fingerprint = (Option<i64>, Option<BTreeMap<String, String>>);
+
+/// Decides whether an event is worth a pass. If an object's
+/// fingerprint is the same as last time, the event was a status-only
+/// write and is skipped.
+///
+/// If a pass ever starts reading a new metadata field from a filtered
+/// kind, that field must be added to the fingerprint.
+struct EventFilter {
+    /// Fingerprint of each object at its last event, by uid.
+    seen: HashMap<String, Fingerprint>,
+    /// Track annotations too. Only Gateways need this: the
+    /// provisioner reads the self-managed opt-out annotation, and
+    /// annotation edits don't bump the generation.
+    track_annotations: bool,
+    /// During a resync: the uids seen so far. Used by `InitDone` to
+    /// drop entries for objects deleted while the watch was down
+    /// (those never get a `Delete` event).
+    resync: Option<std::collections::HashSet<String>>,
+}
+
+impl EventFilter {
+    fn generation_only() -> Self {
+        Self {
+            seen: HashMap::new(),
+            track_annotations: false,
+            resync: None,
+        }
+    }
+
+    fn generation_and_annotations() -> Self {
+        Self {
+            seen: HashMap::new(),
+            track_annotations: true,
+            resync: None,
+        }
+    }
+
+    /// True if this event should trigger a pass.
+    fn relevant<K: kube::Resource>(
+        &mut self,
+        kind: &str,
+        ev: Option<Result<watcher::Event<K>, watcher::Error>>,
+    ) -> bool {
+        match ev {
+            Some(Ok(watcher::Event::Apply(obj))) => self.apply(&obj),
+            Some(Ok(watcher::Event::Delete(obj))) => {
+                if let Some(uid) = obj.meta().uid.as_deref() {
+                    self.seen.remove(uid);
+                }
+                true
+            }
+            // Resync replay: remember the object, but don't run a
+            // pass per object — InitDone runs one pass at the end,
+            // after the reflector store has swapped.
+            Some(Ok(watcher::Event::InitApply(obj))) => {
+                self.apply(&obj);
+                if let (Some(replayed), Some(uid)) = (&mut self.resync, obj.meta().uid.as_deref()) {
+                    replayed.insert(uid.to_string());
+                }
+                false
+            }
+            Some(Ok(watcher::Event::Init)) => {
+                self.resync = Some(std::collections::HashSet::new());
+                false
+            }
+            Some(Ok(watcher::Event::InitDone)) => {
+                if let Some(replayed) = self.resync.take() {
+                    self.seen.retain(|uid, _| replayed.contains(uid));
+                }
+                true
+            }
+            None => false,
+            Some(Err(e)) => {
+                tracing::warn!(kind, error = %e, "watcher emitted error");
+                false
+            }
+        }
+    }
+
+    fn apply<K: kube::Resource>(&mut self, obj: &K) -> bool {
+        let meta = obj.meta();
+        // Without a uid we can't track the object; don't risk a wrong
+        // skip.
+        let Some(uid) = meta.uid.as_deref() else {
+            return true;
+        };
+        let fingerprint: Fingerprint = (
+            meta.generation,
+            self.track_annotations
+                .then(|| meta.annotations.clone())
+                .flatten(),
+        );
+        match self.seen.insert(uid.to_string(), fingerprint.clone()) {
+            Some(prev) => prev != fingerprint,
+            None => true,
+        }
+    }
+
+    /// For Services and Secrets: every change matters, so never skip
+    /// `Apply` or `Delete`. Resyncs still collapse into the single
+    /// `InitDone` pass.
+    fn always<K: kube::Resource>(
+        kind: &str,
+        ev: Option<Result<watcher::Event<K>, watcher::Error>>,
+    ) -> bool {
+        match ev {
+            Some(Ok(
+                watcher::Event::Apply(_) | watcher::Event::Delete(_) | watcher::Event::InitDone,
+            )) => true,
+            Some(Ok(watcher::Event::Init | watcher::Event::InitApply(_))) | None => false,
+            Some(Err(e)) => {
+                tracing::warn!(kind, error = %e, "watcher emitted error");
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    fn gw(uid: &str, generation: i64, annotations: Option<&[(&str, &str)]>) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                uid: Some(uid.into()),
+                generation: Some(generation),
+                annotations: annotations.map(|kv| {
+                    kv.iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // mirrors the stream item shape
+    fn ev(g: Gateway) -> Option<Result<watcher::Event<Gateway>, watcher::Error>> {
+        Some(Ok(watcher::Event::Apply(g)))
+    }
+
+    #[test]
+    fn status_only_write_is_skipped() {
+        let mut f = EventFilter::generation_only();
+        assert!(f.relevant("Gateway", ev(gw("u1", 1, None))));
+        // A status write leaves the generation untouched.
+        assert!(!f.relevant("Gateway", ev(gw("u1", 1, None))));
+        // A spec change bumps it.
+        assert!(f.relevant("Gateway", ev(gw("u1", 2, None))));
+    }
+
+    #[test]
+    fn annotation_change_relevant_only_when_tracked() {
+        let mut tracked = EventFilter::generation_and_annotations();
+        assert!(tracked.relevant("Gateway", ev(gw("u1", 1, None))));
+        assert!(tracked.relevant("Gateway", ev(gw("u1", 1, Some(&[("a", "b")])))));
+
+        let mut untracked = EventFilter::generation_only();
+        assert!(untracked.relevant("Gateway", ev(gw("u1", 1, None))));
+        assert!(!untracked.relevant("Gateway", ev(gw("u1", 1, Some(&[("a", "b")])))));
+    }
+
+    #[test]
+    fn delete_forgets_the_uid() {
+        let mut f = EventFilter::generation_only();
+        assert!(f.relevant("Gateway", ev(gw("u1", 1, None))));
+        assert!(f.relevant(
+            "Gateway",
+            Some(Ok(watcher::Event::Delete(gw("u1", 1, None))))
+        ));
+        // After a delete the uid is forgotten, so the next apply
+        // counts as new.
+        assert!(f.relevant("Gateway", ev(gw("u1", 1, None))));
+    }
+
+    #[test]
+    fn resync_coalesces_to_the_init_done_pass() {
+        let mut f = EventFilter::generation_and_annotations();
+        assert!(!f.relevant::<Gateway>("Gateway", Some(Ok(watcher::Event::Init))));
+        assert!(!f.relevant(
+            "Gateway",
+            Some(Ok(watcher::Event::InitApply(gw("u1", 1, None))))
+        ));
+        assert!(f.relevant::<Gateway>("Gateway", Some(Ok(watcher::Event::InitDone))));
+        // The replay recorded u1's fingerprint, so a status echo
+        // after the resync still skips.
+        assert!(!f.relevant("Gateway", ev(gw("u1", 1, None))));
+
+        // u1 is deleted while the watch is down: the resync replays
+        // only u2, so InitDone drops u1's entry.
+        assert!(!f.relevant::<Gateway>("Gateway", Some(Ok(watcher::Event::Init))));
+        assert!(!f.relevant(
+            "Gateway",
+            Some(Ok(watcher::Event::InitApply(gw("u2", 1, None))))
+        ));
+        assert!(f.relevant::<Gateway>("Gateway", Some(Ok(watcher::Event::InitDone))));
+        assert!(!f.seen.contains_key("u1"));
+        assert!(f.seen.contains_key("u2"));
     }
 }
