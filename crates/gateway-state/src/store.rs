@@ -518,8 +518,9 @@ impl Inner {
     }
 
     fn upsert_http_route(&mut self, parent: &ListenerKey, route: HttpRoute) -> Vec<BindEvent> {
+        let rkey = RouteKey::new(parent.clone(), route.name.clone());
         self.upsert_route_raw(parent, route);
-        self.re_resolve_listener(parent);
+        self.patch_listener_route(parent, &rkey);
         if self.bind_meta.contains_key(&parent.bind) {
             self.rebuild_bind(&parent.bind);
             return vec![BindEvent::Updated(parent.bind.clone())];
@@ -566,7 +567,7 @@ impl Inner {
                 set.remove(key);
             }
         }
-        self.re_resolve_listener(&key.listener);
+        self.patch_listener_route(&key.listener, key);
         if self.bind_meta.contains_key(&key.listener.bind) {
             self.rebuild_bind(&key.listener.bind);
             return vec![BindEvent::Updated(key.listener.bind.clone())];
@@ -909,6 +910,51 @@ impl Inner {
             tls,
         });
         self.active_listeners.insert(key.clone(), active);
+    }
+
+    /// Update one route in its listener without touching the
+    /// siblings.
+    ///
+    /// If the listener is active and stays active, copy its route
+    /// list, patch the one entry at its sorted position, and swap the
+    /// listener. The copy is a list of `Arc`s — cheap at any size.
+    ///
+    /// If the listener flips between pending and active (first route
+    /// arrives, or the last one leaves), fall back to the full
+    /// `place_listener` re-evaluation. That's rare.
+    fn patch_listener_route(&mut self, lkey: &ListenerKey, rkey: &RouteKey) {
+        let route = self.active_routes.get(rkey).cloned();
+        let Some(current) = self.active_listeners.get(lkey) else {
+            // The listener isn't active. A newly active route may
+            // promote it; anything else changes nothing.
+            if route.is_some() {
+                self.re_resolve_listener(lkey);
+            }
+            return;
+        };
+        let mut routes = current.routes.clone();
+        let idx = routes.binary_search_by(|r| r.key.name.cmp(&rkey.name));
+        match (route, idx) {
+            (Some(new), Ok(i)) => routes[i] = new,
+            (Some(new), Err(i)) => routes.insert(i, new),
+            (None, Ok(i)) => {
+                routes.remove(i);
+            }
+            // Route wasn't in the list and still isn't.
+            (None, Err(_)) => return,
+        }
+        if routes.is_empty() {
+            // No active routes left: the listener goes pending.
+            self.re_resolve_listener(lkey);
+            return;
+        }
+        let updated = Arc::new(ActiveListener {
+            key: current.key.clone(),
+            hostname: current.hostname.clone(),
+            routes,
+            tls: current.tls.clone(),
+        });
+        self.active_listeners.insert(lkey.clone(), updated);
     }
 
     fn re_resolve_route(&mut self, key: &RouteKey) {
