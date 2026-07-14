@@ -44,7 +44,13 @@ use tokio::task::JoinHandle;
 /// still pump many requests, which is what the gateway's upstream
 /// pool does. Adequate for this test.
 async fn spawn_counting_http() -> (u16, Arc<AtomicU64>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_counting_http_on(0).await
+}
+
+/// Like `spawn_counting_http` but binds a specific port (0 =
+/// ephemeral). Lets a test restart an upstream at the same address.
+async fn spawn_counting_http_on(port: u16) -> (u16, Arc<AtomicU64>, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let counter = Arc::new(AtomicU64::new(0));
     let c = Arc::clone(&counter);
@@ -90,7 +96,7 @@ async fn wait_for_listening(port: u16) {
     panic!("gateway did not start listening on port {port}");
 }
 
-fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
+fn cfg_endpoints(bind_port: u16, ports: &[u16]) -> GatewayConfig {
     GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -120,22 +126,23 @@ fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
         }],
         backends: vec![Backend::Static(StaticBackend {
             name: "be".into(),
-            endpoints: vec![
-                Endpoint {
-                    name: "e0".into(),
+            endpoints: ports
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Endpoint {
+                    name: format!("e{i}"),
                     address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    port: p1,
-                },
-                Endpoint {
-                    name: "e1".into(),
-                    address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    port: p2,
-                },
-            ],
+                    port: *p,
+                })
+                .collect(),
             protocol: BackendProtocol::Http1,
         })],
         secrets: vec![],
     }
+}
+
+fn cfg_two_endpoints(bind_port: u16, p1: u16, p2: u16) -> GatewayConfig {
+    cfg_endpoints(bind_port, &[p1, p2])
 }
 
 /// Drive one GET through the gateway. Returns the response status, or
@@ -242,6 +249,88 @@ async fn p2c_distributes_then_evicts_failing_endpoint() {
         c2_after >= 25,
         "endpoint 2 didn't pick up the load: c2_after={c2_after}, bad_gateway={bad_gateway}"
     );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// A single-endpoint backend must fail open. While the
+/// endpoint is down every request gets a 502 (a real dial was
+/// attempted — never a synthesized 503 from an empty pick), and the
+/// first request after the endpoint comes back succeeds immediately.
+/// The eviction duration is deliberately much longer than the test:
+/// recovery can only come from the fail-open dial clearing the
+/// eviction, not from the deadline lapsing.
+#[tokio::test]
+async fn single_endpoint_fails_open_and_recovers() {
+    let (p1, _c1, h1) = spawn_counting_http().await;
+    let bind_port = free_port().await;
+
+    let cfg = cfg_endpoints(bind_port, &[p1]);
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let picker = Arc::new(P2cEwma::new(P2cConfig::default()));
+    let state_cfg = EndpointStateConfig {
+        ewma_alpha: 0.5,
+        failure_threshold: 1,
+        eviction_duration: Duration::from_mins(1),
+    };
+    let lb = LoadBalancer::with_picker(picker, state_cfg);
+    let gateway = Gateway::with_lb(store, lb);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let gw_handle = tokio::spawn(async move {
+        gateway
+            .run(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build_http();
+
+    // Phase 1: endpoint up — requests succeed.
+    for _ in 0..5 {
+        assert_eq!(round_trip(&client, bind_port).await, StatusCode::OK);
+    }
+
+    // Phase 2: endpoint down. `failure_threshold = 1` evicts on the
+    // first failed dial; without fail-open every subsequent request
+    // would be a synthesized 503 for the whole 60s eviction window.
+    // With fail-open each request still dials the dead endpoint and
+    // gets a 502.
+    h1.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..10 {
+        let status = round_trip(&client, bind_port).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "downtime must answer 502 after a dial attempt, never 503"
+        );
+    }
+
+    // Phase 3: endpoint back on the same port. The very next request
+    // must succeed — the successful dial clears the eviction.
+    let (_p1_again, c1_again, _h1_again) = spawn_counting_http_on(p1).await;
+    assert_eq!(
+        round_trip(&client, bind_port).await,
+        StatusCode::OK,
+        "first request after recovery must succeed"
+    );
+    for _ in 0..5 {
+        assert_eq!(round_trip(&client, bind_port).await, StatusCode::OK);
+    }
+    assert!(c1_again.load(Ordering::Relaxed) >= 6);
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
