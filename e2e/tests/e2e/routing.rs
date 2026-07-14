@@ -14,6 +14,9 @@ use gateway_e2e::{
     Driver, Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed,
 };
 use http::StatusCode;
+use k8s_openapi::api::core::v1::Service;
+use kube::Api;
+use kube::api::DeleteParams;
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires kind cluster — run via `just test`"]
@@ -161,6 +164,70 @@ async fn unmatched_request_is_404_before_and_after_first_route() -> Result<()> {
         .get("unmatched.example", "/", reqwest::header::HeaderMap::new())
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn rule_with_missing_backend_answers_500_and_recovers() -> Result<()> {
+    let scope = Scope::new("routing-500").await?;
+    let ns = scope.name();
+    let client = scope.client();
+
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+
+    // One route, two rules: `/ghost` points at a Service that does not
+    // exist; `/` at a real one.
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .path_prefix("/ghost")
+            .backend("ghost", 8080)
+            .add_rule()
+            .path_prefix("/")
+            .backend("echo", 8080)
+            .build(),
+    )
+    .await?;
+
+    // The sibling rule proxies; the broken rule matches and answers
+    // 500 — a misconfigured backend, not a missing route.
+    wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+    wait_until_routed(
+        &addr,
+        "app.example",
+        "/ghost",
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await?;
+
+    // An unmatched request is still 404 — the 500 is scoped to
+    // requests the broken rule actually matches.
+    let resp = Driver::new(&addr)
+        .get("unmatched.example", "/", reqwest::header::HeaderMap::new())
+        .await?;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The missing Service appears: the rule serves without any route
+    // re-apply.
+    deploy_echo(client, ns, "ghost", None).await?;
+    wait_until_routed(&addr, "app.example", "/ghost", StatusCode::OK).await?;
+
+    // And returns to 500 — not 404 — when the Service goes away again.
+    Api::<Service>::namespaced(client.clone(), ns)
+        .delete("ghost", &DeleteParams::default())
+        .await?;
+    wait_until_routed(
+        &addr,
+        "app.example",
+        "/ghost",
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await?;
 
     Ok(())
 }

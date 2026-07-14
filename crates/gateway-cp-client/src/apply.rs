@@ -256,11 +256,9 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         assert_eq!(listener.routes.len(), 1);
         let route = &listener.routes[0];
         assert_eq!(route.backends.len(), 1);
-        assert_eq!(route.backends[0].backend.endpoints[0].port, 8080);
-        assert_eq!(
-            route.backends[0].backend.endpoints[0].address.to_string(),
-            "10.0.0.1"
-        );
+        let backend = route.backends[0].backend.as_ref().expect("ref resolves");
+        assert_eq!(backend.endpoints[0].port, 8080);
+        assert_eq!(backend.endpoints[0].address.to_string(), "10.0.0.1");
     }
 
     #[test]
@@ -286,7 +284,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     }
 
     #[test]
-    fn route_without_backend_stays_pending() {
+    fn route_without_backend_activates_unresolved() {
         let store = Store::new();
         let update = batch(
             vec![
@@ -298,15 +296,16 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         );
         apply_update(&store, update).expect("apply ok");
 
+        // The missing backend does not hold the route back: it activates
+        // with the ref unresolved (the data plane answers 500 for it).
         let read = store.read();
-        assert!(!read.is_route_active(&RouteKey::new(
+        assert!(read.is_route_active(&RouteKey::new(
             ListenerKey::new(BindKey::new("b"), "l"),
             "r"
         )));
-        // Bind is still active but listener has no active routes yet,
-        // so the bind's listener list is empty.
         let bind = read.bind(&BindKey::new("b")).unwrap();
-        assert!(bind.listeners.is_empty());
+        assert_eq!(bind.listeners.len(), 1);
+        assert!(bind.listeners[0].routes[0].backends[0].backend.is_none());
     }
 
     // ----- removes -----
@@ -342,7 +341,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     }
 
     #[test]
-    fn remove_backend_demotes_dependent_routes() {
+    fn remove_backend_unresolves_dependent_refs() {
         let store = Store::new();
         apply_update(
             &store,
@@ -374,8 +373,12 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         )
         .unwrap();
 
-        assert!(!store.read().is_route_active(&rk));
-        assert!(store.read().backend(&BackendKey::new("be")).is_none());
+        // The route stays active; the ref rides along unresolved.
+        let read = store.read();
+        assert!(read.is_route_active(&rk));
+        assert!(read.backend(&BackendKey::new("be")).is_none());
+        let bind = read.bind(&BindKey::new("b")).unwrap();
+        assert!(bind.listeners[0].routes[0].backends[0].backend.is_none());
     }
 
     #[test]

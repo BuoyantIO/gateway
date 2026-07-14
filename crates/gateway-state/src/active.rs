@@ -64,7 +64,11 @@ pub struct ActiveHttpRoute {
 
 #[derive(Debug, Clone)]
 pub struct ActiveBackendRef {
-    pub backend: Arc<ActiveBackend>,
+    /// The backend this ref names, registered or not.
+    pub key: BackendKey,
+    /// `None` while the named backend is not registered — traffic
+    /// destined to this ref is answered with a synthesized 500.
+    pub backend: Option<Arc<ActiveBackend>>,
     pub weight: u32,
 }
 

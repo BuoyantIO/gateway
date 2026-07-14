@@ -49,8 +49,10 @@ impl Default for Store {
 //
 //   * Bind:     registered.
 //   * Backend:  registered.
-//   * Route:    parent bind registered AND parent listener registered
-//               AND every backend ref names a registered backend.
+//   * Route:    parent bind registered AND parent listener registered.
+//               Backend refs resolve per-ref: a ref naming an
+//               unregistered backend rides along unresolved, and the
+//               runtime answers 500 for traffic destined to it.
 //   * Listener: parent bind registered AND AT LEAST ONE active route
 //               under it (HTTP fans out across path / host).
 //
@@ -744,7 +746,7 @@ impl Inner {
                 .backends
                 .iter()
                 .map(|abr| BackendRef {
-                    name: abr.backend.key.0.clone(),
+                    name: abr.key.0.clone(),
                     weight: abr.weight,
                 })
                 .collect(),
@@ -807,26 +809,27 @@ impl Inner {
     }
 
     /// Decide the new placement of `route` under `key`. Active iff
-    /// parent bind known, parent listener known (active or pending),
-    /// and every `backend_refs[i].name` resolves.
+    /// parent bind known and parent listener known (active or
+    /// pending). Backend refs resolve individually: a ref naming an
+    /// unregistered backend stays on the active route unresolved.
     fn place_route(&mut self, route: HttpRoute, key: &RouteKey) {
         if !self.bind_meta.contains_key(&key.listener.bind) || !self.listener_known(&key.listener) {
             self.pending_routes.insert(key.clone(), route);
             return;
         }
-        let mut resolved = Vec::with_capacity(route.backend_refs.len());
-        for br in &route.backend_refs {
-            let bkey = BackendKey::new(br.name.clone());
-            if let Some(b) = self.backends.get(&bkey) {
-                resolved.push(ActiveBackendRef {
-                    backend: Arc::clone(b),
+        let resolved = route
+            .backend_refs
+            .iter()
+            .map(|br| {
+                let bkey = BackendKey::new(br.name.clone());
+                let backend = self.backends.get(&bkey).map(Arc::clone);
+                ActiveBackendRef {
+                    key: bkey,
+                    backend,
                     weight: br.weight,
-                });
-            } else {
-                self.pending_routes.insert(key.clone(), route);
-                return;
-            }
-        }
+                }
+            })
+            .collect();
         let active = Arc::new(ActiveHttpRoute {
             key: key.clone(),
             matches: route.matches,
@@ -1210,6 +1213,9 @@ mod tests {
     fn backendkey(s: &str) -> BackendKey {
         BackendKey::new(s)
     }
+    fn resolved_backend(abr: &ActiveBackendRef) -> &ActiveBackend {
+        abr.backend.as_ref().expect("backend ref resolves")
+    }
 
     // --- tests ---
 
@@ -1240,7 +1246,7 @@ mod tests {
         assert_eq!(listener.routes.len(), 1);
         let route = &listener.routes[0];
         assert_eq!(route.backends.len(), 1);
-        assert_eq!(route.backends[0].backend.endpoints[0].port, 8080);
+        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 8080);
     }
 
     #[test]
@@ -1280,7 +1286,7 @@ mod tests {
     }
 
     #[test]
-    fn route_stashed_without_backend_then_promoted() {
+    fn route_with_missing_backend_activates_unresolved() {
         let store = Store::new();
         store.upsert_bind(http_bind("b", 80)).unwrap();
         store
@@ -1288,14 +1294,24 @@ mod tests {
             .unwrap();
         store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
 
-        assert!(!store.read().is_route_active(&rkey("b", "l", "r")));
-        assert!(store.read().bind(&bkey("b")).unwrap().listeners.is_empty());
+        // The missing backend does not hold the route (or its
+        // listener) back — the ref rides along unresolved.
+        assert!(store.read().is_route_active(&rkey("b", "l", "r")));
+        {
+            let read = store.read();
+            let bind = read.bind(&bkey("b")).unwrap();
+            assert_eq!(bind.listeners.len(), 1);
+            let route = &bind.listeners[0].routes[0];
+            assert!(route.backends[0].backend.is_none());
+            assert_eq!(route.backends[0].key, backendkey("be"));
+        }
 
         store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
 
-        assert!(store.read().is_route_active(&rkey("b", "l", "r")));
-        let bind = store.read().bind(&bkey("b")).unwrap();
-        assert_eq!(bind.listeners.len(), 1);
+        let read = store.read();
+        let bind = read.bind(&bkey("b")).unwrap();
+        let route = &bind.listeners[0].routes[0];
+        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 8080);
     }
 
     #[test]
@@ -1345,14 +1361,21 @@ mod tests {
             .unwrap();
         store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
 
+        // Removing the backend leaves the route (and listener) active;
+        // the ref goes unresolved.
         store.remove_backend(&backendkey("be"));
-        assert!(!store.read().is_route_active(&rkey("b", "l", "r")));
-        assert!(store.read().bind(&bkey("b")).unwrap().listeners.is_empty());
+        {
+            let read = store.read();
+            assert!(read.is_route_active(&rkey("b", "l", "r")));
+            let bind = read.bind(&bkey("b")).unwrap();
+            assert_eq!(bind.listeners.len(), 1);
+            assert!(bind.listeners[0].routes[0].backends[0].backend.is_none());
+        }
 
         store.upsert_backend(static_backend("be", &[("e0", "10.0.0.99", 9999)]));
         let bind = store.read().bind(&bkey("b")).unwrap();
         let route = &bind.listeners[0].routes[0];
-        assert_eq!(route.backends[0].backend.endpoints[0].port, 9999);
+        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 9999);
     }
 
     #[test]
@@ -1368,7 +1391,7 @@ mod tests {
         store.upsert_backend(static_backend("be", &[("e0", "10.0.0.2", 9090)]));
         let bind = store.read().bind(&bkey("b")).unwrap();
         let route = &bind.listeners[0].routes[0];
-        assert_eq!(route.backends[0].backend.endpoints[0].port, 9090);
+        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 9090);
     }
 
     #[test]
@@ -1389,7 +1412,7 @@ mod tests {
         assert_eq!(listener.hostname.as_deref(), Some("svc.local"));
         assert_eq!(listener.routes.len(), 1);
         assert_eq!(
-            listener.routes[0].backends[0].backend.endpoints[0].port,
+            resolved_backend(&listener.routes[0].backends[0]).endpoints[0].port,
             8080
         );
     }
@@ -1584,7 +1607,7 @@ mod tests {
     }
 
     #[test]
-    fn route_with_one_missing_backend_stays_pending() {
+    fn route_with_one_missing_backend_activates_partially_resolved() {
         let store = Store::new();
         store.upsert_backend(static_backend("be0", &[("e0", "10.0.0.1", 8080)]));
         store.upsert_bind(http_bind("b", 80)).unwrap();
@@ -1592,10 +1615,18 @@ mod tests {
             .upsert_listener(&bkey("b"), http_listener("l"))
             .unwrap();
         store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be0", "be1"]));
-        assert!(!store.read().is_route_active(&rkey("b", "l", "r")));
+        assert!(store.read().is_route_active(&rkey("b", "l", "r")));
+        {
+            let read = store.read();
+            let route = &read.bind(&bkey("b")).unwrap().listeners[0].routes[0];
+            assert!(route.backends[0].backend.is_some());
+            assert!(route.backends[1].backend.is_none());
+        }
 
         store.upsert_backend(static_backend("be1", &[("e0", "10.0.0.2", 8080)]));
-        assert!(store.read().is_route_active(&rkey("b", "l", "r")));
+        let read = store.read();
+        let route = &read.bind(&bkey("b")).unwrap().listeners[0].routes[0];
+        assert!(route.backends.iter().all(|abr| abr.backend.is_some()));
     }
 
     #[test]
@@ -1929,18 +1960,16 @@ gatewayConfig:
 
     #[test]
     fn retain_handles_pending_entities() {
-        // Pending route (backend missing) survives if it's in keep.
+        // Pending route (parent listener not registered) survives if
+        // it's in keep.
         let store = Store::new();
         store.upsert_bind(http_bind("b", 80)).unwrap();
-        store
-            .upsert_listener(&bkey("b"), http_listener("l"))
-            .unwrap();
-        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["nobody"]));
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
         assert!(!store.read().is_route_active(&rkey("b", "l", "r")));
 
         let keep = RegisteredKeys {
             binds: [bkey("b")].into_iter().collect(),
-            listeners: [lkey("b", "l")].into_iter().collect(),
+            listeners: HashSet::default(),
             routes: [rkey("b", "l", "r")].into_iter().collect(),
             backends: HashSet::default(),
             secrets: HashSet::default(),

@@ -25,7 +25,9 @@ use gateway_config::filter::{
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
-use gateway_state::{ActiveBackend, ActiveHttpRoute, ActiveListener, BindKey, Store};
+use gateway_state::{
+    ActiveBackend, ActiveBackendRef, ActiveHttpRoute, ActiveListener, BindKey, Store,
+};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
@@ -33,6 +35,7 @@ use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use rand::Rng;
 
 use crate::lb::{EndpointInfo, LoadBalancer};
 
@@ -429,8 +432,12 @@ async fn serve_request(
 
     // No filter short-circuited, so this route must proxy — it needs a
     // backend with a pickable endpoint.
-    let Some(backend) = resolved.backend else {
-        return synthesize_error(RouteResolveError::NoBackend);
+    let backend = match resolved.backend {
+        BackendChoice::Picked(b) => b,
+        BackendChoice::None => return synthesize_error(RouteResolveError::NoBackend),
+        BackendChoice::Unresolved => {
+            return synthesize_error(RouteResolveError::BackendUnresolved);
+        }
     };
     let Some((endpoint, info)) = lb.pick_endpoint(&backend) else {
         return synthesize_status(StatusCode::SERVICE_UNAVAILABLE);
@@ -469,12 +476,23 @@ async fn serve_request(
 // =================== route resolution ===================
 
 struct ResolvedRoute {
-    /// `None` for a route with no backendRefs
-    backend: Option<Arc<ActiveBackend>>,
+    backend: BackendChoice,
     filters: Vec<HttpFilterConfig>,
     route_name: String,
     /// The route's `PathPrefix` value that matched this request
     matched_path_prefix: Option<String>,
+}
+
+/// Outcome of the weighted pick across a route's backend refs.
+enum BackendChoice {
+    /// The route has no backend refs (a redirect route legitimately
+    /// proxies nothing).
+    None,
+    /// The pick landed on a ref whose backend is not registered, or no
+    /// ref is eligible for traffic (all weights zero) — the request is
+    /// answered with a synthesized 500.
+    Unresolved,
+    Picked(Arc<ActiveBackend>),
 }
 
 /// Borrow-struct carrying everything route resolution reads from the
@@ -553,7 +571,7 @@ fn resolve_http_route(
 
     // Backend and endpoint availability are enforced later, on the
     // proxy path — a redirect route legitimately has neither.
-    let backend = chosen.backends.first().map(|br| Arc::clone(&br.backend));
+    let backend = pick_backend_ref(&chosen.backends);
 
     Ok(ResolvedRoute {
         backend,
@@ -561,6 +579,33 @@ fn resolve_http_route(
         route_name: chosen.key.name.clone(),
         matched_path_prefix: matched_prefix(&chosen.matches, ctx.path).map(str::to_owned),
     })
+}
+
+/// Weighted pick across a route's backend refs. Each ref receives a
+/// traffic share proportional to its weight; a share that lands on a
+/// ref whose backend is not registered is `Unresolved` and answers
+/// 500. Weight-zero refs receive no traffic, so a route whose refs
+/// are all weight zero is `Unresolved` for every request.
+fn pick_backend_ref(backends: &[ActiveBackendRef]) -> BackendChoice {
+    if backends.is_empty() {
+        return BackendChoice::None;
+    }
+    let total: u64 = backends.iter().map(|br| u64::from(br.weight)).sum();
+    if total == 0 {
+        return BackendChoice::Unresolved;
+    }
+    let mut point = rand::rng().random_range(0..total);
+    for br in backends {
+        let w = u64::from(br.weight);
+        if point < w {
+            return match &br.backend {
+                Some(b) => BackendChoice::Picked(Arc::clone(b)),
+                None => BackendChoice::Unresolved,
+            };
+        }
+        point -= w;
+    }
+    unreachable!("point is below the summed weights");
 }
 
 /// The longest `PathPrefix` match on the route whose value is a
@@ -924,6 +969,8 @@ enum RouteResolveError {
     NoRoute,
     #[error("route has no backend refs")]
     NoBackend,
+    #[error("route backend ref does not resolve")]
+    BackendUnresolved,
 }
 
 fn synthesize_error(err: RouteResolveError) -> Response<ResponseBody> {
@@ -932,6 +979,9 @@ fn synthesize_error(err: RouteResolveError) -> Response<ResponseBody> {
         | RouteResolveError::NoListener
         | RouteResolveError::NoRoute => StatusCode::NOT_FOUND,
         RouteResolveError::NoBackend => StatusCode::SERVICE_UNAVAILABLE,
+        // An unresolvable backend ref is a server-side misconfiguration,
+        // distinct from "no route matched".
+        RouteResolveError::BackendUnresolved => StatusCode::INTERNAL_SERVER_ERROR,
     };
     synthesize_status(status)
 }
@@ -1805,5 +1855,59 @@ mod tests {
         assert_eq!(replace_prefix("/foo/", "/foo", "/xyz"), "/xyz/");
         assert_eq!(replace_prefix("/foo/bar", "/foo", "/"), "/bar");
         assert_eq!(replace_prefix("/foo", "/foo", "/"), "/");
+    }
+
+    // --- pick_backend_ref ---
+
+    fn backend_ref(name: &str, resolved: bool, weight: u32) -> ActiveBackendRef {
+        let key = gateway_state::BackendKey::new(name);
+        ActiveBackendRef {
+            key: key.clone(),
+            backend: resolved.then(|| {
+                Arc::new(ActiveBackend {
+                    key,
+                    endpoints: vec![],
+                    protocol: BackendProtocol::Http1,
+                })
+            }),
+            weight,
+        }
+    }
+
+    #[test]
+    fn pick_no_refs_is_none() {
+        assert!(matches!(pick_backend_ref(&[]), BackendChoice::None));
+    }
+
+    #[test]
+    fn pick_single_resolved_ref() {
+        let refs = [backend_ref("be", true, 1)];
+        assert!(matches!(
+            pick_backend_ref(&refs),
+            BackendChoice::Picked(b) if b.key.0 == "be"
+        ));
+    }
+
+    #[test]
+    fn pick_single_unresolved_ref() {
+        let refs = [backend_ref("ghost", false, 1)];
+        assert!(matches!(pick_backend_ref(&refs), BackendChoice::Unresolved));
+    }
+
+    #[test]
+    fn pick_all_zero_weights_is_unresolved() {
+        let refs = [backend_ref("be0", true, 0), backend_ref("be1", true, 0)];
+        assert!(matches!(pick_backend_ref(&refs), BackendChoice::Unresolved));
+    }
+
+    #[test]
+    fn pick_skips_zero_weight_refs() {
+        let refs = [backend_ref("ghost", false, 0), backend_ref("be", true, 1)];
+        for _ in 0..64 {
+            assert!(matches!(
+                pick_backend_ref(&refs),
+                BackendChoice::Picked(b) if b.key.0 == "be"
+            ));
+        }
     }
 }
