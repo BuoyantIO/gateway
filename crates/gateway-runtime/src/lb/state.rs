@@ -96,6 +96,7 @@ impl EndpointInfo {
     pub fn record_success(&self, dial_ms: f64) {
         let mut i = self.inner.lock();
         i.consecutive_failures = 0;
+        i.evicted_until = None;
         i.health.update(1.0);
         i.latency_ms.update(dial_ms);
     }
@@ -233,6 +234,17 @@ mod tests {
         // Two more failures should NOT evict (counter was reset).
         i.record_failure();
         i.record_failure();
+        assert!(!i.is_evicted(Instant::now()));
+    }
+
+    #[test]
+    fn record_success_clears_eviction() {
+        let i = info();
+        for _ in 0..3 {
+            i.record_failure();
+        }
+        assert!(i.is_evicted(Instant::now()));
+        i.record_success(10.0);
         assert!(!i.is_evicted(Instant::now()));
     }
 

@@ -26,8 +26,10 @@ pub struct Candidate<'a> {
     pub info: Arc<EndpointInfo>,
 }
 
-/// Endpoint picker. Implementations choose one candidate from a slice
-/// already filtered of evicted/non-viable entries by the runtime.
+/// Endpoint picker. Implementations choose one candidate from the
+/// slice the runtime built: the non-evicted endpoints, or — when
+/// every endpoint is evicted — the evicted ones as a fail-open
+/// fallback.
 pub trait Picker: Send + Sync + 'static {
     /// Pick one candidate. Returns `None` only when the slice is empty.
     fn pick<'a>(&self, candidates: &'a [Candidate<'a>]) -> Option<&'a Candidate<'a>>;
@@ -59,45 +61,131 @@ impl LoadBalancer {
     }
 
     /// Build candidates from `backend.endpoints` (looking up
-    /// `EndpointInfo` per endpoint and skipping evicted entries) and
-    /// ask the picker. Returns the chosen endpoint paired with its
-    /// runtime info, or `None` if no viable candidate exists.
+    /// `EndpointInfo` per endpoint) and ask the picker. Evicted
+    /// endpoints are excluded while at least one non-evicted sibling
+    /// exists; when every endpoint is evicted the picker runs over
+    /// the evicted set instead — attempting a dial against the
+    /// least-bad endpoint beats synthesizing an error, and a success
+    /// clears the eviction on the spot.
     ///
-    /// The caller decides what to do with `None`:
-    /// - TCP maps it to `ProxyError::NoViableEndpoint`.
-    /// - HTTP synthesizes a `503 Service Unavailable`.
-    ///
-    /// The "backend has zero endpoints" case is the caller's concern
-    /// — TCP differentiates it as `ProxyError::NoEndpoint`; HTTP
-    /// catches it during route resolution. Both paths therefore call
-    /// this only when at least one endpoint exists.
+    /// Returns `None` only when the backend has zero endpoints,
+    /// which config validation already rejects for static backends.
+    /// The HTTP caller maps `None` to a synthesized
+    /// `503 Service Unavailable`.
     pub fn pick_endpoint(
         &self,
         backend: &Arc<ActiveBackend>,
     ) -> Option<(Endpoint, Arc<EndpointInfo>)> {
         let now = Instant::now();
-        let candidates: Vec<Candidate<'_>> = backend
-            .endpoints
-            .iter()
-            .filter_map(|ep| {
-                let key = EndpointKey {
-                    backend: backend.key.clone(),
-                    endpoint: ep.name.clone(),
-                };
-                let info = self.endpoint_state.get_or_create(key);
-                if info.is_evicted(now) {
-                    tracing::debug!(
-                        endpoint = %ep.name,
-                        backend = %backend.key,
-                        "endpoint is evicted; skipping"
-                    );
-                    None
-                } else {
-                    Some(Candidate { endpoint: ep, info })
-                }
-            })
-            .collect();
-        let chosen = self.picker.pick(&candidates)?;
+        let mut viable: Vec<Candidate<'_>> = Vec::new();
+        let mut evicted: Vec<Candidate<'_>> = Vec::new();
+        for ep in &backend.endpoints {
+            let key = EndpointKey {
+                backend: backend.key.clone(),
+                endpoint: ep.name.clone(),
+            };
+            let info = self.endpoint_state.get_or_create(key);
+            if info.is_evicted(now) {
+                tracing::debug!(
+                    endpoint = %ep.name,
+                    backend = %backend.key,
+                    "endpoint is evicted; skipping"
+                );
+                evicted.push(Candidate { endpoint: ep, info });
+            } else {
+                viable.push(Candidate { endpoint: ep, info });
+            }
+        }
+        let candidates = if viable.is_empty() {
+            if !evicted.is_empty() {
+                tracing::debug!(
+                    backend = %backend.key,
+                    "all endpoints evicted; failing open over the evicted set"
+                );
+            }
+            &evicted
+        } else {
+            &viable
+        };
+        let chosen = self.picker.pick(candidates)?;
         Some((chosen.endpoint.clone(), Arc::clone(&chosen.info)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    use gateway_config::backend::BackendProtocol;
+    use gateway_state::BackendKey;
+
+    fn endpoint(name: &str, port: u16) -> Endpoint {
+        Endpoint {
+            name: name.into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+        }
+    }
+
+    fn backend(endpoints: Vec<Endpoint>) -> Arc<ActiveBackend> {
+        Arc::new(ActiveBackend {
+            key: BackendKey::new("be"),
+            endpoints,
+            protocol: BackendProtocol::Http1,
+        })
+    }
+
+    fn lb() -> LoadBalancer {
+        LoadBalancer::with_picker(
+            Arc::new(P2cEwma::default()),
+            EndpointStateConfig {
+                ewma_alpha: 0.5,
+                failure_threshold: 1,
+                eviction_duration: Duration::from_mins(1),
+            },
+        )
+    }
+
+    fn evict(lb: &LoadBalancer, backend: &Arc<ActiveBackend>, endpoint: &str) {
+        let info = lb.endpoint_state.get_or_create(EndpointKey {
+            backend: backend.key.clone(),
+            endpoint: endpoint.into(),
+        });
+        info.record_failure(); // threshold = 1 evicts immediately
+        assert!(info.is_evicted(Instant::now()));
+    }
+
+    #[test]
+    fn zero_endpoints_returns_none() {
+        let lb = lb();
+        assert!(lb.pick_endpoint(&backend(vec![])).is_none());
+    }
+
+    #[test]
+    fn all_evicted_fails_open() {
+        let lb = lb();
+        let be = backend(vec![endpoint("e0", 1), endpoint("e1", 2)]);
+        evict(&lb, &be, "e0");
+        evict(&lb, &be, "e1");
+        for _ in 0..100 {
+            assert!(
+                lb.pick_endpoint(&be).is_some(),
+                "all-evicted backend must still yield a pick"
+            );
+        }
+    }
+
+    #[test]
+    fn evicted_endpoint_excluded_while_healthy_sibling_exists() {
+        let lb = lb();
+        let be = backend(vec![endpoint("e0", 1), endpoint("e1", 2)]);
+        evict(&lb, &be, "e0");
+        for _ in 0..100 {
+            let (chosen, _) = lb.pick_endpoint(&be).unwrap();
+            assert_eq!(chosen.name, "e1", "evicted endpoint must not be picked");
+        }
     }
 }
