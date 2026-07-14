@@ -43,10 +43,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use tokio::sync::watch as tokio_watch;
 
 use crate::infra::{self, InfraPublisher};
-use crate::resolve::resolve;
 use crate::server::ServerState;
-use crate::status::{StatusWork, build_work};
-use crate::translator::{K8sState, translate_resolution};
+use crate::status::StatusWork;
+use crate::translator::K8sState;
+use crate::world::WorldCache;
 
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -102,47 +102,84 @@ pub async fn run(
     let mut gc_filter = EventFilter::generation_only();
     let mut gw_filter = EventFilter::generation_and_annotations();
     let mut hr_filter = EventFilter::generation_only();
+    let mut cache = WorldCache::new();
 
     loop {
-        let relevant = tokio::select! {
+        let action = tokio::select! {
             biased;
             () = &mut shutdown => break,
-            ev = gc_stream.next() => gc_filter.relevant("GatewayClass", ev),
-            ev = gw_stream.next() => gw_filter.relevant("Gateway", ev),
-            ev = hr_stream.next() => hr_filter.relevant("HTTPRoute", ev),
-            ev = svc_stream.next() => EventFilter::always("Service", ev),
-            ev = sec_stream.next() => EventFilter::always("Secret", ev),
+            ev = gc_stream.next() => Action::full_if(gc_filter.relevant("GatewayClass", ev)),
+            ev = gw_stream.next() => Action::full_if(gw_filter.relevant("Gateway", ev)),
+            ev = hr_stream.next() => hr_filter.route_action(ev),
+            ev = svc_stream.next() => Action::full_if(EventFilter::always("Service", ev)),
+            ev = sec_stream.next() => Action::full_if(EventFilter::always("Secret", ev)),
         };
-        if !relevant {
-            continue;
-        }
-
-        let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
-        let resolution = resolve(&k8s, &controller_name);
-        let world = translate_resolution(&resolution);
-        state.publish(&world);
-
-        // Desired status rides the same pass; the writer task on the
-        // other side of the channel owns the apiserver writes.
         let now = Time(k8s_openapi::jiff::Timestamp::now());
-        let _ = status_tx.send(build_work(&resolution, &now));
-
-        // Desired data-plane infra rides the same pass; the channel
-        // dedups so the writer only wakes on real changes.
-        if let Some(publisher) = &infra {
-            let set = infra::desired_set(&k8s, &controller_name, &publisher.config);
-            publisher.tx.send_if_modified(|current| {
-                if *current == set {
-                    false
-                } else {
-                    *current = set;
-                    true
+        match action {
+            Action::Skip => {}
+            // One route changed: resolve just that route against the
+            // cached state and send deltas. Routes never affect the
+            // desired infra, so that part is skipped.
+            Action::Route(route_id, route) => {
+                let (deltas, status) = cache.route_event(&route_id, route, &controller_name, &now);
+                for (gw_id, delta) in deltas {
+                    state.apply_delta(&gw_id, delta);
                 }
-            });
+                let _ = status_tx.send(status);
+            }
+            Action::FullPass => {
+                let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
+                let (world, status) = cache.full_pass(k8s, &controller_name, &now);
+                state.publish(world);
+
+                // The writer task on the other side of the channel
+                // owns the apiserver writes.
+                let _ = status_tx.send(status);
+
+                // The channel dedups, so the infra writer only wakes
+                // on real changes.
+                if let Some(publisher) = &infra {
+                    let set =
+                        infra::desired_set(cache.state(), &controller_name, &publisher.config);
+                    publisher.tx.send_if_modified(|current| {
+                        if *current == set {
+                            false
+                        } else {
+                            *current = set;
+                            true
+                        }
+                    });
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// What the loop does with one event.
+// The Route variant is large; there is exactly one Action alive at a
+// time, so boxing would only add an allocation to the hot path.
+#[allow(clippy::large_enum_variant)]
+enum Action {
+    Skip,
+    /// Recompute everything (non-route change, or a resync).
+    FullPass,
+    /// One route changed; `None` means it was deleted.
+    Route(crate::translator::RouteId, Option<HTTPRoute>),
+}
+
+impl Action {
+    fn full_if(relevant: bool) -> Self {
+        if relevant { Self::FullPass } else { Self::Skip }
+    }
+}
+
+fn route_id_of(route: &HTTPRoute) -> Option<crate::translator::RouteId> {
+    Some((
+        route.metadata.namespace.clone()?,
+        route.metadata.name.clone()?,
+    ))
 }
 
 /// Walk each reflector store once and clone the resources into a
@@ -261,6 +298,37 @@ impl EventFilter {
         match self.seen.insert(uid.to_string(), fingerprint.clone()) {
             Some(prev) => prev != fingerprint,
             None => true,
+        }
+    }
+
+    /// `HTTPRoute` events feed the incremental path: a relevant
+    /// `Apply` or `Delete` carries the route out so the loop can
+    /// resolve just that route. Resyncs and odd shapes (no
+    /// namespace/name) fall back to a full pass.
+    fn route_action(
+        &mut self,
+        ev: Option<Result<watcher::Event<HTTPRoute>, watcher::Error>>,
+    ) -> Action {
+        match ev {
+            Some(Ok(watcher::Event::Apply(route))) => {
+                if !self.apply(&route) {
+                    return Action::Skip;
+                }
+                match route_id_of(&route) {
+                    Some(id) => Action::Route(id, Some(route)),
+                    None => Action::FullPass,
+                }
+            }
+            Some(Ok(watcher::Event::Delete(route))) => {
+                if let Some(uid) = route.metadata.uid.as_deref() {
+                    self.seen.remove(uid);
+                }
+                match route_id_of(&route) {
+                    Some(id) => Action::Route(id, None),
+                    None => Action::FullPass,
+                }
+            }
+            other => Action::full_if(self.relevant("HTTPRoute", other)),
         }
     }
 

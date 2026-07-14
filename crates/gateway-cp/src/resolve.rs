@@ -180,6 +180,18 @@ pub(crate) fn collect_owned_classes<'a>(
 
 /// Resolve `state` into the attachment graph for `controller_name`.
 pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a> {
+    resolve_scoped(state, controller_name, None)
+}
+
+/// Like [`resolve`], but when `only_route` is set, route resolution
+/// runs for that single `(namespace, name)` route. Gateways, classes,
+/// listeners, and addresses resolve as usual. This is the incremental
+/// path: one route changed, so only its attachments need recomputing.
+pub fn resolve_scoped<'a>(
+    state: &'a K8sState,
+    controller_name: &str,
+    only_route: Option<(&str, &str)>,
+) -> Resolution<'a> {
     let gateway_classes: Vec<&GatewayClass> = state
         .gateway_classes
         .iter()
@@ -224,6 +236,11 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         ) else {
             continue;
         };
+        if let Some((ns, name)) = only_route
+            && (route_ns != ns || route_name != name)
+        {
+            continue;
+        }
         // (gateway idx, listener idx) pairs this route was already
         // counted on: several parentRefs of one route may select the
         // same listener, but `attachedRoutes` counts distinct routes.

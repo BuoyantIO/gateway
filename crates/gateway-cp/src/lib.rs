@@ -10,6 +10,7 @@ pub mod snapshot;
 pub mod status;
 pub mod translator;
 pub mod watch;
+pub mod world;
 
 pub use diff::diff;
 pub use server::{ConfigStreamService, ServerState};

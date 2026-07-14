@@ -55,6 +55,9 @@ pub fn translate(state: &K8sState, controller_name: &str) -> HashMap<GatewayId, 
     translate_resolution(&resolve(state, controller_name))
 }
 
+/// A route's identity: `(namespace, name)`.
+pub type RouteId = (String, String);
+
 /// Map an already-resolved graph onto per-Gateway snapshots. Pure
 /// emission: no decisions are made here.
 pub fn translate_resolution(resolution: &Resolution<'_>) -> HashMap<GatewayId, Snapshot> {
@@ -291,13 +294,13 @@ fn emit_backend(snapshot: &mut Snapshot, backend: &BackendResolution<'_>) {
     let BackendOutcome::Resolved { key, service } = &backend.outcome else {
         return;
     };
+    let Some(port) = backend.backend_ref.port else {
+        return;
+    };
     let bk = BackendKey::new(key);
     if snapshot.backends.contains_key(&bk) {
         return;
     }
-    let Some(port) = backend.backend_ref.port else {
-        return;
-    };
     let spec = service.spec.as_ref();
     let cluster_ip = spec
         .and_then(|s| s.cluster_ip.as_deref())

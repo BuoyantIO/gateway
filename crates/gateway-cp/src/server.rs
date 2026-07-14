@@ -28,6 +28,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
+
 use crate::diff::diff;
 use crate::snapshot::{GatewayId, Snapshot};
 
@@ -51,11 +53,12 @@ impl ServerState {
     /// against the previous world. Channels are created lazily for
     /// Gateways that didn't exist before. Sends to channels with no
     /// receivers are dropped silently.
-    pub fn publish(&self, next: &HashMap<GatewayId, Snapshot>) {
+    pub fn publish(&self, next: HashMap<GatewayId, Snapshot>) {
         let prev = {
             let mut world = self.world.write();
-            std::mem::replace(&mut *world, next.clone())
+            std::mem::replace(&mut *world, next)
         };
+        let next = self.world.read();
 
         let mut ids: HashSet<&GatewayId> = HashSet::new();
         ids.extend(prev.keys());
@@ -65,6 +68,7 @@ impl ServerState {
         for id in ids {
             let prev_slice = prev.get(id).unwrap_or(&empty);
             let next_slice = next.get(id).unwrap_or(&empty);
+            #[allow(clippy::needless_borrow)]
             let Some(batch) = diff(prev_slice, next_slice) else {
                 continue;
             };
@@ -73,6 +77,27 @@ impl ServerState {
             // bootstrap from `world` and catch up.
             let _ = sender.send(batch);
         }
+    }
+
+    /// Apply one delta to a Gateway's stored snapshot and broadcast
+    /// it. The incremental route path uses this instead of
+    /// [`ServerState::publish`]: the delta carries only route and
+    /// backend changes, so mutating the slice in place avoids
+    /// rebuilding and cloning the world.
+    ///
+    /// Bootstrap stays correct in either order: a DP that subscribes
+    /// around this call sees the delta, the updated bootstrap, or
+    /// both — and upserts/removes are idempotent by key.
+    pub fn apply_delta(&self, gw_id: &GatewayId, delta: pb::ConfigUpdate) {
+        if delta.upserts.is_empty() && delta.removes.is_empty() {
+            return;
+        }
+        {
+            let mut world = self.world.write();
+            let snap = world.entry(gw_id.clone()).or_default();
+            apply_delta_to(snap, &delta);
+        }
+        let _ = self.channel_for(gw_id).send(delta);
     }
 
     /// Subscribe to a Gateway's delta stream. Always called BEFORE
@@ -105,6 +130,44 @@ impl ServerState {
             .entry(gw_id.clone())
             .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
             .clone()
+    }
+}
+
+/// Fold a route-path delta into a snapshot. Only routes and backends
+/// appear on that path; a full publish handles the other kinds.
+/// Shared with the incremental-vs-full equivalence test.
+pub(crate) fn apply_delta_to(snap: &mut Snapshot, delta: &pb::ConfigUpdate) {
+    for up in &delta.upserts {
+        match &up.body {
+            Some(pb::upsert::Body::HttpRoute(r)) => {
+                if let Some(k) = &r.key {
+                    let key = RouteKey::new(
+                        ListenerKey::new(BindKey::new(&k.bind), &k.listener),
+                        &k.name,
+                    );
+                    snap.routes.insert(key, r.clone());
+                }
+            }
+            Some(pb::upsert::Body::Backend(b)) => {
+                snap.backends.insert(BackendKey::new(&b.name), b.clone());
+            }
+            _ => tracing::warn!("unexpected upsert kind in delta"),
+        }
+    }
+    for rm in &delta.removes {
+        match &rm.key {
+            Some(pb::remove::Key::HttpRoute(k)) => {
+                let key = RouteKey::new(
+                    ListenerKey::new(BindKey::new(&k.bind), &k.listener),
+                    &k.name,
+                );
+                snap.routes.remove(&key);
+            }
+            Some(pb::remove::Key::Backend(k)) => {
+                snap.backends.remove(&BackendKey::new(&k.name));
+            }
+            _ => tracing::warn!("unexpected remove kind in delta"),
+        }
     }
 }
 
@@ -386,7 +449,7 @@ mod tests {
             ("demo".to_string(), "api".to_string()),
             slice_with_every_entity(),
         );
-        state.publish(&next);
+        state.publish(next.clone());
 
         let update = state.bootstrap(&("demo".into(), "api".into()));
         assert!(update.removes.is_empty());
@@ -426,7 +489,7 @@ mod tests {
 
         let mut next = HashMap::new();
         next.insert(gw_id.clone(), slice_with_bind("b", 80));
-        state.publish(&next);
+        state.publish(next.clone());
 
         let delta = rx.recv().await.expect("delta received");
         assert_eq!(delta.upserts.len(), 1);
@@ -442,7 +505,7 @@ mod tests {
             slice_with_bind("b", 80),
         );
         // Should not panic even though nothing is subscribed.
-        state.publish(&next);
+        state.publish(next.clone());
     }
 
     #[tokio::test]
@@ -453,12 +516,12 @@ mod tests {
         // Publish a Gateway, then publish without it.
         let mut next = HashMap::new();
         next.insert(gw_id.clone(), slice_with_bind("b", 80));
-        state.publish(&next);
+        state.publish(next.clone());
 
         let mut rx = state.subscribe(&gw_id);
 
         // Empty world: Gateway disappeared.
-        state.publish(&HashMap::new());
+        state.publish(HashMap::new());
 
         let delta = rx.recv().await.expect("delta received");
         assert!(delta.upserts.is_empty());
@@ -472,13 +535,13 @@ mod tests {
 
         let mut first = HashMap::new();
         first.insert(gw_id.clone(), slice_with_bind("b", 80));
-        state.publish(&first);
+        state.publish(first.clone());
 
         let mut rx = state.subscribe(&gw_id);
 
         let mut second = HashMap::new();
         second.insert(gw_id.clone(), slice_with_bind("b", 81));
-        state.publish(&second);
+        state.publish(second.clone());
 
         let delta = rx.recv().await.expect("delta received");
         assert_eq!(delta.upserts.len(), 1);
@@ -533,7 +596,7 @@ mod tests {
         let mut rx = state.subscribe(&gw_id);
         let mut next = HashMap::new();
         next.insert(gw_id.clone(), slice_with_bind("b", 80));
-        state.publish(&next);
+        state.publish(next.clone());
 
         // bootstrap captures the new state...
         let bootstrap = state.bootstrap(&gw_id);
