@@ -983,3 +983,130 @@ async fn grpc_shaped_round_trip() {
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
 }
+
+// =================== unresolved backend refs ===================
+
+/// A rule whose backendRef names a backend that was never registered
+/// still matches and answers 500 — not 404 — and starts proxying the
+/// moment the backend registers, without any route re-apply.
+#[tokio::test]
+async fn route_with_unregistered_backend_returns_500() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener(
+                "l",
+                None,
+                vec![
+                    http_route("broken", "/missing", "ghost-be"),
+                    http_route("real", "/", "be"),
+                ],
+            )],
+        }],
+        backends: vec![static_backend("be", upstream_port)],
+        secrets: vec![],
+    };
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let (gw_handle, shutdown_tx) = spawn_gateway(store.clone());
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let base = format!("http://127.0.0.1:{bind_port}");
+
+    // The broken rule matches and answers 500; the sibling rule with a
+    // resolvable backend is unaffected.
+    let resp = client
+        .get(format!("{base}/missing").parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let resp = client
+        .get(format!("{base}/other").parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The backend appears: the same rule proxies with no route re-apply.
+    store.upsert_backend(static_backend("ghost-be", upstream_port));
+    let resp = client
+        .get(format!("{base}/missing").parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // And it goes back to 500 — not 404 — when the backend disappears.
+    store.remove_backend(&gateway_state::BackendKey::new("ghost-be"));
+    let resp = client
+        .get(format!("{base}/missing").parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// With weighted backendRefs where only some resolve, the traffic share
+/// of the unresolvable ref answers 500 while the rest proxies normally.
+#[tokio::test]
+async fn weighted_refs_split_between_resolved_and_missing() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let mut route = http_route("r", "/", "be");
+    route.backend_refs.push(BackendRef {
+        name: "ghost-be".into(),
+        weight: 1,
+    });
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![route])],
+        }],
+        backends: vec![static_backend("be", upstream_port)],
+        secrets: vec![],
+    };
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let mut oks = 0;
+    let mut errors = 0;
+    for _ in 0..64 {
+        let resp = client
+            .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+            .await
+            .unwrap();
+        match resp.status() {
+            StatusCode::OK => oks += 1,
+            StatusCode::INTERNAL_SERVER_ERROR => errors += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    // 64 fair coin flips: both outcomes appear (P(one-sided) ~ 1e-19).
+    assert!(oks > 0, "resolved ref received no traffic");
+    assert!(errors > 0, "unresolved ref received no traffic");
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
