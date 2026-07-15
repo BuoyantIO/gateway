@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{ObjectMeta, PostParams};
+use kube::api::{ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
@@ -588,6 +588,19 @@ pub async fn deploy_echo(
         .await
         .with_context(|| format!("creating echo service {name}"))?;
 
+    Ok(())
+}
+
+/// Scale an existing `Deployment` to `replicas`.
+///
+/// # Errors
+/// Returns an error if the patch call fails.
+pub async fn scale_deployment(client: &Client, ns: &str, name: &str, replicas: i32) -> Result<()> {
+    let patch = serde_json::json!({ "spec": { "replicas": replicas } });
+    Api::<Deployment>::namespaced(client.clone(), ns)
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|| format!("scaling deployment {name} to {replicas}"))?;
     Ok(())
 }
 

@@ -2,10 +2,12 @@
 //! `crates/gateway-runtime/tests/http_forward.rs::spawn_http_echo`.
 //!
 //! Replies 200 with body `"{method} {path}"`, reflects every
-//! `X-Test-*` request header as `X-Echo-*` on the response, and emits
-//! an `X-Server-Version` header naming the HTTP wire version it
-//! spoke. Uses `hyper_util::server::conn::auto::Builder` so HTTP/1.1
-//! and HTTP/2 (prior knowledge / h2c) both work.
+//! `X-Test-*` request header as `X-Echo-*` on the response, emits an
+//! `X-Server-Version` header naming the HTTP wire version it spoke,
+//! and an `X-Echo-Pod` header carrying `$HOSTNAME` (the pod name in
+//! Kubernetes) so tests can observe which replica served. Uses
+//! `hyper_util::server::conn::auto::Builder` so HTTP/1.1 and HTTP/2
+//! (prior knowledge / h2c) both work.
 
 use std::convert::Infallible;
 
@@ -28,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let bind = std::env::var("ECHO_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let pod: &'static str = std::env::var("HOSTNAME").unwrap_or_default().leak();
     let listener = TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "echo server listening");
 
@@ -35,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         let (stream, peer) = listener.accept().await?;
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let svc = service_fn(|req: Request<Incoming>| async move {
+            let svc = service_fn(move |req: Request<Incoming>| async move {
                 let method = req.method().to_string();
                 let path = req.uri().path().to_string();
                 let server_version = format!("{:?}", req.version());
@@ -51,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
                 let body_text = format!("{method} {path}");
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
-                    .header("x-server-version", server_version);
+                    .header("x-server-version", server_version)
+                    .header("x-echo-pod", pod);
                 for (k, v) in echoed {
                     builder = builder.header(k, v);
                 }

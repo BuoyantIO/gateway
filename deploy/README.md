@@ -12,7 +12,7 @@ deploy/
     ├── gatewayclass.yaml                    # GatewayClass with our controllerName
     ├── controlplane/
     │   ├── serviceaccount.yaml              # gateway-system namespace + SA
-    │   ├── clusterrole.yaml                 # watch on Gateway-API + Services
+    │   ├── clusterrole.yaml                 # watch on Gateway-API + Services + EndpointSlices
     │   ├── clusterrolebinding.yaml
     │   ├── deployment.yaml                  # replicas: 1
     │   └── service.yaml                     # headless :8443
@@ -88,5 +88,6 @@ prefix-match (it falls through to the PathPrefix instead).
   (from the provisioned Service) and PROGRAMMED, listener entries
   carry `attachedRoutes`, and the GatewayClass is marked `Accepted`.
   `HTTPRoute.status.parents` is not written yet.
-- The control plane reads `Service.spec.clusterIP` to resolve backend
-  endpoints. `EndpointSlice` watching and per-pod LB land later.
+- The control plane resolves backend endpoints from `EndpointSlice`s
+  (one endpoint per ready pod address); the data plane balances
+  across them per request. A Service with no ready pods answers 503.

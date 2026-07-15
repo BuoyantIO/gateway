@@ -24,6 +24,7 @@ use gateway_api::apis::standard::httproutes::{
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 
 use crate::resolve::{
     BackendOutcome, BackendResolution, GatewayResolution, ListenerOutcome, Resolution, RouteEdge,
@@ -46,6 +47,7 @@ pub struct K8sState {
     pub gateways: Vec<Gateway>,
     pub http_routes: Vec<HTTPRoute>,
     pub services: Vec<Service>,
+    pub endpoint_slices: Vec<EndpointSlice>,
     pub secrets: Vec<Secret>,
 }
 
@@ -282,13 +284,23 @@ fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> 
 /// Services emit nothing and the DP-side Store stashes dependent
 /// routes until the backend lands.
 ///
+/// The endpoint set is the per-pod inventory resolve derived from
+/// the Service's `EndpointSlice`s, already deduplicated and sorted.
+/// An empty set is emitted as-is: the backend exists but has no
+/// ready pods, and the DP answers 503 until one appears.
+///
 /// Protocol is derived from `Service.spec.ports[*].appProtocol` for
 /// the port matching `backendRef.port`. Port names are intentionally
 /// not inspected — the K8s API treats name as an operator-facing
 /// label only; `appProtocol` is the standard hint. See
 /// [`map_app_protocol`] for recognized values.
 fn emit_backend(snapshot: &mut Snapshot, backend: &BackendResolution<'_>) {
-    let BackendOutcome::Resolved { key, service } = &backend.outcome else {
+    let BackendOutcome::Resolved {
+        key,
+        service,
+        endpoints,
+    } = &backend.outcome
+    else {
         return;
     };
     let bk = BackendKey::new(key);
@@ -298,30 +310,27 @@ fn emit_backend(snapshot: &mut Snapshot, backend: &BackendResolution<'_>) {
     let Some(port) = backend.backend_ref.port else {
         return;
     };
-    let spec = service.spec.as_ref();
-    let cluster_ip = spec
-        .and_then(|s| s.cluster_ip.as_deref())
-        .unwrap_or_default();
-    let port_app_protocol = spec
+    let port_app_protocol = service
+        .spec
+        .as_ref()
         .and_then(|s| s.ports.as_deref())
         .unwrap_or(&[])
         .iter()
         .find(|p| p.port == port)
         .and_then(|p| p.app_protocol.as_deref());
     let protocol = map_app_protocol(port_app_protocol);
-    let (svc_ns, svc_name) = (
-        service.metadata.namespace.as_deref().unwrap_or_default(),
-        service.metadata.name.as_deref().unwrap_or_default(),
-    );
     snapshot.backends.insert(
         bk,
         pb::BackendUpsert {
             name: key.clone(),
-            endpoints: vec![pb::Endpoint {
-                name: format!("{svc_ns}/{svc_name}"),
-                address: cluster_ip.to_string(),
-                port: port.unsigned_abs(),
-            }],
+            endpoints: endpoints
+                .iter()
+                .map(|e| pb::Endpoint {
+                    name: e.name.clone(),
+                    address: e.address.clone(),
+                    port: u32::from(e.port),
+                })
+                .collect(),
             protocol: protocol as i32,
         },
     );
@@ -612,8 +621,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use k8s_openapi::ByteString;
-    use k8s_openapi::api::core::v1::ServiceSpec;
+    use k8s_openapi::api::core::v1::{ObjectReference, ServiceSpec};
+    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    use crate::diff::diff;
+    use crate::resolve::SERVICE_NAME_LABEL;
 
     const OURS: &str = "gateway.test/controller";
 
@@ -1028,6 +1041,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1092,6 +1106,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1140,6 +1155,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1185,6 +1201,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
 
@@ -1219,6 +1236,7 @@ mod tests {
                 ],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1262,6 +1280,7 @@ mod tests {
                 }],
             )],
             services: vec![service("other-ns", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1291,6 +1310,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("None"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1317,6 +1337,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1324,6 +1345,123 @@ mod tests {
         assert!(s.backends.is_empty());
         // Route still emitted; the BackendRef carries the unresolved name.
         assert_eq!(s.routes.len(), 1);
+    }
+
+    fn endpoint_slice(name: &str, service: &str, pods: &[(&str, &str)]) -> EndpointSlice {
+        EndpointSlice {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some(name.into()),
+                labels: Some(
+                    [(SERVICE_NAME_LABEL.to_string(), service.to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            address_type: "IPv4".into(),
+            endpoints: pods
+                .iter()
+                .map(|(address, pod)| Endpoint {
+                    addresses: vec![(*address).to_string()],
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        serving: Some(true),
+                        ..Default::default()
+                    }),
+                    target_ref: Some(ObjectReference {
+                        kind: Some("Pod".into()),
+                        name: Some((*pod).to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            ports: Some(vec![EndpointPort {
+                port: Some(8080),
+                ..Default::default()
+            }]),
+        }
+    }
+
+    fn per_pod_state(endpoint_slices: Vec<EndpointSlice>) -> K8sState {
+        K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices,
+            secrets: vec![],
+        }
+    }
+
+    #[test]
+    fn backend_emits_one_endpoint_per_ready_pod() {
+        let state = per_pod_state(vec![
+            endpoint_slice(
+                "svc-1",
+                "svc",
+                &[("10.1.0.2", "pod-b"), ("10.1.0.1", "pod-a")],
+            ),
+            endpoint_slice("svc-2", "svc", &[("10.1.0.3", "pod-c")]),
+        ]);
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let backend = s.backends.get(&BackendKey::new("demo/svc:8080")).unwrap();
+        let endpoints: Vec<(&str, &str, u32)> = backend
+            .endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), e.address.as_str(), e.port))
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("pod-a", "10.1.0.1", 8080),
+                ("pod-b", "10.1.0.2", 8080),
+                ("pod-c", "10.1.0.3", 8080),
+            ],
+            "endpoint set is the sorted union across slices"
+        );
+    }
+
+    #[test]
+    fn backend_with_no_slices_emits_empty_endpoints() {
+        // The backend upsert still goes out: the Service exists but
+        // has no ready pods, and the DP answers 503 for it — distinct
+        // from a missing Service (no upsert, 500).
+        let state = per_pod_state(vec![]);
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let backend = s.backends.get(&BackendKey::new("demo/svc:8080")).unwrap();
+        assert!(backend.endpoints.is_empty());
+    }
+
+    #[test]
+    fn translation_converges_regardless_of_slice_order() {
+        let a = endpoint_slice(
+            "svc-1",
+            "svc",
+            &[("10.1.0.1", "pod-a"), ("10.1.0.2", "pod-b")],
+        );
+        let b = endpoint_slice("svc-2", "svc", &[("10.1.0.3", "pod-c")]);
+        let forward = translate(&per_pod_state(vec![a.clone(), b.clone()]), OURS);
+        let reversed = translate(&per_pod_state(vec![b, a]), OURS);
+
+        let id = ("demo".to_string(), "api".to_string());
+        assert!(
+            diff(forward.get(&id).unwrap(), reversed.get(&id).unwrap()).is_none(),
+            "same slice set in different arrival order must diff to no-op"
+        );
     }
 
     #[test]
@@ -1347,6 +1485,7 @@ mod tests {
                 )],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1376,6 +1515,7 @@ mod tests {
                 )],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1567,6 +1707,7 @@ mod tests {
                 vec!["a.example.com".into(), "b.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1603,6 +1744,7 @@ mod tests {
                 vec!["other.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1632,6 +1774,7 @@ mod tests {
                 vec![rule(Some("/"), vec![backend_ref("svc", 8080)], vec![])],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1662,6 +1805,7 @@ mod tests {
                 vec!["*.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1702,6 +1846,7 @@ mod tests {
                 }],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1749,6 +1894,7 @@ mod tests {
                 }],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -1848,6 +1994,7 @@ mod tests {
                 vec![route_with_match(m)],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         }
     }
@@ -1985,6 +2132,7 @@ mod tests {
                 Some("10.0.0.1"),
                 &[(port, app_protocol)],
             )],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -2053,6 +2201,7 @@ mod tests {
                     &[("", "foo")],
                 )],
             )],
+            endpoint_slices: vec![],
             secrets: vec![tls_secret("demo", "foo", "CERTPEM", "KEYPEM")],
             ..Default::default()
         };
@@ -2083,6 +2232,7 @@ mod tests {
                     &[("", "foo")],
                 )],
             )],
+            endpoint_slices: vec![],
             secrets: vec![
                 tls_secret("demo", "foo", "CERTPEM", "KEYPEM"),
                 tls_secret("demo", "bar", "OTHER", "OTHER"),
@@ -2113,6 +2263,7 @@ mod tests {
                     &[("other", "foo")],
                 )],
             )],
+            endpoint_slices: vec![],
             secrets: vec![tls_secret("other", "foo", "CERTPEM", "KEYPEM")],
             ..Default::default()
         };
@@ -2163,6 +2314,7 @@ mod tests {
                     &[("", "foo")],
                 )],
             )],
+            endpoint_slices: vec![],
             secrets: vec![tls_secret("demo", "foo", "CERT", "KEY")],
             ..Default::default()
         };
@@ -2196,6 +2348,7 @@ mod tests {
                     https_listener("secure", 8443, Some("b.example.com"), &[("", "foo")]),
                 ],
             )],
+            endpoint_slices: vec![],
             secrets: vec![tls_secret("demo", "foo", "CERT", "KEY")],
             ..Default::default()
         };
@@ -2319,6 +2472,7 @@ mod tests {
                 Some("10.0.0.1"),
                 &[(8080, Some("grpc"))],
             )],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
@@ -2355,6 +2509,7 @@ mod tests {
                 vec!["app.example.com".into()],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
             secrets: vec![],
         };
         let out = translate(&state, OURS);
