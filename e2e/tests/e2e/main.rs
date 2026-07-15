@@ -5,6 +5,7 @@
 //! thread count.
 
 mod backend_protocol;
+mod endpoints;
 mod filters;
 mod matches;
 mod provisioner;

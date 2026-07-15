@@ -1,11 +1,12 @@
 //! kube watch loop.
 //!
-//! Five `kube_runtime::reflector` instances keep an in-memory view of
-//! `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`, and
-//! `core/v1 Secret` (filtered to `type: kubernetes.io/tls`). A single
-//! `tokio::select!` over the watcher streams drives the loop: each
-//! relevant event triggers one pass (resolve, translate, publish,
-//! status, infra).
+//! Six `kube_runtime::reflector` instances keep an in-memory view of
+//! `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`,
+//! `discovery/v1 EndpointSlice` (filtered to slices carrying the
+//! `kubernetes.io/service-name` label), and `core/v1 Secret`
+//! (filtered to `type: kubernetes.io/tls`). A single `tokio::select!`
+//! over the watcher streams drives the loop: each relevant event
+//! triggers one pass (resolve, translate, publish, status, infra).
 //!
 //! Not every event is relevant. A status-only write does not bump
 //! `metadata.generation` and changes nothing the pass reads, so it is
@@ -18,8 +19,10 @@
 //! - `GatewayClass`, `HTTPRoute`: skip unless the generation changed.
 //! - `Gateway`: skip unless the generation or the annotations changed
 //!   (the provisioner reads the self-managed opt-out annotation).
-//! - `Service`, `Secret`: never skipped. Service status carries the
-//!   `LoadBalancer` address; Secret data has no generation.
+//! - `Service`, `Secret`, `EndpointSlice`: never skipped. Service
+//!   status carries the `LoadBalancer` address; Secret data has no
+//!   generation; every `EndpointSlice` write is an endpoint-set
+//!   change.
 //!
 //! A watcher resync replays every object; the replay runs one pass at
 //! the end (`InitDone`) instead of one per object.
@@ -34,6 +37,7 @@ use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::HTTPRoute;
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::Api;
 use kube::runtime::reflector::{self, Store as ReflectorStore};
 use kube::runtime::watcher::{self, Config};
@@ -43,7 +47,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use tokio::sync::watch as tokio_watch;
 
 use crate::infra::{self, InfraPublisher};
-use crate::resolve::resolve;
+use crate::resolve::{SERVICE_NAME_LABEL, resolve};
 use crate::server::ServerState;
 use crate::status::{StatusWork, build_work};
 use crate::translator::{K8sState, translate_resolution};
@@ -54,7 +58,7 @@ pub enum WatchError {
     Kube(#[from] kube::Error),
 }
 
-/// Run the watch loop until `shutdown` resolves. Sets up five
+/// Run the watch loop until `shutdown` resolves. Sets up six
 /// reflectors against the cluster `client` and drives them under one
 /// `select!`.
 ///
@@ -93,6 +97,12 @@ pub async fn run(
     let mut svc_stream =
         reflector::reflector(svc_writer, watcher::watcher(svc_api, Config::default())).boxed();
 
+    let (es_store, es_writer) = reflector::store::<EndpointSlice>();
+    let es_api: Api<EndpointSlice> = Api::all(client.clone());
+    let es_config = Config::default().labels(SERVICE_NAME_LABEL);
+    let mut es_stream =
+        reflector::reflector(es_writer, watcher::watcher(es_api, es_config)).boxed();
+
     let (sec_store, sec_writer) = reflector::store::<Secret>();
     let sec_api: Api<Secret> = Api::all(client);
     let sec_config = Config::default().fields("type=kubernetes.io/tls");
@@ -111,13 +121,16 @@ pub async fn run(
             ev = gw_stream.next() => gw_filter.relevant("Gateway", ev),
             ev = hr_stream.next() => hr_filter.relevant("HTTPRoute", ev),
             ev = svc_stream.next() => EventFilter::always("Service", ev),
+            ev = es_stream.next() => EventFilter::always("EndpointSlice", ev),
             ev = sec_stream.next() => EventFilter::always("Secret", ev),
         };
         if !relevant {
             continue;
         }
 
-        let k8s = collect_state(&gc_store, &gw_store, &hr_store, &svc_store, &sec_store);
+        let k8s = collect_state(
+            &gc_store, &gw_store, &hr_store, &svc_store, &es_store, &sec_store,
+        );
         let resolution = resolve(&k8s, &controller_name);
         let world = translate_resolution(&resolution);
         state.publish(&world);
@@ -152,6 +165,7 @@ fn collect_state(
     gw: &ReflectorStore<Gateway>,
     hr: &ReflectorStore<HTTPRoute>,
     svc: &ReflectorStore<Service>,
+    es: &ReflectorStore<EndpointSlice>,
     sec: &ReflectorStore<Secret>,
 ) -> K8sState {
     K8sState {
@@ -159,6 +173,7 @@ fn collect_state(
         gateways: gw.state().iter().map(|a| (**a).clone()).collect(),
         http_routes: hr.state().iter().map(|a| (**a).clone()).collect(),
         services: svc.state().iter().map(|a| (**a).clone()).collect(),
+        endpoint_slices: es.state().iter().map(|a| (**a).clone()).collect(),
         secrets: sec.state().iter().map(|a| (**a).clone()).collect(),
     }
 }

@@ -13,5 +13,5 @@ pub use cluster::{Scope, kube_client};
 pub use drive::{Driver, wait_until_redirected, wait_until_routed, wait_until_routed_tls};
 pub use fixtures::{
     HttpRouteBuilder, deploy_echo, deploy_tls_secret, gateway, gateway_address, gateway_https,
-    http_route,
+    http_route, scale_deployment,
 };

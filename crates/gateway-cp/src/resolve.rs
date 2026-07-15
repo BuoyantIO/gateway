@@ -25,11 +25,15 @@ use gateway_api::apis::standard::httproutes::{
 };
 use gateway_cp_proto::v1 as pb;
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 
 use crate::infra::desired::object_name;
 use crate::infra::{GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE};
 use crate::snapshot::GatewayId;
 use crate::translator::K8sState;
+
+/// The well-known `EndpointSlice` label naming the owning Service.
+pub(crate) const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
 /// The resolved world for one pass: every owned Gateway with its
 /// classified listeners and addresses, and every (route x parentRef)
@@ -149,18 +153,41 @@ pub struct BackendResolution<'a> {
 }
 
 pub enum BackendOutcome<'a> {
-    /// Service present with a usable `ClusterIP`; an upsert is emitted.
-    Resolved { key: String, service: &'a Service },
+    /// Service present with a usable `ClusterIP`; an upsert is
+    /// emitted carrying the per-pod endpoints derived from the
+    /// Service's `EndpointSlice`s. `endpoints` may be empty (no
+    /// ready pods): the upsert still goes out and the DP answers
+    /// 503 until pods become ready.
+    Resolved {
+        key: String,
+        service: &'a Service,
+        endpoints: Vec<ResolvedEndpoint>,
+    },
     /// Referenced Service does not exist; the ref is still emitted on
     /// the route and the DP stashes it until the backend lands.
     MissingService { key: String },
     /// Service exists but is headless / has no assigned `ClusterIP`
-    /// (or no spec). Same wire behavior as missing.
+    /// (or no spec). Same wire behavior as missing. Headless
+    /// Services could resolve through their `EndpointSlice`s too;
+    /// that is deliberately not done yet.
     Headless { key: String },
     /// Cross-namespace without a `ReferenceGrant`: dropped entirely.
     CrossNamespace,
     /// backendRef without a port: dropped entirely.
     NoPort,
+}
+
+/// One usable pod address for a backend, derived from the Service's
+/// `EndpointSlice`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    /// Stable per pod: the targetRef name when it is a Pod, else the
+    /// address. Becomes `pb::Endpoint.name` and therefore the DP's
+    /// per-endpoint state key, so health and latency history track a
+    /// pod across `EndpointSlice` updates.
+    pub name: String,
+    pub address: String,
+    pub port: u16,
 }
 
 /// Names of the `GatewayClass`es whose `controllerName` is ours.
@@ -189,6 +216,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
 
     let services_by_id = index_by_id(&state.services, |s| &s.metadata);
     let secrets_by_id = index_by_id(&state.secrets, |s| &s.metadata);
+    let slices_by_service = index_slices(&state.endpoint_slices);
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
     for gw in &state.gateways {
@@ -242,6 +270,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
                 gw_idx.map(|i| (i, &mut gateways[i])),
                 &mut counted,
                 &services_by_id,
+                &slices_by_service,
             ));
         }
     }
@@ -394,6 +423,7 @@ fn resolve_cert_refs<'a>(
 /// accepted listeners, then — when the attachment is Accepted —
 /// count the route once per selected listener (`counted` carries the
 /// per-route memory across this route's parentRefs).
+#[allow(clippy::too_many_arguments)]
 fn resolve_route_parent<'a>(
     hr: &'a HTTPRoute,
     route_ns: &'a str,
@@ -402,8 +432,9 @@ fn resolve_route_parent<'a>(
     gateway: Option<(usize, &mut GatewayResolution<'a>)>,
     counted: &mut std::collections::HashSet<(usize, usize)>,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
+    slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
 ) -> RouteResolution<'a> {
-    let rule_backends = resolve_rule_backends(hr, route_ns, services_by_id);
+    let rule_backends = resolve_rule_backends(hr, route_ns, services_by_id, slices_by_service);
 
     let Some((gw_idx, gateway)) = gateway else {
         return RouteResolution {
@@ -488,6 +519,7 @@ fn resolve_rule_backends<'a>(
     hr: &'a HTTPRoute,
     route_ns: &str,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
+    slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
 ) -> Vec<Vec<BackendResolution<'a>>> {
     hr.spec
         .rules
@@ -501,7 +533,7 @@ fn resolve_rule_backends<'a>(
                 .iter()
                 .map(|br| BackendResolution {
                     backend_ref: br,
-                    outcome: resolve_backend(br, route_ns, services_by_id),
+                    outcome: resolve_backend(br, route_ns, services_by_id, slices_by_service),
                 })
                 .collect()
         })
@@ -512,6 +544,7 @@ fn resolve_backend<'a>(
     br: &HttpRouteRulesBackendRefs,
     route_ns: &str,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
+    slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
 ) -> BackendOutcome<'a> {
     let Some(port) = br.port else {
         return BackendOutcome::NoPort;
@@ -533,11 +566,122 @@ fn resolve_backend<'a>(
         .as_ref()
         .and_then(|s| s.cluster_ip.as_deref())
         .is_some_and(|ip| !ip.is_empty() && ip != "None");
-    if usable_ip {
-        BackendOutcome::Resolved { key, service }
-    } else {
-        BackendOutcome::Headless { key }
+    if !usable_ip {
+        return BackendOutcome::Headless { key };
     }
+    let slices = slices_by_service
+        .get(&(backend_ns, br.name.as_str()))
+        .map_or(&[][..], Vec::as_slice);
+    BackendOutcome::Resolved {
+        key,
+        service,
+        endpoints: endpoints_from_slices(service, port, slices),
+    }
+}
+
+/// Index `EndpointSlice`s by the Service they belong to, read from
+/// the `kubernetes.io/service-name` label. Unlabeled slices are
+/// skipped (the slice controller always sets the label; anything
+/// else is not Service-owned).
+fn index_slices(slices: &[EndpointSlice]) -> HashMap<(&str, &str), Vec<&EndpointSlice>> {
+    let mut index: HashMap<(&str, &str), Vec<&EndpointSlice>> = HashMap::new();
+    for slice in slices {
+        let Some(ns) = slice.metadata.namespace.as_deref() else {
+            continue;
+        };
+        let Some(service) = slice
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(SERVICE_NAME_LABEL))
+        else {
+            continue;
+        };
+        index.entry((ns, service)).or_default().push(slice);
+    }
+    index
+}
+
+/// Derive the usable per-pod endpoints for one Service port from its
+/// `EndpointSlice`s: one endpoint per ready address, at the slice
+/// port whose name matches the service port's name.
+///
+/// The result is a pure function of the slice *set* — accumulation
+/// is keyed by endpoint name with a deterministic merge, and the
+/// output is sorted — so translation converges to the same snapshot
+/// regardless of slice arrival order and the diff never sees a
+/// same-set reorder.
+fn endpoints_from_slices(
+    service: &Service,
+    service_port: i32,
+    slices: &[&EndpointSlice],
+) -> Vec<ResolvedEndpoint> {
+    // The slice port carries the *service port's name*, not its
+    // number. A Service with a single unnamed port yields slices
+    // with unnamed ports; no matching ServicePort means no slice
+    // port can match either way.
+    let port_name = service
+        .spec
+        .as_ref()
+        .and_then(|s| s.ports.as_deref())
+        .unwrap_or(&[])
+        .iter()
+        .find(|p| p.port == service_port)
+        .and_then(|p| p.name.as_deref())
+        .unwrap_or("");
+
+    let mut out: std::collections::BTreeMap<String, ResolvedEndpoint> =
+        std::collections::BTreeMap::new();
+    for slice in slices {
+        if slice.address_type != "IPv4" {
+            continue;
+        }
+        let Some(target_port) = slice
+            .ports
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|p| p.name.as_deref().unwrap_or("") == port_name)
+            .and_then(|p| p.port)
+            .and_then(|p| u16::try_from(p).ok())
+        else {
+            continue;
+        };
+        for endpoint in &slice.endpoints {
+            let usable = endpoint
+                .conditions
+                .as_ref()
+                .is_none_or(|c| c.ready != Some(false) && c.serving != Some(false));
+            if !usable {
+                continue;
+            }
+            let pod_name = endpoint
+                .target_ref
+                .as_ref()
+                .filter(|r| r.kind.as_deref() == Some("Pod"))
+                .and_then(|r| r.name.as_deref());
+            for address in &endpoint.addresses {
+                let candidate = ResolvedEndpoint {
+                    name: pod_name.unwrap_or(address).to_string(),
+                    address: address.clone(),
+                    port: target_port,
+                };
+                // Same name in two slices (rebalancing in flight):
+                // keep the smaller (address, port) so the winner
+                // doesn't depend on iteration order.
+                out.entry(candidate.name.clone())
+                    .and_modify(|existing| {
+                        if (candidate.address.as_str(), candidate.port)
+                            < (existing.address.as_str(), existing.port)
+                        {
+                            *existing = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+    }
+    out.into_values().collect()
 }
 
 /// The address(es) a Gateway is reachable at, read from the
@@ -710,8 +854,10 @@ mod tests {
     };
     use gateway_api::apis::standard::httproutes::{HttpRouteRules, HttpRouteSpec};
     use k8s_openapi::api::core::v1::{
-        LoadBalancerIngress, LoadBalancerStatus, ServiceSpec, ServiceStatus,
+        LoadBalancerIngress, LoadBalancerStatus, ObjectReference, ServicePort, ServiceSpec,
+        ServiceStatus,
     };
+    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
     const OURS: &str = "gateway.buoyant.io/controller";
@@ -832,6 +978,71 @@ mod tests {
                 ..Default::default()
             }),
             status: None,
+        }
+    }
+
+    fn service_with_port(ns: &str, name: &str, port: i32, port_name: Option<&str>) -> Service {
+        let mut svc = service(ns, name, Some("10.0.0.1"));
+        svc.spec.as_mut().unwrap().ports = Some(vec![ServicePort {
+            name: port_name.map(String::from),
+            port,
+            ..Default::default()
+        }]);
+        svc
+    }
+
+    fn endpoint_slice(
+        ns: &str,
+        name: &str,
+        service: &str,
+        ports: &[(Option<&str>, i32)],
+        endpoints: Vec<Endpoint>,
+    ) -> EndpointSlice {
+        EndpointSlice {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                labels: Some(
+                    [(SERVICE_NAME_LABEL.to_string(), service.to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            address_type: "IPv4".into(),
+            endpoints,
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|(name, port)| EndpointPort {
+                        name: name.map(String::from),
+                        port: Some(*port),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn slice_endpoint(
+        address: &str,
+        pod: Option<&str>,
+        ready: Option<bool>,
+        serving: Option<bool>,
+    ) -> Endpoint {
+        Endpoint {
+            addresses: vec![address.into()],
+            conditions: Some(EndpointConditions {
+                ready,
+                serving,
+                ..Default::default()
+            }),
+            target_ref: pod.map(|p| ObjectReference {
+                kind: Some("Pod".into()),
+                name: Some(p.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -1100,7 +1311,8 @@ mod tests {
         let outcomes = &r.routes[0].rule_backends[0];
         assert!(matches!(
             &outcomes[0].outcome,
-            BackendOutcome::Resolved { key, .. } if key == "demo/ok:8080"
+            BackendOutcome::Resolved { key, endpoints, .. }
+                if key == "demo/ok:8080" && endpoints.is_empty()
         ));
         assert!(matches!(
             &outcomes[1].outcome,
@@ -1115,6 +1327,280 @@ mod tests {
             BackendOutcome::CrossNamespace
         ));
         assert!(matches!(&outcomes[4].outcome, BackendOutcome::NoPort));
+    }
+
+    // ----- per-pod endpoints -----
+
+    fn ready(address: &str, pod: &str) -> Endpoint {
+        slice_endpoint(address, Some(pod), Some(true), Some(true))
+    }
+
+    /// State with one gateway, one route to `svc:8080`, and the given
+    /// Service + slices; returns the endpoints of the route's only
+    /// backend.
+    fn resolve_endpoints(svc: Service, slices: Vec<EndpointSlice>) -> Vec<ResolvedEndpoint> {
+        let mut s = state(
+            vec![gw("demo", "gw", "zd", vec![http_listener("h", 80, None)])],
+            vec![route(
+                "demo",
+                "r",
+                vec![parent("gw", None)],
+                None,
+                vec![backend_ref("svc", None, Some(8080))],
+            )],
+        );
+        s.services = vec![svc];
+        s.endpoint_slices = slices;
+        let r = resolve(&s, OURS);
+        match &r.routes[0].rule_backends[0][0].outcome {
+            BackendOutcome::Resolved { endpoints, .. } => endpoints.clone(),
+            _ => panic!("expected Resolved"),
+        }
+    }
+
+    #[test]
+    fn resolved_backend_unions_endpoints_across_slices() {
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, None),
+            vec![
+                endpoint_slice(
+                    "demo",
+                    "svc-1",
+                    "svc",
+                    &[(None, 8080)],
+                    vec![ready("10.1.0.1", "pod-a"), ready("10.1.0.2", "pod-b")],
+                ),
+                endpoint_slice(
+                    "demo",
+                    "svc-2",
+                    "svc",
+                    &[(None, 8080)],
+                    vec![ready("10.1.0.3", "pod-c")],
+                ),
+            ],
+        );
+        assert_eq!(
+            endpoints,
+            vec![
+                ResolvedEndpoint {
+                    name: "pod-a".into(),
+                    address: "10.1.0.1".into(),
+                    port: 8080,
+                },
+                ResolvedEndpoint {
+                    name: "pod-b".into(),
+                    address: "10.1.0.2".into(),
+                    port: 8080,
+                },
+                ResolvedEndpoint {
+                    name: "pod-c".into(),
+                    address: "10.1.0.3".into(),
+                    port: 8080,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn endpoint_derivation_is_slice_order_independent() {
+        let svc = service_with_port("demo", "svc", 8080, None);
+        let a = endpoint_slice(
+            "demo",
+            "svc-1",
+            "svc",
+            &[(None, 8080)],
+            vec![ready("10.1.0.2", "pod-b"), ready("10.1.0.1", "pod-a")],
+        );
+        let b = endpoint_slice(
+            "demo",
+            "svc-2",
+            "svc",
+            &[(None, 8080)],
+            vec![ready("10.1.0.3", "pod-c")],
+        );
+        assert_eq!(
+            endpoints_from_slices(&svc, 8080, &[&a, &b]),
+            endpoints_from_slices(&svc, 8080, &[&b, &a]),
+        );
+    }
+
+    #[test]
+    fn duplicate_pod_across_slices_dedupes_deterministically() {
+        // The same pod in two slices mid-rebalance: one endpoint
+        // survives, and which one doesn't depend on slice order.
+        let svc = service_with_port("demo", "svc", 8080, None);
+        let a = endpoint_slice(
+            "demo",
+            "svc-1",
+            "svc",
+            &[(None, 8080)],
+            vec![ready("10.1.0.2", "pod-a")],
+        );
+        let b = endpoint_slice(
+            "demo",
+            "svc-2",
+            "svc",
+            &[(None, 8080)],
+            vec![ready("10.1.0.1", "pod-a")],
+        );
+        let forward = endpoints_from_slices(&svc, 8080, &[&a, &b]);
+        assert_eq!(forward, endpoints_from_slices(&svc, 8080, &[&b, &a]));
+        assert_eq!(
+            forward,
+            vec![ResolvedEndpoint {
+                name: "pod-a".into(),
+                address: "10.1.0.1".into(),
+                port: 8080,
+            }],
+        );
+    }
+
+    #[test]
+    fn unready_and_unserving_endpoints_are_filtered() {
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, None),
+            vec![endpoint_slice(
+                "demo",
+                "svc-1",
+                "svc",
+                &[(None, 8080)],
+                vec![
+                    slice_endpoint("10.1.0.1", Some("pod-a"), Some(false), Some(true)),
+                    slice_endpoint("10.1.0.2", Some("pod-b"), Some(true), Some(false)),
+                    // Absent conditions count as ready (K8s semantics).
+                    slice_endpoint("10.1.0.3", Some("pod-c"), None, None),
+                    ready("10.1.0.4", "pod-d"),
+                ],
+            )],
+        );
+        let names: Vec<&str> = endpoints.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["pod-c", "pod-d"]);
+    }
+
+    #[test]
+    fn named_port_resolves_through_slice_port_name() {
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, Some("http")),
+            vec![endpoint_slice(
+                "demo",
+                "svc-1",
+                "svc",
+                &[(Some("metrics"), 9999), (Some("http"), 9090)],
+                vec![ready("10.1.0.1", "pod-a")],
+            )],
+        );
+        assert_eq!(
+            endpoints,
+            vec![ResolvedEndpoint {
+                name: "pod-a".into(),
+                address: "10.1.0.1".into(),
+                port: 9090,
+            }],
+        );
+    }
+
+    #[test]
+    fn slice_without_matching_port_contributes_nothing() {
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, Some("http")),
+            vec![endpoint_slice(
+                "demo",
+                "svc-1",
+                "svc",
+                &[(Some("grpc"), 9090)],
+                vec![ready("10.1.0.1", "pod-a")],
+            )],
+        );
+        assert!(endpoints.is_empty());
+    }
+
+    #[test]
+    fn non_ipv4_slices_are_ignored() {
+        let mut slice = endpoint_slice(
+            "demo",
+            "svc-1",
+            "svc",
+            &[(None, 8080)],
+            vec![ready("fd00::1", "pod-a")],
+        );
+        slice.address_type = "IPv6".into();
+        let endpoints =
+            resolve_endpoints(service_with_port("demo", "svc", 8080, None), vec![slice]);
+        assert!(endpoints.is_empty());
+    }
+
+    #[test]
+    fn zero_ready_endpoints_still_resolve() {
+        // The backend exists with no usable pods: still Resolved (the
+        // upsert goes out empty and the DP answers 503), never
+        // conflated with a missing Service.
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, None),
+            vec![endpoint_slice(
+                "demo",
+                "svc-1",
+                "svc",
+                &[(None, 8080)],
+                vec![slice_endpoint(
+                    "10.1.0.1",
+                    Some("pod-a"),
+                    Some(false),
+                    Some(false),
+                )],
+            )],
+        );
+        assert!(endpoints.is_empty());
+    }
+
+    #[test]
+    fn endpoint_name_prefers_pod_target_ref() {
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, None),
+            vec![endpoint_slice(
+                "demo",
+                "svc-1",
+                "svc",
+                &[(None, 8080)],
+                vec![
+                    ready("10.1.0.1", "pod-a"),
+                    slice_endpoint("10.1.0.2", None, Some(true), Some(true)),
+                ],
+            )],
+        );
+        let names: Vec<&str> = endpoints.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["10.1.0.2", "pod-a"]);
+    }
+
+    #[test]
+    fn slices_from_other_services_and_namespaces_are_excluded() {
+        let endpoints = resolve_endpoints(
+            service_with_port("demo", "svc", 8080, None),
+            vec![
+                endpoint_slice(
+                    "demo",
+                    "other-1",
+                    "other",
+                    &[(None, 8080)],
+                    vec![ready("10.9.0.1", "pod-x")],
+                ),
+                endpoint_slice(
+                    "elsewhere",
+                    "svc-1",
+                    "svc",
+                    &[(None, 8080)],
+                    vec![ready("10.9.0.2", "pod-y")],
+                ),
+                endpoint_slice(
+                    "demo",
+                    "svc-1",
+                    "svc",
+                    &[(None, 8080)],
+                    vec![ready("10.1.0.1", "pod-a")],
+                ),
+            ],
+        );
+        let names: Vec<&str> = endpoints.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["pod-a"]);
     }
 
     // ----- certificateRefs -----
