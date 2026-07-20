@@ -1,8 +1,12 @@
 set shell := ["bash", "-eo", "pipefail", "-c"]
 
 CLUSTER := "gateway-e2e"
-DP_IMAGE := "gateway-data-plane:latest"
-CP_IMAGE := "gateway-control-plane:latest"
+DP_IMAGE_REPO := "gateway-data-plane"
+DP_IMAGE_TAG := "latest"
+DP_IMAGE := DP_IMAGE_REPO + ":" + DP_IMAGE_TAG
+CP_IMAGE_REPO := "gateway-control-plane"
+CP_IMAGE_TAG := "latest"
+CP_IMAGE := CP_IMAGE_REPO + ":" + CP_IMAGE_TAG
 ECHO_IMAGE := "gateway-test-echo:e2e"
 GATEWAY_API_CRDS := "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml"
 # Assigns docker-network IPs to LoadBalancer Services in the kind
@@ -22,6 +26,10 @@ check-fmt:
 [group('check')]
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+
+[group('check')]
+lint-chart:
+    helm lint deploy/chart/gateway
 
 [group('check')]
 lint: check-fmt clippy
@@ -60,9 +68,12 @@ up: images
     # Gateway API CRD bundle at startup; whoever loses that race must
     # take ownership rather than fail.
     kubectl apply --server-side --force-conflicts -f {{GATEWAY_API_CRDS}}
-    kubectl apply -f deploy/manifests/gatewayclass.yaml
-    kubectl create namespace gateway-system --dry-run=client -o yaml | kubectl apply -f -
-    kubectl apply -f deploy/manifests/controlplane/
+    helm upgrade --install gateway deploy/chart/gateway \
+        --namespace gateway-system --create-namespace \
+        --set controlPlane.image.repository={{CP_IMAGE_REPO}} \
+        --set controlPlane.image.tag={{CP_IMAGE_TAG}} \
+        --set dataPlane.image.repository={{DP_IMAGE_REPO}} \
+        --set dataPlane.image.tag={{DP_IMAGE_TAG}}
     kubectl -n gateway-system wait --for=condition=available deployment/gateway-cp --timeout=120s
 
 [group('e2e')]

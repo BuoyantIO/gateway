@@ -31,6 +31,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just lint
+      - run: just lint-chart
 
   test-unit:
     runs-on: ubuntu-24.04

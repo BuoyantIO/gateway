@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gateway-cp
-  namespace: gateway-system
+  namespace: {{ .Release.Namespace }}
   labels:
     app: gateway-cp
 spec:
@@ -18,15 +18,15 @@ spec:
       serviceAccountName: gateway-cp
       containers:
         - name: gateway-cp
-          image: gateway-control-plane:latest
+          image: {{ include "gateway.cpImage" . }}
           imagePullPolicy: IfNotPresent
           args:
             - --listen=0.0.0.0:8443
             - --controller-name=gateway.buoyant.io/controller
             # Data-plane provisioning: the CP deploys a gatewayd
             # Deployment + Service per owned Gateway.
-            - --dp-image=gateway-data-plane:latest
-            - --cp-url=http://gateway-cp.gateway-system.svc:8443
+            - --dp-image={{ include "gateway.dpImage" . }}
+            - --cp-url=http://gateway-cp.{{ .Release.Namespace }}.svc:8443
           ports:
             - name: grpc
               containerPort: 8443

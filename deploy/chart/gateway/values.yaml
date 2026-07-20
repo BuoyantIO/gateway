@@ -1,0 +1,11 @@
+controlPlane:
+  image:
+    repository: ghcr.io/buoyantio/gateway-cp
+    # Defaults to the chart appVersion.
+    tag: ""
+
+dataPlane:
+  image:
+    repository: ghcr.io/buoyantio/gatewayd
+    # Defaults to the chart appVersion.
+    tag: ""

@@ -1,0 +1,8 @@
+apiVersion: v2
+name: gateway
+description: Buoyant gateway control plane
+type: application
+# Placeholder versions: release CI packages the chart with
+# --version / --app-version derived from the git tag.
+version: 0.0.0
+appVersion: 0.0.0-dev
