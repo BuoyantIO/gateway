@@ -1,21 +1,20 @@
 # Deploy
 
-Manifests for running the gateway control plane and a sample data
-plane on a Kubernetes cluster (kind or any standard distribution).
+Helm chart and sample manifests for running the gateway control
+plane and a sample data plane on a Kubernetes cluster (kind or any
+standard distribution).
 
 ## Layout
 
 ```
 deploy/
 ├── README.md
+├── chart/
+│   └── gateway/                             # Helm chart: CP Deployment, RBAC,
+│       ├── Chart.yaml                       # headless Service, GatewayClass
+│       ├── values.yaml                      # controlPlane.image / dataPlane.image
+│       └── templates/
 └── manifests/
-    ├── gatewayclass.yaml                    # GatewayClass with our controllerName
-    ├── controlplane/
-    │   ├── serviceaccount.yaml              # gateway-system namespace + SA
-    │   ├── clusterrole.yaml                 # watch on Gateway-API + Services + EndpointSlices
-    │   ├── clusterrolebinding.yaml
-    │   ├── deployment.yaml                  # replicas: 1
-    │   └── service.yaml                     # headless :8443
     └── examples/
         └── sample-app/
             ├── namespace.yaml               # demo namespace
@@ -24,12 +23,14 @@ deploy/
             └── echo.yaml                    # hashicorp/http-echo backend
 ```
 
-The data plane is not part of the sample: the control plane
+The data plane is not part of the chart: the control plane
 provisions a gatewayd `Deployment` + `Service`
 (`api-gateway-gatewayd`) in the Gateway's namespace when the Gateway
-is applied.
+is applied. The chart pins the gatewayd image the provisioner
+deploys via `dataPlane.image` (rendered into the CP's `--dp-image`
+flag).
 
-## Build the images
+## Install from local builds
 
 From the repo root:
 
@@ -44,14 +45,23 @@ For kind:
 kind load docker-image gateway-data-plane:latest gateway-control-plane:latest
 ```
 
-## Apply
+Install the Gateway API CRDs, the chart (pointed at the local
+images), and the sample app:
 
 ```sh
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
-kubectl apply -f deploy/manifests/gatewayclass.yaml
-kubectl apply -f deploy/manifests/controlplane/
+helm upgrade --install gateway deploy/chart/gateway \
+    --namespace gateway-system --create-namespace \
+    --set controlPlane.image.repository=gateway-control-plane \
+    --set controlPlane.image.tag=latest \
+    --set dataPlane.image.repository=gateway-data-plane \
+    --set dataPlane.image.tag=latest
 kubectl apply -f deploy/manifests/examples/sample-app/
 ```
+
+Image values default to the published `ghcr.io/buoyantio` images at
+the chart's `appVersion`; the overrides above are only needed for
+locally built images.
 
 ## Verify
 
