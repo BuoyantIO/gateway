@@ -1,0 +1,88 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to re-release
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  REGISTRY: ghcr.io/buoyantio
+  CHART_REGISTRY: oci://ghcr.io/buoyantio/charts
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.TAG }}
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          install_only: true
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          save-if: "false"
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # A release tag is published exactly once; a re-run of a
+      # partially failed publish must not overwrite pushed images.
+      - name: Refuse to overwrite a published tag
+        run: |
+          if docker manifest inspect "$REGISTRY/gateway-cp:$TAG" >/dev/null 2>&1; then
+            echo "::error::$REGISTRY/gateway-cp:$TAG already exists"
+            exit 1
+          fi
+      # `just up` builds the images with the release names/tags and
+      # installs the chart from source pointing at them; the e2e
+      # suite is the publish gate — nothing is pushed if it fails.
+      - name: E2E against release images
+        run: |
+          just CP_IMAGE_REPO="$REGISTRY/gateway-cp" CP_IMAGE_TAG="$TAG" \
+               DP_IMAGE_REPO="$REGISTRY/gatewayd" DP_IMAGE_TAG="$TAG" up
+          just test-e2e
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get gateway,httproute -A || true
+          kubectl -n gateway-system logs deployment/gateway-cp --tail=200 || true
+      - name: Push images
+        run: |
+          docker push "$REGISTRY/gateway-cp:$TAG"
+          docker push "$REGISTRY/gatewayd:$TAG"
+      - name: Publish chart
+        run: |
+          helm package deploy/chart/gateway --version "$VERSION" --app-version "$TAG"
+          helm push "gateway-$VERSION.tgz" "$CHART_REGISTRY"
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          helm template gateway "gateway-$VERSION.tgz" -n gateway-system > install.yaml
+          gh release create "$TAG" "gateway-$VERSION.tgz" install.yaml --generate-notes
