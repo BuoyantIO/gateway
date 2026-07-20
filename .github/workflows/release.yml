@@ -1,0 +1,163 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Release version, e.g. 0.1.0 (no v prefix). Required for publishing:
+          the workflow creates the v<version> tag at the selected commit once
+          the release succeeds, and fails upfront if that version was already
+          released (its tag exists).
+        type: string
+        required: false
+      publish:
+        description: 'Publish the release (otherwise just dry-run); only allowed from the main branch'
+        type: boolean
+        required: false
+        default: false
+
+# Release runs must never be cancelled mid-flight; dispatches queue up
+# behind one another.
+concurrency:
+  group: ${{ github.workflow }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  DOCKER_REGISTRY: ghcr.io/buoyantio
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Validate inputs
+        run: |
+          version='${{ inputs.version }}'
+          if [[ -n $version && ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version '$version' is not semver (expected e.g. 0.1.0, without the v prefix)"
+            exit 1
+          fi
+          if [[ ${{ inputs.publish }} == true && -z $version ]]; then
+            echo "::error::publish requires the version input"
+            exit 1
+          fi
+          if [[ ${{ inputs.publish }} == true && '${{ github.ref }}' != refs/heads/main ]]; then
+            echo "::error::publish is only allowed from the main branch (got '${{ github.ref_name }}')"
+            exit 1
+          fi
+          if [[ -n $version ]] && git ls-remote --exit-code origin "refs/tags/v$version" >/dev/null; then
+            echo "::error::tag v$version already exists: that version has already been released. Choose a new version."
+            exit 1
+          fi
+      - id: release
+        run: echo "is_release=${{ inputs.publish == true }}" >> "$GITHUB_OUTPUT"
+      - id: version
+        run: echo "version=${{ inputs.version || '0.0.0-undefined' }}" >> "$GITHUB_OUTPUT"
+    outputs:
+      is_release: ${{ steps.release.outputs.is_release }}
+      version: ${{ steps.version.outputs.version }}
+
+  # The publish gate: build the release-named images, install the chart
+  # from source pointing at them, and run the full e2e suite. Nothing is
+  # pushed unless this job is green. The tested image bytes are handed
+  # to the publish job as an artifact, so what is pushed is exactly what
+  # was tested.
+  test:
+    needs: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: extractions/setup-just@dd310ad5a97d8e7b41793f8ef055398d51ad4de6
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          install_only: true
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          save-if: "false"
+      - name: E2E against release images
+        run: |
+          just CP_IMAGE_REPO="$DOCKER_REGISTRY/gateway-cp" \
+               CP_IMAGE_TAG="${{ needs.meta.outputs.version }}" \
+               DP_IMAGE_REPO="$DOCKER_REGISTRY/gatewayd" \
+               DP_IMAGE_TAG="${{ needs.meta.outputs.version }}" \
+               up
+          just test-e2e
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get gateway,httproute -A || true
+          kubectl -n gateway-system logs deployment/gateway-cp --tail=200 || true
+      - name: Save images
+        if: ${{ needs.meta.outputs.is_release == 'true' }}
+        run: |
+          docker save -o /tmp/gateway-images.tar \
+            "$DOCKER_REGISTRY/gateway-cp:${{ needs.meta.outputs.version }}" \
+            "$DOCKER_REGISTRY/gatewayd:${{ needs.meta.outputs.version }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ needs.meta.outputs.is_release == 'true' }}
+        with:
+          name: gateway-images.tar
+          path: /tmp/gateway-images.tar
+          retention-days: 1
+
+  publish:
+    if: ${{ needs.meta.outputs.is_release == 'true' }}
+    needs: [meta, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: gateway-images.tar
+          path: /tmp
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
+        with:
+          registry: ghcr.io
+          username: buoyantio
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push images
+        run: |
+          docker load -i /tmp/gateway-images.tar
+          docker push "$DOCKER_REGISTRY/gateway-cp:${{ needs.meta.outputs.version }}"
+          docker push "$DOCKER_REGISTRY/gatewayd:${{ needs.meta.outputs.version }}"
+      - name: Publish chart
+        run: |
+          helm package deploy/chart/gateway \
+            --version ${{ needs.meta.outputs.version }} \
+            --app-version ${{ needs.meta.outputs.version }}
+          helm push "gateway-${{ needs.meta.outputs.version }}.tgz" "oci://$DOCKER_REGISTRY/charts"
+
+  create_release_tag:
+    # The tag is only created once the release has been fully published;
+    # a failed run leaves no tag behind so the version can be retried.
+    # Recreating an existing tag can't happen here: validation fails any
+    # publish whose version was already released.
+    if: ${{ needs.meta.outputs.is_release == 'true' }}
+    needs: [meta, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/git/refs \
+            -f ref="refs/tags/v${{ inputs.version }}" \
+            -f sha="${{ github.sha }}"
