@@ -27,3 +27,8 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "patch"]
+  # Leader election: one lease in the release namespace decides
+  # which replica writes status and reconciles infra.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]

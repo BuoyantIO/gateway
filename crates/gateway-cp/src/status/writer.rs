@@ -37,10 +37,12 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// backoff picks up from there.
 const CONFLICT_RETRIES: usize = 3;
 
-/// Run the writer until `shutdown` resolves.
+/// Run the writer until `shutdown` resolves. Only the leader writes;
+/// while following, work (and retries) sit parked until promotion.
 pub async fn run(
     client: Client,
     mut work_rx: watch::Receiver<StatusWork>,
+    mut is_leader: watch::Receiver<bool>,
     shutdown: impl Future<Output = ()>,
 ) {
     let mut shutdown = pin!(shutdown);
@@ -51,8 +53,15 @@ pub async fn run(
         tokio::select! {
             biased;
             () = &mut shutdown => return,
+            _ = is_leader.changed() => {}
             _ = work_rx.changed() => {}
             () = sleep(retry_delay), if retry_pending => {}
+        }
+
+        // Guards the retry loop too: a demoted leader must not keep
+        // retrying stale work against the new leader's writes.
+        if !*is_leader.borrow_and_update() {
+            continue;
         }
 
         let work = work_rx.borrow_and_update().clone();

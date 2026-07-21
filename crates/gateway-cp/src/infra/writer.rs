@@ -50,6 +50,7 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 pub async fn run(
     client: Client,
     mut desired_rx: watch::Receiver<Vec<GatewayInfra>>,
+    mut is_leader: watch::Receiver<bool>,
     shutdown: impl Future<Output = ()>,
 ) {
     let mut shutdown = pin!(shutdown);
@@ -84,11 +85,18 @@ pub async fn run(
         tokio::select! {
             biased;
             () = &mut shutdown => return,
+            _ = is_leader.changed() => {}
             _ = desired_rx.changed() => {}
             ev = sa_stream.next() => log_watch_err("ServiceAccount", ev.as_ref()),
             ev = svc_stream.next() => log_watch_err("Service", ev.as_ref()),
             ev = dep_stream.next() => log_watch_err("Deployment", ev.as_ref()),
             () = sleep(retry_delay), if retry_pending => {}
+        }
+
+        // Reconciling is an apiserver write path: leader-only. This
+        // also parks drift-repair and retries on followers.
+        if !*is_leader.borrow_and_update() {
+            continue;
         }
 
         let desired = desired_rx.borrow_and_update().clone();
