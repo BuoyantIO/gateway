@@ -73,6 +73,7 @@ pub async fn run(
     state: Arc<ServerState>,
     infra: Option<InfraPublisher>,
     status_tx: tokio_watch::Sender<StatusWork>,
+    mut is_leader: tokio_watch::Receiver<bool>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), WatchError> {
     let mut shutdown = pin!(shutdown);
@@ -117,6 +118,10 @@ pub async fn run(
         let relevant = tokio::select! {
             biased;
             () = &mut shutdown => break,
+            // A promotion runs a full pass immediately so the status
+            // and infra skipped while following are emitted without
+            // waiting for the next cluster event.
+            _ = is_leader.changed() => *is_leader.borrow(),
             ev = gc_stream.next() => gc_filter.relevant("GatewayClass", ev),
             ev = gw_stream.next() => gw_filter.relevant("Gateway", ev),
             ev = hr_stream.next() => hr_filter.relevant("HTTPRoute", ev),
@@ -134,6 +139,12 @@ pub async fn run(
         let resolution = resolve(&k8s, &controller_name);
         let world = translate_resolution(&resolution);
         state.publish(&world);
+
+        // Status and infra are apiserver writes: leader-only. Every
+        // replica still publishes to its own data planes above.
+        if !*is_leader.borrow() {
+            continue;
+        }
 
         // Desired status rides the same pass; the writer task on the
         // other side of the channel owns the apiserver writes.

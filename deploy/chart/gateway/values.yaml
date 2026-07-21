@@ -1,4 +1,7 @@
 controlPlane:
+  # Two replicas by default: leader election picks the single writer,
+  # every replica serves data planes.
+  replicas: 2
   image:
     repository: ghcr.io/buoyantio/gateway-cp
     # Defaults to the chart appVersion.

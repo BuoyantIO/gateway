@@ -6,7 +6,7 @@ metadata:
   labels:
     app: gateway-cp
 spec:
-  replicas: 1
+  replicas: {{ .Values.controlPlane.replicas }}
   selector:
     matchLabels:
       app: gateway-cp
@@ -33,3 +33,12 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            # Identity and Lease namespace for leader election.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

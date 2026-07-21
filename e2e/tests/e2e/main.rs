@@ -7,6 +7,7 @@
 mod backend_protocol;
 mod endpoints;
 mod filters;
+mod ha;
 mod matches;
 mod provisioner;
 mod redirect;

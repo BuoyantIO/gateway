@@ -19,6 +19,13 @@ use crate::error::Error;
 
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Two ceilings because disconnection costs different things in the
+/// two states. Before the first sync the store is empty and every
+/// request is refused, so each second of backoff is a second of
+/// downtime — retry hard. After it, the store keeps serving the last
+/// config and a slow reconnect only delays updates, so the full
+/// ceiling is fine.
+const BACKOFF_MAX_COLD: Duration = Duration::from_secs(2);
 const BACKOFF_FACTOR: u32 = 2;
 const BACKOFF_JITTER: f64 = 0.2;
 const REQUEST_CHANNEL_CAPACITY: usize = 4;
@@ -62,7 +69,10 @@ pub async fn run(
                 }
             }
         }
-        let delay = backoff.next();
+        let mut delay = backoff.next();
+        if !*ready.borrow() {
+            delay = delay.min(BACKOFF_MAX_COLD);
+        }
         tracing::debug!(?delay, "backing off before reconnect");
         tokio::select! {
             biased;
