@@ -9,6 +9,7 @@ mod endpoints;
 mod filters;
 mod ha;
 mod matches;
+mod probes;
 mod provisioner;
 mod redirect;
 mod routing;

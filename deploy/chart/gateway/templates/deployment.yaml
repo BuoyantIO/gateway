@@ -27,9 +27,31 @@ spec:
             # Deployment + Service per owned Gateway.
             - --dp-image={{ include "gateway.dpImage" . }}
             - --cp-url=http://gateway-cp.{{ .Release.Namespace }}.svc:8443
+            - --admin-addr=0.0.0.0:15021
           ports:
             - name: grpc
               containerPort: 8443
+            - name: admin
+              containerPort: 15021
+          # Ready once the watch caches have synced and the first
+          # translated snapshot is servable; unready while draining.
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: admin
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /healthz/ready
+              port: admin
+            periodSeconds: 1
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz/alive
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 3
           env:
             - name: RUST_LOG
               value: info

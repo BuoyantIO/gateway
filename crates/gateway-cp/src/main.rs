@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use gateway_cp::admin;
 use gateway_cp::infra::{InfraConfig, InfraPublisher, writer as infra_writer};
 use gateway_cp::lease;
 use gateway_cp::status::{StatusWork, writer as status_writer};
@@ -41,6 +42,10 @@ struct Args {
     #[arg(long, default_value_t = 15021)]
     dp_admin_port: u16,
 
+    /// Admin HTTP listen address (readiness and liveness probes).
+    #[arg(long, default_value = "0.0.0.0:15021")]
+    admin_addr: SocketAddr,
+
     /// This replica's identity for leader election; the Deployment
     /// sets it from the pod name via the downward API.
     #[arg(long, env = "POD_NAME", default_value_t = default_pod_name())]
@@ -54,6 +59,28 @@ struct Args {
 
 fn default_pod_name() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "gateway-cp-0".to_string())
+}
+
+/// Bind and spawn the admin (probe) server; returns the readiness
+/// sender the watch loop drives. Binding here means a bad address
+/// fails startup instead of leaving a silently unready pod.
+async fn spawn_admin(
+    addr: SocketAddr,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> anyhow::Result<(
+    watch::Sender<admin::ReadyState>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (ready_tx, ready_rx) = watch::channel(admin::ReadyState {
+        pending: gateway_cp::watch::WATCHED_KINDS.to_vec(),
+        shutting_down: false,
+    });
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let handle = tokio::spawn(admin::serve(listener, ready_rx, async move {
+        let _ = shutdown_rx.wait_for(|v| *v).await;
+    }));
+    tracing::info!(admin = %addr, "admin server listening");
+    Ok((ready_tx, handle))
 }
 
 /// Spawn the lease elector; returns the leadership channel consumed
@@ -107,6 +134,10 @@ async fn main() -> anyhow::Result<()> {
     // drains off the same signal.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_signal_handler(shutdown_tx.clone());
+
+    // Admin server: readiness flips once the watch loop has run a
+    // full pass over synced reflectors.
+    let (ready_tx, admin_handle) = spawn_admin(args.admin_addr, shutdown_rx.clone()).await?;
 
     // Leader election: every replica translates and serves data
     // planes, but only the lease holder writes status and reconciles
@@ -177,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
                 infra_publisher,
                 status_tx,
                 is_leader,
+                ready_tx,
                 shutdown,
             )
             .await
@@ -208,5 +240,6 @@ async fn main() -> anyhow::Result<()> {
     // Last: vacating the lease happens inside the elector's shutdown
     // path, after the writers above have stopped acting on leadership.
     let _ = lease_handle.await;
+    let _ = admin_handle.await;
     Ok(())
 }

@@ -46,11 +46,23 @@ use thiserror::Error;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use tokio::sync::watch as tokio_watch;
 
+use crate::admin::ReadyState;
 use crate::infra::{self, InfraPublisher};
 use crate::resolve::{SERVICE_NAME_LABEL, resolve};
 use crate::server::ServerState;
 use crate::status::{StatusWork, build_work};
 use crate::translator::{K8sState, translate_resolution};
+
+/// The resource kinds the loop watches, in reflector order. Also the
+/// initial pending set for the readiness endpoint.
+pub const WATCHED_KINDS: [&str; 6] = [
+    "GatewayClass",
+    "Gateway",
+    "HTTPRoute",
+    "Service",
+    "EndpointSlice",
+    "Secret",
+];
 
 #[derive(Debug, Error)]
 pub enum WatchError {
@@ -67,6 +79,7 @@ pub enum WatchError {
 /// watcher errors are transient and handled by `kube_runtime::watcher`
 /// internally; we log and continue.
 #[allow(clippy::similar_names)] // gc/gw/hr/svc/sec bindings are intentionally parallel
+#[allow(clippy::too_many_arguments)] // the loop is the wiring point for every channel
 pub async fn run(
     client: kube::Client,
     controller_name: String,
@@ -74,6 +87,7 @@ pub async fn run(
     infra: Option<InfraPublisher>,
     status_tx: tokio_watch::Sender<StatusWork>,
     mut is_leader: tokio_watch::Receiver<bool>,
+    ready_tx: tokio_watch::Sender<ReadyState>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), WatchError> {
     let mut shutdown = pin!(shutdown);
@@ -114,6 +128,8 @@ pub async fn run(
     let mut gw_filter = EventFilter::generation_and_annotations();
     let mut hr_filter = EventFilter::generation_only();
 
+    let mut sync = SyncTracker::new();
+
     loop {
         let relevant = tokio::select! {
             biased;
@@ -122,12 +138,12 @@ pub async fn run(
             // and infra skipped while following are emitted without
             // waiting for the next cluster event.
             _ = is_leader.changed() => *is_leader.borrow(),
-            ev = gc_stream.next() => gc_filter.relevant("GatewayClass", ev),
-            ev = gw_stream.next() => gw_filter.relevant("Gateway", ev),
-            ev = hr_stream.next() => hr_filter.relevant("HTTPRoute", ev),
-            ev = svc_stream.next() => EventFilter::always("Service", ev),
-            ev = es_stream.next() => EventFilter::always("EndpointSlice", ev),
-            ev = sec_stream.next() => EventFilter::always("Secret", ev),
+            ev = gc_stream.next() => { sync.mark("GatewayClass", ev.as_ref()); gc_filter.relevant("GatewayClass", ev) }
+            ev = gw_stream.next() => { sync.mark("Gateway", ev.as_ref()); gw_filter.relevant("Gateway", ev) }
+            ev = hr_stream.next() => { sync.mark("HTTPRoute", ev.as_ref()); hr_filter.relevant("HTTPRoute", ev) }
+            ev = svc_stream.next() => { sync.mark("Service", ev.as_ref()); EventFilter::always("Service", ev) }
+            ev = es_stream.next() => { sync.mark("EndpointSlice", ev.as_ref()); EventFilter::always("EndpointSlice", ev) }
+            ev = sec_stream.next() => { sync.mark("Secret", ev.as_ref()); EventFilter::always("Secret", ev) }
         };
         if !relevant {
             continue;
@@ -139,6 +155,20 @@ pub async fn run(
         let resolution = resolve(&k8s, &controller_name);
         let world = translate_resolution(&resolution);
         state.publish(&world);
+
+        // Readiness follows the pass, not the stores: a pod is ready
+        // once the world it serves derives from complete cluster
+        // state. Kinds drop off the pending list as their reflectors
+        // deliver initial state.
+        ready_tx.send_if_modified(|s| {
+            let next = sync.ready_state();
+            if *s == next {
+                false
+            } else {
+                *s = next;
+                true
+            }
+        });
 
         // Status and infra are apiserver writes: leader-only. Every
         // replica still publishes to its own data planes above.
@@ -166,7 +196,46 @@ pub async fn run(
         }
     }
 
+    // Draining: go unready so the pod leaves the Service endpoints
+    // before its streams close (data planes reconnect to a peer).
+    let _ = ready_tx.send(ReadyState {
+        pending: Vec::new(),
+        shutting_down: true,
+    });
+
     Ok(())
+}
+
+/// Tracks which reflectors have delivered their initial state.
+/// `run` marks streams as they yield `InitDone`; the pending list
+/// feeds the readiness endpoint.
+struct SyncTracker {
+    pending: Vec<&'static str>,
+}
+
+impl SyncTracker {
+    fn new() -> Self {
+        Self {
+            pending: WATCHED_KINDS.to_vec(),
+        }
+    }
+
+    fn mark<K>(
+        &mut self,
+        kind: &'static str,
+        ev: Option<&Result<watcher::Event<K>, watcher::Error>>,
+    ) {
+        if matches!(ev, Some(Ok(watcher::Event::InitDone))) {
+            self.pending.retain(|k| *k != kind);
+        }
+    }
+
+    fn ready_state(&self) -> ReadyState {
+        ReadyState {
+            pending: self.pending.clone(),
+            shutting_down: false,
+        }
+    }
 }
 
 /// Walk each reflector store once and clone the resources into a
