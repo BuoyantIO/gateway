@@ -691,6 +691,8 @@ dependencies = [
  "gateway-state",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "parking_lot",

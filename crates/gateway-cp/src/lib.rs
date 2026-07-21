@@ -2,6 +2,7 @@
 //! incremental `ConfigUpdate` batches to data planes over a streaming
 //! gRPC channel.
 
+pub mod admin;
 pub mod diff;
 pub mod infra;
 pub mod lease;
