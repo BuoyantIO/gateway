@@ -42,6 +42,16 @@ async fn main() -> anyhow::Result<()> {
                 let method = req.method().to_string();
                 let path = req.uri().path().to_string();
                 let server_version = format!("{:?}", req.version());
+                // `?delay-ms=N` holds the response, keeping a request
+                // in flight for drain tests.
+                if let Some(ms) = req
+                    .uri()
+                    .query()
+                    .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("delay-ms=")))
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms.min(30_000))).await;
+                }
                 let mut echoed: Vec<(String, String)> = Vec::new();
                 for (k, v) in req.headers() {
                     let name = k.as_str().to_ascii_lowercase();

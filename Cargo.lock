@@ -764,6 +764,7 @@ dependencies = [
  "form_urlencoded",
  "gateway-config",
  "gateway-state",
+ "h2",
  "http",
  "http-body-util",
  "hyper",

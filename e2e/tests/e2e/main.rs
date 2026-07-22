@@ -5,6 +5,7 @@
 //! thread count.
 
 mod backend_protocol;
+mod drain;
 mod endpoints;
 mod filters;
 mod ha;
