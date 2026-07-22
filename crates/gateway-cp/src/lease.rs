@@ -2,9 +2,9 @@
 //!
 //! Exactly one replica may write status and reconcile infra; every
 //! replica still translates and serves data planes. The claiming
-//! rules follow kubert's lease manager: the holder renews inside a
-//! grace window before expiry, a rival waits out the current claim's
-//! expiry before trying, takeovers bump `leaseTransitions`, and a
+//! rules: the holder renews inside a grace window before expiry, a
+//! rival waits out the current claim's expiry before trying,
+//! takeovers bump `leaseTransitions`, and a
 //! clean shutdown vacates the lease so the peer takes over
 //! immediately. Writes are optimistic-concurrency replaces (the
 //! `resourceVersion` of the last-seen lease rides along), so two
