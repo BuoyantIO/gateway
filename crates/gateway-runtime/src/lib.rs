@@ -3,6 +3,7 @@
 //! dispatches accepted connections to the appropriate protocol handler.
 
 mod accept;
+pub mod drain;
 mod error;
 mod gateway;
 pub mod lb;
