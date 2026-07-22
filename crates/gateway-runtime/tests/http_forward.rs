@@ -947,7 +947,7 @@ async fn client_h2_server_h2() {
 }
 
 #[tokio::test]
-async fn grpc_shaped_round_trip() {
+async fn h2_request_body_round_trips() {
     let upstream = spawn_body_echo().await;
     let bind_port = free_port().await;
     let cfg = http_config_proto(bind_port, upstream, "/", BackendProtocol::Http2);
@@ -956,26 +956,27 @@ async fn grpc_shaped_round_trip() {
     let (gw_handle, shutdown_tx) = spawn_gateway(store);
     wait_for_listening(bind_port).await;
 
-    // gRPC: H2 client → gateway → h2c to the (Http2) backend. Body is a
-    // length-prefixed gRPC frame; assert it round-trips byte-for-byte.
+    // H2 client → gateway → h2c backend: the request body must reach
+    // the backend and the response body must come back byte-for-byte.
+    // (The version matrix above checks status and wire version only;
+    // real gRPC semantics — trailers, streams, large messages — are
+    // covered by the e2e suite against a real gRPC server.)
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new())
         .http2_only(true)
         .build_http();
     let payload = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
     let req = Request::builder()
         .method("POST")
-        .uri(format!("http://127.0.0.1:{bind_port}/svc.Service/Method"))
-        .header("content-type", "application/grpc")
+        .uri(format!("http://127.0.0.1:{bind_port}/"))
         .body(Full::new(payload.clone()))
         .unwrap();
-    let resp = client.request(req).await.expect("grpc request failed");
+    let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
             .get("x-server-version")
             .and_then(|v| v.to_str().ok()),
         Some("HTTP/2.0"),
-        "gateway must speak HTTP/2 to a gRPC (Http2) backend"
     );
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, payload);
