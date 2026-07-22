@@ -7,6 +7,7 @@
 mod backend_protocol;
 mod endpoints;
 mod filters;
+mod grpc;
 mod ha;
 mod matches;
 mod probes;

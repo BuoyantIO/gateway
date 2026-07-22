@@ -27,7 +27,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
@@ -516,6 +516,33 @@ pub async fn deploy_echo(
     name: &str,
     app_protocol: Option<&str>,
 ) -> Result<()> {
+    deploy_backend(client, ns, name, app_protocol, None).await
+}
+
+/// Deploy the gRPC echo server (same test image, second binary) with
+/// a Service whose `appProtocol: grpc` makes the gateway dial it over
+/// h2c.
+///
+/// # Errors
+/// Returns an error if a create call fails.
+pub async fn deploy_grpc_echo(client: &Client, ns: &str, name: &str) -> Result<()> {
+    deploy_backend(
+        client,
+        ns,
+        name,
+        Some("grpc"),
+        Some(vec!["/usr/local/bin/grpc_echo".to_string()]),
+    )
+    .await
+}
+
+async fn deploy_backend(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    app_protocol: Option<&str>,
+    command: Option<Vec<String>>,
+) -> Result<()> {
     let labels: BTreeMap<String, String> =
         [("app".to_owned(), name.to_owned())].into_iter().collect();
 
@@ -542,6 +569,7 @@ pub async fn deploy_echo(
                         name: "echo".into(),
                         image: Some("gateway-test-echo:e2e".into()),
                         image_pull_policy: Some("IfNotPresent".into()),
+                        command,
                         ports: Some(vec![ContainerPort {
                             name: Some("http".into()),
                             container_port: 8080,
@@ -645,5 +673,17 @@ pub async fn apply_http_route(client: &Client, hr: &HTTPRoute) -> Result<()> {
                 hr.metadata.name.as_deref().unwrap_or("?")
             )
         })?;
+    Ok(())
+}
+
+/// Delete an `HTTPRoute` by name.
+///
+/// # Errors
+/// Returns an error if the delete call fails.
+pub async fn delete_http_route(client: &Client, ns: &str, name: &str) -> Result<()> {
+    Api::<HTTPRoute>::namespaced(client.clone(), ns)
+        .delete(name, &DeleteParams::default())
+        .await
+        .with_context(|| format!("deleting HTTPRoute {ns}/{name}"))?;
     Ok(())
 }
