@@ -3,7 +3,6 @@
 //! dispatches accepted connections to the appropriate protocol handler.
 
 mod accept;
-pub mod drain;
 mod error;
 mod gateway;
 pub mod lb;
@@ -11,4 +10,5 @@ mod proxy;
 
 pub use error::RuntimeError;
 pub use gateway::Gateway;
+pub use gateway_drain as drain;
 pub use proxy::http::HttpClient;

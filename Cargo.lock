@@ -688,6 +688,7 @@ dependencies = [
  "futures",
  "gateway-api",
  "gateway-cp-proto",
+ "gateway-drain",
  "gateway-state",
  "http",
  "http-body-util",
@@ -735,6 +736,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-drain"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "gateway-e2e"
 version = "0.0.0"
 dependencies = [
@@ -763,6 +771,7 @@ dependencies = [
  "bytes",
  "form_urlencoded",
  "gateway-config",
+ "gateway-drain",
  "gateway-state",
  "h2",
  "http",
