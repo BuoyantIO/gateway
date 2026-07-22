@@ -12,9 +12,9 @@
 //! "the process and its runtime respond", nothing deeper.
 
 use std::convert::Infallible;
-use std::future::Future;
 use std::pin::pin;
 
+use gateway_drain as drain;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -42,17 +42,14 @@ impl ReadyState {
 
 /// Accept loop on an already-bound listener (binding stays in
 /// `main` so a bad `--admin-addr` fails startup instead of leaving
-/// a silently unready pod). Runs until `shutdown` resolves.
-pub async fn serve(
-    listener: TcpListener,
-    ready: watch::Receiver<ReadyState>,
-    shutdown: impl Future<Output = ()>,
-) {
-    let mut shutdown = pin!(shutdown);
+/// a silently unready pod). Runs until `drain` fires; in-flight
+/// probe responses finish under the drain barrier.
+pub async fn serve(listener: TcpListener, ready: watch::Receiver<ReadyState>, drain: drain::Watch) {
+    let mut stop = pin!(drain.clone().signaled());
     loop {
         tokio::select! {
             biased;
-            () = &mut shutdown => return,
+            _release = &mut stop => return,
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(a) => a,
@@ -62,16 +59,26 @@ pub async fn serve(
                     }
                 };
                 let ready = ready.clone();
+                let drain = drain.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let state = ready.borrow().clone();
                         let response = respond(req.method(), req.uri().path(), &state);
                         async move { Ok::<_, Infallible>(response) }
                     });
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
+                    let conn = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service);
+                    let mut conn = pin!(conn);
+                    let result = tokio::select! {
+                        res = conn.as_mut() => res,
+                        shutdown = drain.signaled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let res = conn.await;
+                            drop(shutdown);
+                            res
+                        }
+                    };
+                    if let Err(e) = result {
                         tracing::debug!(error = %e, "admin connection error");
                     }
                 });
@@ -122,11 +129,14 @@ mod tests {
         }
     }
 
-    async fn spawn_admin(ready: watch::Receiver<ReadyState>) -> std::net::SocketAddr {
+    async fn spawn_admin(
+        ready: watch::Receiver<ReadyState>,
+    ) -> (std::net::SocketAddr, drain::Signal) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, ready, std::future::pending()));
-        addr
+        let (signal, watch) = drain::channel();
+        tokio::spawn(serve(listener, ready, watch));
+        (addr, signal)
     }
 
     async fn get(addr: std::net::SocketAddr, path: &str) -> String {
@@ -141,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn ready_names_pending_kinds_then_flips() {
         let (tx, rx) = watch::channel(pending(&["Gateway", "Secret"]));
-        let addr = spawn_admin(rx).await;
+        let (addr, _stop) = spawn_admin(rx).await;
 
         let response = get(addr, "/healthz/ready").await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
@@ -155,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_goes_unready() {
         let (tx, rx) = watch::channel(pending(&[]));
-        let addr = spawn_admin(rx).await;
+        let (addr, _stop) = spawn_admin(rx).await;
 
         let response = get(addr, "/healthz/ready").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -172,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn alive_is_unconditional() {
         let (_tx, rx) = watch::channel(pending(&["Gateway"]));
-        let addr = spawn_admin(rx).await;
+        let (addr, _stop) = spawn_admin(rx).await;
 
         let response = get(addr, "/healthz/alive").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -181,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_path_is_404() {
         let (_tx, rx) = watch::channel(pending(&[]));
-        let addr = spawn_admin(rx).await;
+        let (addr, _stop) = spawn_admin(rx).await;
 
         let response = get(addr, "/nope").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");

@@ -19,8 +19,8 @@ use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, St
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
-use gateway_runtime::Gateway;
 use gateway_runtime::lb::{EndpointStateConfig, LoadBalancer, P2cConfig, P2cEwma};
+use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
@@ -30,7 +30,6 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// HTTP echo server that counts requests it serves. Returns 200 OK
@@ -186,14 +185,9 @@ async fn p2c_distributes_then_evicts_failing_endpoint() {
     let lb = LoadBalancer::with_picker(picker, state_cfg);
     let gateway = Gateway::with_lb(store, lb);
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, drain_watch) = drain::channel();
     let gw_handle = tokio::spawn(async move {
-        gateway
-            .run(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
+        gateway.run(drain_watch).await.unwrap();
     });
 
     wait_for_listening(bind_port).await;
@@ -250,7 +244,7 @@ async fn p2c_distributes_then_evicts_failing_endpoint() {
         "endpoint 2 didn't pick up the load: c2_after={c2_after}, bad_gateway={bad_gateway}"
     );
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -282,14 +276,9 @@ async fn single_endpoint_fails_open_and_recovers() {
     let lb = LoadBalancer::with_picker(picker, state_cfg);
     let gateway = Gateway::with_lb(store, lb);
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, drain_watch) = drain::channel();
     let gw_handle = tokio::spawn(async move {
-        gateway
-            .run(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
+        gateway.run(drain_watch).await.unwrap();
     });
 
     wait_for_listening(bind_port).await;
@@ -332,7 +321,7 @@ async fn single_endpoint_fails_open_and_recovers() {
     }
     assert!(c1_again.load(Ordering::Relaxed) >= 6);
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")

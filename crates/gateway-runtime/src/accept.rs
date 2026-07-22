@@ -9,6 +9,7 @@ use rustls::server::Acceptor;
 use tokio::net::TcpListener;
 use tokio_rustls::LazyConfigAcceptor;
 
+use crate::drain;
 use crate::lb::LoadBalancer;
 use crate::proxy::http;
 use crate::proxy::http::{HttpClient, pick_listener_by_hostname};
@@ -19,10 +20,10 @@ use crate::proxy::http::{HttpClient, pick_listener_by_hostname};
 /// bind.
 ///
 /// Exits when the task is aborted (typically because the bind was
-/// removed or its listening address changed).
-///
-/// TODO: add a shutdown signal so we can drain in-flight connections
-/// instead of dropping them on shutdown.
+/// removed or its listening address changed). Aborting only stops new
+/// accepts: every accepted connection runs in its own task holding the
+/// drain watch (process shutdown merged with this bind's teardown) and
+/// closes gracefully when it fires.
 pub(crate) async fn run_bind(
     store: Store,
     bind_key: BindKey,
@@ -30,6 +31,7 @@ pub(crate) async fn run_bind(
     protocol: BindProtocol,
     lb: Arc<LoadBalancer>,
     http_client: HttpClient,
+    drain: drain::Watch,
 ) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -53,11 +55,13 @@ pub(crate) async fn run_bind(
         let bind_key = bind_key.clone();
         let lb = Arc::clone(&lb);
         let http_client = http_client.clone();
+        let drain = drain.clone();
 
         match protocol {
             BindProtocol::Http => {
                 tokio::spawn(async move {
-                    http::handle_connection(store, bind_key, stream, peer, lb, http_client).await;
+                    http::handle_connection(store, bind_key, stream, peer, lb, http_client, drain)
+                        .await;
                 });
             }
             BindProtocol::Tls => {
@@ -80,8 +84,16 @@ pub(crate) async fn run_bind(
                     };
                     match start.into_stream(config).await {
                         Ok(tls) => {
-                            http::handle_connection(store, bind_key, tls, peer, lb, http_client)
-                                .await;
+                            http::handle_connection(
+                                store,
+                                bind_key,
+                                tls,
+                                peer,
+                                lb,
+                                http_client,
+                                drain,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             tracing::debug!(bind = %bind_key, %peer, error = %e,

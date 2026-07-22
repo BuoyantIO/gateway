@@ -15,7 +15,7 @@ use gateway_config::config::GatewayConfig;
 use gateway_config::listener::{CertRef, HttpsListener, Listener, TlsConfig, TlsMode};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_config::secret::TlsSecret;
-use gateway_runtime::Gateway;
+use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty};
@@ -27,7 +27,6 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 use tokio_rustls::TlsConnector;
 
 // Throwaway self-signed EC cert + PKCS#8 key (same pair the
@@ -114,17 +113,13 @@ async fn wait_for_listening(port: u16) {
     panic!("gateway did not start listening on port {port}");
 }
 
-fn spawn_gateway(store: Store) -> (tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+fn spawn_gateway(store: Store) -> (tokio::task::JoinHandle<()>, drain::Signal) {
+    let (stop, watch) = drain::channel();
     let gw = Gateway::new(store);
     let handle = tokio::spawn(async move {
-        gw.run(async {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .unwrap();
+        gw.run(watch).await.unwrap();
     });
-    (handle, shutdown_tx)
+    (handle, stop)
 }
 
 /// A TLS bind with one HTTPS listener (cert ref `app-tls`), one route,
@@ -276,7 +271,7 @@ async fn https_h1_round_trip() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"GET /hello");
 
-    let _ = shutdown.send(());
+    drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }
 
@@ -316,7 +311,7 @@ async fn https_h2_round_trip_via_alpn() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"GET /h2");
 
-    let _ = shutdown.send(());
+    drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }
 
@@ -340,7 +335,7 @@ async fn https_not_served_when_secret_absent() {
         "handshake must fail when the cert secret is absent"
     );
 
-    let _ = shutdown.send(());
+    drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }
 
@@ -428,7 +423,7 @@ async fn sni_selects_listener_certificate() {
     let tls_b = tls_connect(bind_port, &[b"http/1.1"], "b.example.com").await;
     assert_eq!(tls_b.get_ref().1.peer_certificates().unwrap()[0], cert_b);
 
-    let _ = shutdown.send(());
+    drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }
 
@@ -451,7 +446,7 @@ async fn sni_with_no_matching_listener_rejected() {
         "handshake must fail when SNI matches no listener and there is no catch-all"
     );
 
-    let _ = shutdown.send(());
+    drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }
 
@@ -492,6 +487,6 @@ async fn sni_wildcard_match_and_exact_precedence() {
         cert_a
     );
 
-    let _ = shutdown.send(());
+    drop(shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw).await;
 }

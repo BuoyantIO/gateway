@@ -75,6 +75,15 @@ impl ServerState {
         }
     }
 
+    /// Drop every broadcast channel, ending all connected data-plane
+    /// streams cleanly (`forward_deltas` sees `Closed` and returns).
+    /// Draining calls this so the gRPC server's graceful shutdown is
+    /// not blocked waiting on infinite config streams; disconnected
+    /// data planes reconnect to a peer replica and re-bootstrap.
+    pub fn disconnect_all(&self) {
+        self.channels.write().clear();
+    }
+
     /// Subscribe to a Gateway's delta stream. Always called BEFORE
     /// reading the bootstrap so no in-flight delta is lost.
     fn subscribe(&self, gw_id: &GatewayId) -> broadcast::Receiver<pb::ConfigUpdate> {

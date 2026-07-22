@@ -3,14 +3,15 @@
 //! `GET /healthz/ready` answers 200 once the data plane has applied
 //! its config bootstrap (file config loaded, or the first
 //! `sync_complete` batch from the control plane) and 503 before
-//! that. Readiness is a latch — a control-plane reconnect never
-//! flips it back, because the store keeps serving its last state
-//! while the stream resyncs.
+//! that. A control-plane reconnect never flips it back, because the
+//! store keeps serving its last state while the stream resyncs; the
+//! one thing that does is shutdown, so a draining pod leaves the
+//! Service endpoints while in-flight work finishes.
 
 use std::convert::Infallible;
-use std::future::Future;
 use std::pin::pin;
 
+use gateway_runtime::drain;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -22,17 +23,15 @@ use tokio::sync::watch;
 
 /// Accept loop on an already-bound listener (binding stays in
 /// `main` so a bad `--admin-addr` fails startup instead of leaving
-/// a silently unready pod). Runs until `shutdown` resolves.
-pub async fn serve(
-    listener: TcpListener,
-    ready: watch::Receiver<bool>,
-    shutdown: impl Future<Output = ()>,
-) {
-    let mut shutdown = pin!(shutdown);
+/// a silently unready pod). Runs until `drain` fires; in-flight
+/// probe responses finish under the drain barrier like any other
+/// connection.
+pub async fn serve(listener: TcpListener, ready: watch::Receiver<bool>, drain: drain::Watch) {
+    let mut stop = pin!(drain.clone().signaled());
     loop {
         tokio::select! {
             biased;
-            () = &mut shutdown => return,
+            _release = &mut stop => return,
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(a) => a,
@@ -42,15 +41,25 @@ pub async fn serve(
                     }
                 };
                 let ready = ready.clone();
+                let drain = drain.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let response = respond(req.method(), req.uri().path(), *ready.borrow());
                         async move { Ok::<_, Infallible>(response) }
                     });
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                    {
+                    let conn = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service);
+                    let mut conn = pin!(conn);
+                    let result = tokio::select! {
+                        res = conn.as_mut() => res,
+                        shutdown = drain.signaled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let res = conn.await;
+                            drop(shutdown);
+                            res
+                        }
+                    };
+                    if let Err(e) = result {
                         tracing::debug!(error = %e, "admin connection error");
                     }
                 });
@@ -83,11 +92,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    async fn spawn_admin(ready: watch::Receiver<bool>) -> std::net::SocketAddr {
+    async fn spawn_admin(ready: watch::Receiver<bool>) -> (std::net::SocketAddr, drain::Signal) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, ready, std::future::pending()));
-        addr
+        let (signal, watch) = drain::channel();
+        tokio::spawn(serve(listener, ready, watch));
+        (addr, signal)
     }
 
     async fn get(addr: std::net::SocketAddr, path: &str) -> String {
@@ -102,7 +112,7 @@ mod tests {
     #[tokio::test]
     async fn not_ready_then_ready() {
         let (tx, rx) = watch::channel(false);
-        let addr = spawn_admin(rx).await;
+        let (addr, _stop) = spawn_admin(rx).await;
 
         let response = get(addr, "/healthz/ready").await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
@@ -115,7 +125,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_path_is_404() {
         let (_tx, rx) = watch::channel(true);
-        let addr = spawn_admin(rx).await;
+        let (addr, _stop) = spawn_admin(rx).await;
 
         let response = get(addr, "/nope").await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");

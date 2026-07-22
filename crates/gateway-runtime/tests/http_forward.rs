@@ -14,7 +14,7 @@ use gateway_config::config::GatewayConfig;
 use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
-use gateway_runtime::Gateway;
+use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
@@ -24,7 +24,6 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 
 // =================== test harness ===================
 
@@ -185,17 +184,13 @@ async fn wait_for_listening(port: u16) {
     panic!("gateway did not start listening on port {port}");
 }
 
-fn spawn_gateway(store: Store) -> (tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+fn spawn_gateway(store: Store) -> (tokio::task::JoinHandle<()>, drain::Signal) {
+    let (stop, watch) = drain::channel();
     let gw = Gateway::new(store);
     let handle = tokio::spawn(async move {
-        gw.run(async {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .unwrap();
+        gw.run(watch).await.unwrap();
     });
-    (handle, shutdown_tx)
+    (handle, stop)
 }
 
 // =================== tests ===================
@@ -224,7 +219,7 @@ async fn http1_round_trip() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"GET /hello");
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -258,7 +253,7 @@ async fn http2_prior_knowledge_round_trip() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"GET /h2-path");
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -329,7 +324,7 @@ async fn host_routing_picks_matching_listener() {
     // any listener on the bind is active.
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -390,7 +385,7 @@ async fn path_routing_longest_prefix_wins() {
         .expect("request failed");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -447,7 +442,7 @@ async fn request_header_modifier_applies() {
         .unwrap_or("");
     assert_eq!(echoed, "from-filter");
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -600,7 +595,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         "wrong header value should fall through to catchall"
     );
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -718,7 +713,7 @@ async fn regex_path_routes_matching_request() {
         .unwrap_or("");
     assert_eq!(served, "CATCHALL", "non-matching path should fall through");
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -801,7 +796,7 @@ async fn response_header_modifier_applies() {
         "removed header must not appear on the response"
     );
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -825,7 +820,7 @@ async fn unreachable_backend_returns_502() {
         .expect("request failed");
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -911,7 +906,7 @@ async fn run_version_case(server_proto: BackendProtocol, client_h2: bool) -> (St
         .unwrap_or("")
         .to_string();
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
     (status, server_version)
 }
@@ -980,7 +975,7 @@ async fn grpc_shaped_round_trip() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, payload);
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
 }
 
@@ -1050,7 +1045,7 @@ async fn route_with_unregistered_backend_returns_500() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")
@@ -1104,7 +1099,7 @@ async fn weighted_refs_split_between_resolved_and_missing() {
     assert!(oks > 0, "resolved ref received no traffic");
     assert!(errors > 0, "unresolved ref received no traffic");
 
-    let _ = shutdown_tx.send(());
+    drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
         .await
         .expect("gateway did not shut down")

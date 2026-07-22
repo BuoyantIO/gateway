@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/gateway-config",
   "crates/gateway-state",
+  "crates/gateway-drain",
   "crates/gateway-runtime",
   "crates/gatewayd",
   "crates/gateway-cp-proto",

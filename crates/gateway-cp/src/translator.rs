@@ -580,8 +580,8 @@ where
 /// Recognized HTTP/2 indicators on `Service.spec.ports[*].appProtocol`.
 ///
 /// `kubernetes.io/h2c` is the Kubernetes-registered value;
-/// `h2c` and `grpc` are de-facto conventions used by NGINX, Envoy,
-/// and agent gateway. Any other value — including the websocket
+/// `h2c` and `grpc` are de-facto conventions widely recognized by
+/// proxies. Any other value — including the websocket
 /// variants `kubernetes.io/ws` / `kubernetes.io/wss` or any custom
 /// `mycompany.com/...` string — maps to HTTP/1.1.
 ///
