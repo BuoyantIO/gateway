@@ -15,6 +15,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -37,6 +38,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rand::Rng;
 
+use crate::drain;
 use crate::lb::{EndpointInfo, LoadBalancer};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -350,8 +352,8 @@ fn apply_header_ops(
 ///
 /// `auto::Builder::serve_connection_with_upgrades` peeks the first
 /// bytes for the HTTP/2 preface and wires the H2 codec on match,
-/// otherwise HTTP/1.1. This is the same wiring agent gateway uses; it
-/// removes any need for the gateway itself to distinguish H1 from H2C.
+/// otherwise HTTP/1.1, so the gateway itself never has to
+/// distinguish H1 from H2C.
 pub(crate) async fn handle_connection<I>(
     store: Store,
     bind_key: BindKey,
@@ -359,6 +361,7 @@ pub(crate) async fn handle_connection<I>(
     peer: SocketAddr,
     lb: Arc<LoadBalancer>,
     client: HttpClient,
+    drain: drain::Watch,
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -377,7 +380,34 @@ pub(crate) async fn handle_connection<I>(
     });
 
     let builder = auto::Builder::new(TokioExecutor::new());
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    let mut conn = std::pin::pin!(conn);
+
+    // Serve until the client closes — or the drain fires (process
+    // shutdown merged with this bind's teardown), in which case tell
+    // the peer to go away (`Connection: close` on HTTP/1, GOAWAY on
+    // HTTP/2), keep driving in-flight work to completion, and only
+    // then release the drain barrier (the handle held below).
+    //
+    // Hand-rolled poll instead of `select!`: polling the auto
+    // connection from multiple await points trips rustc's
+    // "implementation of `From` is not general enough" false positive
+    // on its error conversions. hyper-util has this exact future
+    // internally (its graceful-shutdown watcher) but keeps it private.
+    let mut signaled = std::pin::pin!(drain.signaled());
+    let mut release = None;
+    let result = std::future::poll_fn(|cx| {
+        if release.is_none()
+            && let Poll::Ready(shutdown) = signaled.as_mut().poll(cx)
+        {
+            conn.as_mut().graceful_shutdown();
+            release = Some(shutdown);
+        }
+        conn.as_mut().poll(cx)
+    })
+    .await;
+    drop(release);
+    if let Err(e) = result {
         tracing::debug!(%peer, error = %e, "http connection terminated");
     }
 }
@@ -791,8 +821,8 @@ fn method_matches(want: &Method, got: &Method) -> bool {
 ///
 /// Repeated header values: if the request carries multiple values
 /// for the same header, the match succeeds if **any** of them
-/// matches (linkerd / Envoy convention; Gateway API leaves this
-/// undefined).
+/// matches (Gateway API leaves this undefined; any-of is the common
+/// proxy behavior).
 fn header_matches(want: &HeaderMatch, headers: &http::HeaderMap) -> bool {
     let values = headers.get_all(&want.name);
     match &want.value {
@@ -809,7 +839,8 @@ fn header_matches(want: &HeaderMatch, headers: &http::HeaderMap) -> bool {
 /// via `form_urlencoded`. Regexes are anchored at both ends.
 ///
 /// Repeated keys: match succeeds if **any** occurrence's value
-/// matches (linkerd convention; Gateway API leaves this undefined).
+/// matches (Gateway API leaves this undefined; any-of is the common
+/// proxy behavior).
 fn query_param_matches(want: &QueryParamMatch, query: Option<&str>) -> bool {
     let Some(qs) = query else {
         return false;
@@ -826,9 +857,8 @@ fn query_param_matches(want: &QueryParamMatch, query: Option<&str>) -> bool {
 }
 
 /// Whole-string regex match. `regex::Regex::find` matches anywhere;
-/// we explicitly check `start == 0 && end == len`. This mirrors
-/// linkerd2-proxy's
-/// `linkerd/http/route/src/http/match/header.rs:21-29`.
+/// we explicitly check `start == 0 && end == len` so a pattern only
+/// matches the entire value.
 fn regex_anchored(re: &regex::Regex, value: &str) -> bool {
     re.find(value)
         .is_some_and(|m| m.start() == 0 && m.end() == value.len())
@@ -1448,8 +1478,8 @@ mod tests {
         headers.insert("x-id", "bar".parse().unwrap());
         // Regex `bar` should match full `bar` value.
         assert!(header_matches(&header_regex("x-id", "bar"), &headers));
-        // Regex `bar` should NOT match `barbaz` — linkerd-style
-        // explicit anchoring at both ends.
+        // Regex `bar` should NOT match `barbaz` — patterns are
+        // anchored at both ends.
         headers.insert("x-id", "barbaz".parse().unwrap());
         assert!(!header_matches(&header_regex("x-id", "bar"), &headers));
         // Regex `b.+` matches the whole string.

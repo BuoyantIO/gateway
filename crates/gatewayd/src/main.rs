@@ -26,6 +26,12 @@ struct Args {
     /// server when unset.
     #[arg(long)]
     admin_addr: Option<SocketAddr>,
+
+    /// Seconds in-flight connections get to finish after shutdown or
+    /// a bind teardown starts. Sized under the default Kubernetes
+    /// termination grace period (30s) so draining beats the SIGKILL.
+    #[arg(long, default_value_t = 25)]
+    drain_grace: u64,
 }
 
 #[tokio::main]
@@ -53,23 +59,27 @@ async fn main() -> anyhow::Result<()> {
         ready_tx.send_replace(true);
     }
 
-    // Shared shutdown flag. ctrl-c flips it; both the CP client task
-    // (if any) and the gateway run loop wait on it.
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let signal_tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("ctrl-c received; shutting down");
-        let _ = signal_tx.send(true);
-    });
+    // One drain channel is the whole shutdown story: the Watch side
+    // is the shutdown signal every component
+    // listens on, the Signal side is the barrier the driver waits
+    // out. SIGTERM is what the kubelet sends on pod deletion —
+    // handling it is what makes rolling updates drain instead of
+    // riding out the grace period to SIGKILL.
+    let grace = std::time::Duration::from_secs(args.drain_grace);
+    let (drain_signal, drain_watch) = gateway_runtime::drain::channel();
+    // The admin server drains on its own channel, chained after the
+    // data drain: it must keep answering probes (as unready) while
+    // connections finish, and stop only afterwards. shutting_down is
+    // the level the probe state reads during that window.
+    let (admin_signal, admin_watch) = gateway_runtime::drain::channel();
+    let (shutting_down_tx, shutting_down_rx) = watch::channel(false);
+    let driver = spawn_drain_driver(drain_signal, admin_signal, shutting_down_tx, grace)?;
 
     let admin_handle = if let Some(addr) = args.admin_addr {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!(%addr, "admin server listening");
-        let mut rx = shutdown_rx.clone();
-        Some(tokio::spawn(admin::serve(listener, ready_rx, async move {
-            let _ = rx.wait_for(|v| *v).await;
-        })))
+        let probe_rx = spawn_probe_state(ready_rx.clone(), shutting_down_rx.clone());
+        Some(tokio::spawn(admin::serve(listener, probe_rx, admin_watch)))
     } else {
         None
     };
@@ -79,12 +89,12 @@ async fn main() -> anyhow::Result<()> {
         let endpoint = tonic::transport::Endpoint::try_from(cp_url)
             .map_err(|e| anyhow::anyhow!("invalid --control-plane URL: {e}"))?;
         let store_clone = store.clone();
-        let mut rx = shutdown_rx.clone();
+        let w = drain_watch.clone();
         tracing::info!(?endpoint, client_id, "connecting to control plane");
         Some(tokio::spawn(async move {
             if let Err(e) =
                 gateway_cp_client::run(endpoint, client_id, store_clone, ready_tx, async move {
-                    let _ = rx.wait_for(|v| *v).await;
+                    let _ = w.signaled().await;
                 })
                 .await
             {
@@ -96,12 +106,16 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let gateway = gateway_runtime::Gateway::new(store);
-    let mut rx = shutdown_rx;
-    gateway
-        .run(async move {
-            let _ = rx.wait_for(|v| *v).await;
-        })
-        .await?;
+    gateway.run(drain_watch).await?;
+
+    // The run loop exited: on a signal the driver is already waiting
+    // out in-flight work under the grace deadline; without one (event
+    // channel closed) there is nothing to drain against.
+    if *shutting_down_rx.borrow() {
+        let _ = driver.await;
+    } else {
+        driver.abort();
+    }
 
     if let Some(handle) = cp_handle {
         let _ = handle.await;
@@ -111,6 +125,66 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Register SIGINT/SIGTERM and spawn the drain driver: on the first
+/// signal, go unready and fire the data drain, waiting out in-flight
+/// connections under the grace deadline, then drain the admin server
+/// (which served unready probes throughout). A second signal skips
+/// the wait and exits immediately — a courtesy for an impatient
+/// operator; Kubernetes itself never sends a second SIGTERM.
+fn spawn_drain_driver(
+    data: gateway_runtime::drain::Signal,
+    admin: gateway_runtime::drain::Signal,
+    shutting_down: watch::Sender<bool>,
+    grace: std::time::Duration,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{SignalKind, signal as unix_signal};
+    let mut interrupt = unix_signal(SignalKind::interrupt())?;
+    let mut terminate = unix_signal(SignalKind::terminate())?;
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => tracing::info!("SIGINT received; draining"),
+            _ = terminate.recv() => tracing::info!("SIGTERM received; draining"),
+        }
+        let _ = shutting_down.send(true);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+            tracing::warn!("second signal received; exiting immediately");
+            std::process::exit(1);
+        });
+        if tokio::time::timeout(grace, data.drain()).await.is_err() {
+            tracing::warn!("drain deadline expired with connections still open; exiting");
+        }
+        // Probe responses are sub-second; a short deadline is plenty.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), admin.drain()).await;
+    }))
+}
+
+/// Effective probe readiness = bootstrapped && not shutting down: a
+/// draining pod goes unready so it leaves the Service endpoints while
+/// in-flight work finishes.
+fn spawn_probe_state(
+    mut ready: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+) -> watch::Receiver<bool> {
+    let (probe_tx, probe_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        loop {
+            let up = *ready.borrow_and_update() && !*shutdown.borrow_and_update();
+            if probe_tx.send(up).is_err() {
+                return;
+            }
+            tokio::select! {
+                c = ready.changed() => { if c.is_err() { return; } }
+                c = shutdown.changed() => { if c.is_err() { return; } }
+            }
+        }
+    });
+    probe_rx
 }
 
 fn load_yaml_into_store(

@@ -8,6 +8,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 
 use crate::accept;
+use crate::drain;
 use crate::error::RuntimeError;
 use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
 use crate::proxy::http::HttpClient;
@@ -47,35 +48,43 @@ impl Gateway {
         }
     }
 
-    /// Run until `shutdown` resolves. Spawns accept tasks for every bind
+    /// Run until `drain` fires — the drain watch doubles as the
+    /// shutdown signal. Spawns accept tasks for every bind
     /// currently in the store, then drives the bind-event loop.
     ///
-    /// On shutdown, all per-bind tasks are aborted; in-flight connections
-    /// are dropped without drain.
+    /// Every accepted connection watches the process drain merged
+    /// with its own bind's drain: either one makes it close
+    /// gracefully — `Connection: close` on HTTP/1, GOAWAY on HTTP/2 —
+    /// after finishing in-flight work. Bind teardown is RAII:
+    /// dropping a session drops its `Signal`, which fires its
+    /// connections' watches. The caller owns the process barrier:
+    /// after this returns, `Signal::drain` resolves once every
+    /// connection has finished (bound it with a timeout).
     ///
     /// # Errors
     /// Returns `RuntimeError` if the event channel closes unexpectedly.
-    pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RuntimeError> {
+    pub async fn run(self, drain: drain::Watch) -> Result<(), RuntimeError> {
         let mut rx = self.store.subscribe();
-        // One BindSession per active bind: the spawned accept task plus
-        // the address it's listening on. Dropping a session aborts its
-        // task; replacing the entry with `insert(...)` swaps in a new
-        // session and drops the old one (aborting the old task).
+        // One BindSession per active bind: the spawned accept task,
+        // the address it listens on, and the drain signal for its
+        // connections. Dropping a session aborts the accept task and
+        // fires the signal; replacing an entry with `insert` tears
+        // down the old one the same way.
         let mut sessions: HashMap<BindKey, BindSession> = HashMap::new();
 
         // Seed: spawn an accept task for every currently-active bind.
         let initial: Vec<_> = self.store.read().binds().collect();
         for bind in initial {
-            if let Some(s) = self.spawn_session(&bind.key) {
+            if let Some(s) = self.spawn_session(&bind.key, &drain) {
                 sessions.insert(bind.key.clone(), s);
             }
         }
 
-        let mut shutdown = pin!(shutdown);
+        let mut stop = pin!(drain.clone().signaled());
         loop {
             tokio::select! {
                 biased;
-                () = &mut shutdown => break,
+                _release = &mut stop => break,
                 evt = rx.recv() => match evt {
                     Ok(BindEvent::Added(k) | BindEvent::Updated(k)) => {
                         let new_addr = self.store.read().bind(&k)
@@ -89,8 +98,8 @@ impl Gateway {
                                 let unchanged = sessions.get(&k)
                                     .is_some_and(|s| s.listening_addr == new);
                                 if !unchanged {
-                                    if let Some(s) = self.spawn_session(&k) {
-                                        sessions.insert(k, s); // drops & aborts the old one if any
+                                    if let Some(s) = self.spawn_session(&k, &drain) {
+                                        sessions.insert(k, s);
                                     } else {
                                         sessions.remove(&k);
                                     }
@@ -109,7 +118,7 @@ impl Gateway {
                         sessions.clear();
                         let snapshot: Vec<_> = self.store.read().binds().collect();
                         for bind in snapshot {
-                            if let Some(s) = self.spawn_session(&bind.key) {
+                            if let Some(s) = self.spawn_session(&bind.key, &drain) {
                                 sessions.insert(bind.key.clone(), s);
                             }
                         }
@@ -119,12 +128,13 @@ impl Gateway {
             }
         }
 
-        // Drop all remaining sessions → all accept tasks aborted.
+        // Drop every session: accept tasks abort, bind signals fire,
+        // connections close gracefully under the caller's barrier.
         drop(sessions);
         Ok(())
     }
 
-    fn spawn_session(&self, key: &BindKey) -> Option<BindSession> {
+    fn spawn_session(&self, key: &BindKey, process_drain: &drain::Watch) -> Option<BindSession> {
         let bind = self.store.read().bind(key)?;
         let addr = SocketAddr::new(bind.address, bind.port);
         let protocol = bind.bind_protocol;
@@ -132,22 +142,30 @@ impl Gateway {
         let lb = Arc::clone(&self.lb);
         let http_client = self.http_client.clone();
         let bind_key = key.clone();
+        let (bind_signal, bind_drain) = drain::channel();
+        // One merged watch per bind: connections fire on process
+        // shutdown OR this bind's teardown through a single future.
+        let conn_drain = process_drain.clone().merge(bind_drain);
         let task = tokio::spawn(async move {
-            accept::run_bind(store, bind_key, addr, protocol, lb, http_client).await;
+            accept::run_bind(store, bind_key, addr, protocol, lb, http_client, conn_drain).await;
         });
         Some(BindSession {
             task,
             listening_addr: addr,
+            _signal: bind_signal,
         })
     }
 }
 
 /// A running per-bind accept task, paired with the socket address it's
-/// listening on. Dropping the session aborts the task.
-/// TODO: handle proper draining of in-flight connections.
+/// listening on and the drain signal for its connections. Teardown is
+/// the `Drop`: the accept task aborts (stopping new connections) and
+/// the signal drops, which fires the drain watch every connection of
+/// this bind holds.
 struct BindSession {
     task: JoinHandle<()>,
     listening_addr: SocketAddr,
+    _signal: drain::Signal,
 }
 
 impl Drop for BindSession {
