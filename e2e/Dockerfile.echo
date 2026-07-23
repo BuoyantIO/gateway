@@ -9,10 +9,12 @@ ENV RUSTUP_MAX_RETRIES=10
 ENV CARGO_INCREMENTAL=0
 COPY . .
 RUN --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
-    cargo build --release --locked --bin echo -p gateway-e2e \
-    && cp /src/target/release/echo /usr/local/bin/echo
+    cargo build --release --locked -p gateway-e2e --bin echo --bin grpc_echo \
+    && cp /src/target/release/echo /usr/local/bin/echo \
+    && cp /src/target/release/grpc_echo /usr/local/bin/grpc_echo
 
 FROM debian:bookworm-slim
 COPY --from=builder /usr/local/bin/echo /usr/local/bin/echo
+COPY --from=builder /usr/local/bin/grpc_echo /usr/local/bin/grpc_echo
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/echo"]

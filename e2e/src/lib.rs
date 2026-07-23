@@ -9,9 +9,15 @@ pub mod cluster;
 pub mod drive;
 pub mod fixtures;
 
+/// Generated types for the e2e gRPC echo service (`proto/echo.proto`).
+pub mod grpc {
+    #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
+    tonic::include_proto!("echo.v1");
+}
+
 pub use cluster::{Scope, kube_client};
 pub use drive::{Driver, wait_until_redirected, wait_until_routed, wait_until_routed_tls};
 pub use fixtures::{
-    HttpRouteBuilder, deploy_echo, deploy_tls_secret, gateway, gateway_address, gateway_https,
-    http_route, scale_deployment,
+    HttpRouteBuilder, delete_http_route, deploy_echo, deploy_grpc_echo, deploy_tls_secret, gateway,
+    gateway_address, gateway_https, http_route, scale_deployment,
 };

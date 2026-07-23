@@ -1,0 +1,32 @@
+// Test-only gRPC service used by the e2e suite to prove the gateway
+// forwards gRPC end to end: trailers (grpc-status), long-lived
+// server streams, and large unary messages.
+syntax = "proto3";
+
+package echo.v1;
+
+service GrpcEcho {
+  // Echoes the payload back; the large-message round-trip probe.
+  rpc UnaryEcho(Payload) returns (Payload);
+  // Emits `ticks` messages spaced `interval_ms` apart, then ends OK;
+  // the long-lived stream probe.
+  rpc ServerStream(StreamRequest) returns (stream Tick);
+  // Always fails with INTERNAL "boom"; proves trailer content
+  // (status code and message) crosses the gateway.
+  rpc Fail(Empty) returns (Empty);
+}
+
+message Payload {
+  bytes data = 1;
+}
+
+message StreamRequest {
+  uint32 ticks = 1;
+  uint32 interval_ms = 2;
+}
+
+message Tick {
+  uint64 seq = 1;
+}
+
+message Empty {}
