@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_e2e::fixtures::apply_gateway;
-use gateway_e2e::{Scope, gateway};
+use gateway_e2e::{Scope, annotate_gateway, gateway};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount, ServicePort, ServiceSpec};
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
@@ -246,6 +246,36 @@ async fn squatted_service_is_refused_but_siblings_apply() -> Result<()> {
             .is_none(),
         "squatted Service must not be adopted"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn replicas_annotation_scales_the_provisioned_deployment() -> Result<()> {
+    let scope = Scope::new("prov-replicas").await?;
+    let ns = scope.name();
+    let client = scope.client();
+    let (_, _, dep_api) = apis(client, ns);
+
+    let mut gw = gateway(ns, "gw", 80, None);
+    gw.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert("gateway.buoyant.io/dp-replicas".to_owned(), "2".to_owned());
+    apply_gateway(client, &gw).await?;
+
+    wait_for(&dep_api, "gw-gatewayd", "two DP replicas available", |d| {
+        d.status.as_ref().and_then(|s| s.available_replicas) == Some(2)
+    })
+    .await?;
+
+    // Removing the annotation reconciles back to the default of one.
+    annotate_gateway(client, ns, "gw", "gateway.buoyant.io/dp-replicas", None).await?;
+    wait_for(&dep_api, "gw-gatewayd", "replicas back to default", |d| {
+        d.spec.as_ref().and_then(|s| s.replicas) == Some(1)
+    })
+    .await?;
 
     Ok(())
 }
