@@ -279,3 +279,59 @@ async fn replicas_annotation_scales_the_provisioned_deployment() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn resource_annotations_land_on_the_dp_container() -> Result<()> {
+    let scope = Scope::new("prov-resources").await?;
+    let ns = scope.name();
+    let client = scope.client();
+    let (_, _, dep_api) = apis(client, ns);
+
+    let mut gw = gateway(ns, "gw", 80, None);
+    let annotations = gw.metadata.annotations.get_or_insert_with(BTreeMap::new);
+    annotations.insert(
+        "gateway.buoyant.io/dp-cpu-request".to_owned(),
+        "100m".to_owned(),
+    );
+    annotations.insert(
+        "gateway.buoyant.io/dp-memory-limit".to_owned(),
+        "64Mi".to_owned(),
+    );
+    apply_gateway(client, &gw).await?;
+
+    let resources = |d: &Deployment| {
+        d.spec
+            .as_ref()?
+            .template
+            .spec
+            .as_ref()?
+            .containers
+            .first()?
+            .resources
+            .clone()
+    };
+    wait_for(&dep_api, "gw-gatewayd", "resources on the container", |d| {
+        resources(d).is_some_and(|r| {
+            r.requests
+                .as_ref()
+                .is_some_and(|req| req.get("cpu").is_some_and(|q| q.0 == "100m"))
+                && r.limits
+                    .as_ref()
+                    .is_some_and(|lim| lim.get("memory").is_some_and(|q| q.0 == "64Mi"))
+        })
+    })
+    .await?;
+
+    // Removing one annotation clears its entry and keeps the other.
+    annotate_gateway(client, ns, "gw", "gateway.buoyant.io/dp-memory-limit", None).await?;
+    wait_for(
+        &dep_api,
+        "gw-gatewayd",
+        "limit cleared, request kept",
+        |d| resources(d).is_some_and(|r| r.limits.is_none() && r.requests.is_some()),
+    )
+    .await?;
+
+    Ok(())
+}

@@ -6,6 +6,7 @@
 //! [`writer`] owns the apiserver writes. The watch loop connects
 //! them through an [`InfraPublisher`].
 
+mod annotations;
 pub mod desired;
 pub mod writer;
 
@@ -50,3 +51,12 @@ pub const SERVICE_TYPE_ANNOTATION: &str = "gateway.buoyant.io/service-type";
 /// `Deployment`: a positive integer, default 1. Anything else falls
 /// back to the default with a warning.
 pub const DP_REPLICAS_ANNOTATION: &str = "gateway.buoyant.io/dp-replicas";
+
+/// Per-Gateway resource requests and limits for the provisioned
+/// data-plane container, each a Kubernetes quantity. Unset means no
+/// entry; an invalid quantity is skipped with a warning without
+/// discarding the others.
+pub const DP_CPU_REQUEST_ANNOTATION: &str = "gateway.buoyant.io/dp-cpu-request";
+pub const DP_MEMORY_REQUEST_ANNOTATION: &str = "gateway.buoyant.io/dp-memory-request";
+pub const DP_CPU_LIMIT_ANNOTATION: &str = "gateway.buoyant.io/dp-cpu-limit";
+pub const DP_MEMORY_LIMIT_ANNOTATION: &str = "gateway.buoyant.io/dp-memory-limit";

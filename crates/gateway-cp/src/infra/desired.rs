@@ -17,8 +17,8 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Resource;
 
 use super::{
-    DP_REPLICAS_ANNOTATION, GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
-    PROVISIONING_ANNOTATION, PROVISIONING_DISABLED, SERVICE_TYPE_ANNOTATION,
+    GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE, PROVISIONING_ANNOTATION,
+    PROVISIONING_DISABLED, annotations,
 };
 
 /// Kubernetes object-name length cap (RFC 1123 label).
@@ -80,8 +80,8 @@ pub fn desired(gw: &Gateway, cfg: &InfraConfig) -> Option<GatewayInfra> {
     let namespace = gw.meta().namespace.as_deref()?;
     let uid = gw.meta().uid.as_deref()?;
 
-    let self_managed =
-        annotation(gw, PROVISIONING_ANNOTATION).is_some_and(|v| v == PROVISIONING_DISABLED);
+    let self_managed = annotations::annotation(gw, PROVISIONING_ANNOTATION)
+        .is_some_and(|v| v == PROVISIONING_DISABLED);
     if self_managed {
         return None;
     }
@@ -175,7 +175,7 @@ fn deployment(
     Deployment {
         metadata,
         spec: Some(DeploymentSpec {
-            replicas: Some(dp_replicas(gw)),
+            replicas: Some(annotations::dp_replicas(gw)),
             selector: LabelSelector {
                 match_labels: Some(selector_labels.clone()),
                 ..Default::default()
@@ -203,6 +203,7 @@ fn deployment(
                             ..Default::default()
                         }]),
                         ports: Some(container_ports),
+                        resources: annotations::dp_resources(gw),
                         readiness_probe: Some(ready_probe(admin_port, 10, None)),
                         startup_probe: Some(ready_probe(admin_port, 1, Some(60))),
                         ..Default::default()
@@ -216,74 +217,13 @@ fn deployment(
     }
 }
 
-/// A Gateway metadata annotation by key.
-fn annotation<'a>(gw: &'a Gateway, key: &str) -> Option<&'a str> {
-    gw.meta()
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(key))
-        .map(String::as_str)
-}
-
-/// Replica count for the provisioned Deployment: the annotation as a
-/// positive integer, or 1 (also the fallback for anything that isn't
-/// one, with a warning).
-fn dp_replicas(gw: &Gateway) -> i32 {
-    match annotation(gw, DP_REPLICAS_ANNOTATION) {
-        None => 1,
-        Some(v) => match v.parse::<i32>() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                let gateway = format!(
-                    "{}/{}",
-                    gw.meta().namespace.as_deref().unwrap_or_default(),
-                    gw.meta().name.as_deref().unwrap_or_default(),
-                );
-                tracing::warn!(
-                    gateway,
-                    value = %v,
-                    annotation = DP_REPLICAS_ANNOTATION,
-                    "replicas must be a positive integer; using 1"
-                );
-                1
-            }
-        },
-    }
-}
-
-/// The Service types the annotation may select. Anything else falls
-/// back to the default with a warning — passing a bad value through
-/// would produce a Service the apiserver never accepts and wedge the
-/// apply loop on permanent retries.
-const SERVICE_TYPES: [&str; 3] = ["ClusterIP", "NodePort", "LoadBalancer"];
-
-const DEFAULT_SERVICE_TYPE: &str = "LoadBalancer";
-
 fn service(
     gw: &Gateway,
     metadata: ObjectMeta,
     selector_labels: &BTreeMap<String, String>,
     ports: &[(String, i32)],
 ) -> Service {
-    let annotated = annotation(gw, SERVICE_TYPE_ANNOTATION);
-    let service_type = match annotated {
-        Some(v) if SERVICE_TYPES.contains(&v) => v.to_string(),
-        Some(v) => {
-            let gateway = format!(
-                "{}/{}",
-                gw.meta().namespace.as_deref().unwrap_or_default(),
-                gw.meta().name.as_deref().unwrap_or_default(),
-            );
-            tracing::warn!(
-                gateway,
-                value = %v,
-                annotation = SERVICE_TYPE_ANNOTATION,
-                "unsupported service type; using {DEFAULT_SERVICE_TYPE}"
-            );
-            DEFAULT_SERVICE_TYPE.to_string()
-        }
-        None => DEFAULT_SERVICE_TYPE.to_string(),
-    };
+    let service_type = annotations::service_type(gw);
 
     Service {
         metadata,
@@ -372,6 +312,10 @@ fn ready_probe(admin_port: i32, period_seconds: i32, failure_threshold: Option<i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::{
+        DP_CPU_LIMIT_ANNOTATION, DP_CPU_REQUEST_ANNOTATION, DP_MEMORY_LIMIT_ANNOTATION,
+        DP_MEMORY_REQUEST_ANNOTATION, DP_REPLICAS_ANNOTATION, SERVICE_TYPE_ANNOTATION,
+    };
 
     use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassSpec};
     use gateway_api::apis::standard::gateways::{
@@ -662,6 +606,51 @@ mod tests {
             infra.service.spec.as_ref().unwrap().type_.as_deref(),
             Some("ClusterIP")
         );
+    }
+
+    #[test]
+    fn resources_absent_without_annotations() {
+        let gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        let infra = desired(&gw, &config()).unwrap();
+        assert_eq!(container(&infra).resources, None);
+    }
+
+    #[test]
+    fn resource_annotations_land_on_the_container() {
+        let mut gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        gw.metadata.annotations = Some(
+            [
+                (DP_CPU_REQUEST_ANNOTATION.to_string(), "100m".to_string()),
+                (DP_MEMORY_REQUEST_ANNOTATION.to_string(), "32Mi".to_string()),
+                (DP_CPU_LIMIT_ANNOTATION.to_string(), "1".to_string()),
+                (DP_MEMORY_LIMIT_ANNOTATION.to_string(), "64Mi".to_string()),
+            ]
+            .into(),
+        );
+        let infra = desired(&gw, &config()).unwrap();
+        let resources = container(&infra).resources.clone().unwrap();
+        let requests = resources.requests.unwrap();
+        let limits = resources.limits.unwrap();
+        assert_eq!(requests["cpu"].0, "100m");
+        assert_eq!(requests["memory"].0, "32Mi");
+        assert_eq!(limits["cpu"].0, "1");
+        assert_eq!(limits["memory"].0, "64Mi");
+    }
+
+    #[test]
+    fn invalid_quantity_is_skipped_without_discarding_the_rest() {
+        let mut gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        gw.metadata.annotations = Some(
+            [
+                (DP_CPU_REQUEST_ANNOTATION.to_string(), "lots".to_string()),
+                (DP_MEMORY_LIMIT_ANNOTATION.to_string(), "64Mi".to_string()),
+            ]
+            .into(),
+        );
+        let infra = desired(&gw, &config()).unwrap();
+        let resources = container(&infra).resources.clone().unwrap();
+        assert_eq!(resources.requests, None, "invalid cpu request skipped");
+        assert_eq!(resources.limits.unwrap()["memory"].0, "64Mi");
     }
 
     #[test]
