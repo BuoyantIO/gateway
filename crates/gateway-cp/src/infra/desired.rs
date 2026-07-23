@@ -27,12 +27,15 @@ const MAX_NAME: usize = 63;
 /// Readiness endpoint served by gatewayd's admin server.
 const READY_PATH: &str = "/healthz/ready";
 
-/// Everything the CP provisions for one Gateway.
+/// Everything the CP provisions for one Gateway. `service` is `None`
+/// when the Gateway attaches to an operator-owned Service (the
+/// service-name annotation): the `ServiceAccount` and `Deployment`
+/// are still provisioned, the fronting Service is not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayInfra {
     pub service_account: ServiceAccount,
     pub deployment: Deployment,
-    pub service: Service,
+    pub service: Option<Service>,
 }
 
 /// Provisioner-level knobs, carried from CP flags.
@@ -133,7 +136,11 @@ pub fn desired(gw: &Gateway, cfg: &InfraConfig) -> Option<GatewayInfra> {
             annotations,
             &ports,
         ),
-        service: service(gw, metadata, &selector_labels, &ports),
+        // With an operator-owned Service named, the operator points
+        // its selector at the DP pods; we provision no Service.
+        service: annotations::service_name(gw)
+            .is_none()
+            .then(|| service(gw, metadata, &selector_labels, &ports)),
     })
 }
 
@@ -358,6 +365,10 @@ mod tests {
         }
     }
 
+    fn svc(infra: &GatewayInfra) -> &Service {
+        infra.service.as_ref().expect("service provisioned")
+    }
+
     fn container(infra: &GatewayInfra) -> &Container {
         &infra
             .deployment
@@ -420,7 +431,7 @@ mod tests {
         for meta in [
             &infra.service_account.metadata,
             &infra.deployment.metadata,
-            &infra.service.metadata,
+            &svc(&infra).metadata,
         ] {
             assert_eq!(meta.name.as_deref(), Some("web-gatewayd"));
             assert_eq!(meta.namespace.as_deref(), Some("demo"));
@@ -434,6 +445,44 @@ mod tests {
             assert_eq!(owner.uid, "uid-1234");
             assert_eq!(owner.controller, Some(true));
         }
+    }
+
+    #[test]
+    fn service_name_annotation_skips_the_service_only() {
+        let mut gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        gw.metadata.annotations = Some(
+            [(
+                crate::infra::SERVICE_NAME_ANNOTATION.to_string(),
+                "edge".to_string(),
+            )]
+            .into(),
+        );
+        let infra = desired(&gw, &config()).expect("provisioned");
+
+        assert!(infra.service.is_none());
+        assert_eq!(
+            infra.service_account.metadata.name.as_deref(),
+            Some("web-gatewayd")
+        );
+        assert_eq!(
+            infra.deployment.metadata.name.as_deref(),
+            Some("web-gatewayd")
+        );
+        // The DP pods keep the selector label the operator's Service
+        // points at.
+        let pod_labels = infra
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .as_ref()
+            .unwrap()
+            .labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(pod_labels.get(GATEWAY_NAME_LABEL).unwrap(), "web");
     }
 
     #[test]
@@ -505,7 +554,7 @@ mod tests {
         );
 
         // The Service exposes listener ports only — never admin.
-        let svc_ports = infra.service.spec.as_ref().unwrap().ports.as_ref().unwrap();
+        let svc_ports = svc(&infra).spec.as_ref().unwrap().ports.as_ref().unwrap();
         let seen: Vec<(Option<&str>, i32, &IntOrString)> = svc_ports
             .iter()
             .map(|p| (p.name.as_deref(), p.port, p.target_port.as_ref().unwrap()))
@@ -594,7 +643,7 @@ mod tests {
         let gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
         let infra = desired(&gw, &config()).unwrap();
         assert_eq!(
-            infra.service.spec.as_ref().unwrap().type_.as_deref(),
+            svc(&infra).spec.as_ref().unwrap().type_.as_deref(),
             Some("LoadBalancer")
         );
 
@@ -603,7 +652,7 @@ mod tests {
             Some([(SERVICE_TYPE_ANNOTATION.to_string(), "ClusterIP".to_string())].into());
         let infra = desired(&gw, &config()).unwrap();
         assert_eq!(
-            infra.service.spec.as_ref().unwrap().type_.as_deref(),
+            svc(&infra).spec.as_ref().unwrap().type_.as_deref(),
             Some("ClusterIP")
         );
     }
@@ -690,7 +739,7 @@ mod tests {
             Some([(SERVICE_TYPE_ANNOTATION.to_string(), "clusterip".to_string())].into());
         let infra = desired(&gw, &config()).unwrap();
         assert_eq!(
-            infra.service.spec.as_ref().unwrap().type_.as_deref(),
+            svc(&infra).spec.as_ref().unwrap().type_.as_deref(),
             Some("LoadBalancer")
         );
     }
@@ -740,8 +789,7 @@ mod tests {
             .unwrap();
         assert_eq!(selector.len(), 1);
         assert_eq!(selector.get(GATEWAY_NAME_LABEL).unwrap(), "web");
-        let svc_selector = infra
-            .service
+        let svc_selector = svc(&infra)
             .spec
             .as_ref()
             .unwrap()
