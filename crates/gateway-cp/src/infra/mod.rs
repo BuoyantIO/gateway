@@ -6,7 +6,7 @@
 //! [`writer`] owns the apiserver writes. The watch loop connects
 //! them through an [`InfraPublisher`].
 
-mod annotations;
+pub(crate) mod annotations;
 pub mod desired;
 pub mod writer;
 
@@ -60,3 +60,11 @@ pub const DP_CPU_REQUEST_ANNOTATION: &str = "gateway.buoyant.io/dp-cpu-request";
 pub const DP_MEMORY_REQUEST_ANNOTATION: &str = "gateway.buoyant.io/dp-memory-request";
 pub const DP_CPU_LIMIT_ANNOTATION: &str = "gateway.buoyant.io/dp-cpu-limit";
 pub const DP_MEMORY_LIMIT_ANNOTATION: &str = "gateway.buoyant.io/dp-memory-limit";
+
+/// Per-Gateway reference to an operator-owned `Service` in the
+/// Gateway's own namespace. When set, the provisioner skips its own
+/// `Service` (deleting a previously provisioned one) and never
+/// mutates the referenced object; address writeback reads the
+/// referenced `Service` instead. The operator points its selector at
+/// the DP pods via [`GATEWAY_NAME_LABEL`].
+pub const SERVICE_NAME_ANNOTATION: &str = "gateway.buoyant.io/service-name";

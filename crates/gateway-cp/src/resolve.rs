@@ -27,6 +27,7 @@ use gateway_cp_proto::v1 as pb;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 
+use crate::infra;
 use crate::infra::desired::object_name;
 use crate::infra::{GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE};
 use crate::snapshot::GatewayId;
@@ -684,18 +685,35 @@ fn endpoints_from_slices(
     out.into_values().collect()
 }
 
-/// The address(es) a Gateway is reachable at, read from the
-/// provisioner-managed Service: `LoadBalancer` ingress when present,
-/// the `ClusterIP` for non-`LoadBalancer` Services, and nothing while
-/// a `LoadBalancer` assignment is pending. The Service is verified by the managed-by
-/// label and a controller ownerReference with the Gateway's uid —
-/// never by name alone.
+/// The address(es) a Gateway is reachable at: `LoadBalancer` ingress
+/// when present, the `ClusterIP` for non-`LoadBalancer` Services, and
+/// nothing while a `LoadBalancer` assignment is pending.
+///
+/// With the service-name annotation the addresses come from the
+/// referenced operator-owned Service in the Gateway's namespace —
+/// named by the Gateway's own author, so no ownership guard applies;
+/// while it doesn't exist the Gateway stays unaddressed (with a
+/// warning). Otherwise they come from the provisioner-managed
+/// Service, verified by the managed-by label and a controller
+/// ownerReference with the Gateway's uid — never by name alone.
 fn managed_service_addresses(
     gw: &Gateway,
     gw_ns: &str,
     gw_name: &str,
     services_by_id: &HashMap<(&str, &str), &Service>,
 ) -> Vec<GatewayAddress> {
+    if let Some(ref_name) = infra::annotations::service_name(gw) {
+        let Some(svc) = services_by_id.get(&(gw_ns, ref_name)) else {
+            tracing::warn!(
+                gateway = format!("{gw_ns}/{gw_name}"),
+                service = ref_name,
+                "referenced Service does not exist; gateway stays unaddressed"
+            );
+            return Vec::new();
+        };
+        return service_addresses(svc);
+    }
+
     let managed_name = object_name(gw_name);
     let Some(svc) = services_by_id.get(&(gw_ns, managed_name.as_str())) else {
         return Vec::new();
@@ -712,7 +730,12 @@ fn managed_service_addresses(
     if !labeled || !owned {
         return Vec::new();
     }
+    service_addresses(svc)
+}
 
+/// Extract a Service's published addresses: LB ingress, or the
+/// cluster IPs when it isn't a `LoadBalancer`.
+fn service_addresses(svc: &Service) -> Vec<GatewayAddress> {
     let mut out = Vec::new();
     let ingress = svc
         .status
@@ -1718,5 +1741,55 @@ mod tests {
             }]
         );
         assert!(r.gateways[3].addresses.is_empty());
+    }
+
+    #[test]
+    fn annotated_gateway_reads_addresses_from_the_referenced_service() {
+        // gw-ref: names an operator-owned Service — plain, unlabeled,
+        //   unowned — and gets its cluster IP; the leftover managed
+        //   Service must not win over the annotation.
+        // gw-missing: names a Service that doesn't exist -> none.
+        let annotate = |mut g: Gateway, v: &str| {
+            g.metadata.annotations = Some(
+                [(
+                    crate::infra::SERVICE_NAME_ANNOTATION.to_string(),
+                    v.to_string(),
+                )]
+                .into(),
+            );
+            g
+        };
+        let mut s = state(
+            vec![
+                annotate(
+                    gw("demo", "gw-ref", "zd", vec![http_listener("h", 80, None)]),
+                    "edge",
+                ),
+                annotate(
+                    gw(
+                        "demo",
+                        "gw-missing",
+                        "zd",
+                        vec![http_listener("h", 80, None)],
+                    ),
+                    "nope",
+                ),
+            ],
+            vec![],
+        );
+        s.services = vec![
+            service("demo", "edge", Some("10.96.0.42")),
+            managed_service("demo", "gw-ref", "ClusterIP", vec![], vec!["10.96.0.10"]),
+        ];
+        let r = resolve(&s, OURS);
+
+        assert_eq!(
+            r.gateways[0].addresses,
+            vec![GatewayAddress {
+                value: "10.96.0.42".into(),
+                kind: AddressKind::Ip
+            }]
+        );
+        assert!(r.gateways[1].addresses.is_empty());
     }
 }

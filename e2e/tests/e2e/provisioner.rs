@@ -8,10 +8,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use gateway_api::apis::standard::gateways::Gateway;
-use gateway_e2e::fixtures::apply_gateway;
-use gateway_e2e::{Scope, annotate_gateway, gateway};
+use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
+use gateway_e2e::{
+    Scope, annotate_gateway, deploy_echo, gateway, gateway_address, http_route, wait_until_routed,
+};
+use http::StatusCode;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount, ServicePort, ServiceSpec};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
 use kube::{Client, ResourceExt};
 
@@ -75,6 +79,61 @@ fn assert_managed(meta: &kube::api::ObjectMeta, gw_name: &str) {
     assert_eq!(owner.kind, "Gateway");
     assert_eq!(owner.name, gw_name);
     assert_eq!(owner.controller, Some(true));
+}
+
+/// An operator-owned `LoadBalancer` Service pointing at a Gateway's
+/// DP pods via the gateway-name label — no managed-by label, no
+/// owner ref. What a migrating operator would keep.
+fn operator_service(ns: &str, name: &str, gw_name: &str) -> Service {
+    Service {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("LoadBalancer".into()),
+            selector: Some(
+                [(
+                    "gateway.networking.k8s.io/gateway-name".to_string(),
+                    gw_name.to_string(),
+                )]
+                .into(),
+            ),
+            ports: Some(vec![ServicePort {
+                port: 80,
+                target_port: Some(IntOrString::Int(80)),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// Poll until `name`'s `LoadBalancer` ingress IP is assigned.
+/// Deadline matches `gateway_address` — LB assignment is the slow
+/// path on CI.
+async fn wait_lb_ip(api: &Api<Service>, name: &str) -> Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(3);
+    loop {
+        if let Some(svc) = api.get_opt(name).await?
+            && let Some(ip) = svc
+                .status
+                .as_ref()
+                .and_then(|s| s.load_balancer.as_ref())
+                .and_then(|lb| lb.ingress.as_ref())
+                .and_then(|i| i.first())
+                .and_then(|i| i.ip.clone())
+        {
+            return Ok(ip);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a LoadBalancer IP on service {name}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 fn apis(client: &Client, ns: &str) -> (Api<ServiceAccount>, Api<Service>, Api<Deployment>) {
@@ -274,6 +333,153 @@ async fn replicas_annotation_scales_the_provisioned_deployment() -> Result<()> {
     annotate_gateway(client, ns, "gw", "gateway.buoyant.io/dp-replicas", None).await?;
     wait_for(&dep_api, "gw-gatewayd", "replicas back to default", |d| {
         d.spec.as_ref().and_then(|s| s.replicas) == Some(1)
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn gateway_attaches_to_existing_service() -> Result<()> {
+    let scope = Scope::new("prov-svcname").await?;
+    let ns = scope.name();
+    let client = scope.client();
+    let (_, svc_api, dep_api) = apis(client, ns);
+
+    deploy_echo(client, ns, "echo", None).await?;
+
+    let mut gw = gateway(ns, "gw", 80, None);
+    gw.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(
+            "gateway.buoyant.io/service-name".to_owned(),
+            "edge".to_owned(),
+        );
+    apply_gateway(client, &gw).await?;
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .path_prefix("/")
+            .backend("echo", 8080)
+            .build(),
+    )
+    .await?;
+
+    // The DP still provisions and becomes ready — with no fronting
+    // Service and no address while the referenced one is missing.
+    wait_for(&dep_api, "gw-gatewayd", "DP deployment available", |d| {
+        d.status.as_ref().and_then(|s| s.available_replicas) == Some(1)
+    })
+    .await?;
+    assert!(
+        svc_api.get_opt("gw-gatewayd").await?.is_none(),
+        "no Service may be provisioned in service-name mode"
+    );
+    let gw_api: Api<Gateway> = Api::namespaced(client.clone(), ns);
+    let addresses = gw_api
+        .get("gw")
+        .await?
+        .status
+        .and_then(|s| s.addresses)
+        .unwrap_or_default();
+    assert!(
+        addresses.is_empty(),
+        "gateway must stay unaddressed while the referenced Service is missing"
+    );
+
+    // The operator creates the Service; the Gateway picks up its
+    // address and serves traffic through it.
+    let before = svc_api
+        .create(&PostParams::default(), &operator_service(ns, "edge", "gw"))
+        .await?;
+    let lb_ip = wait_lb_ip(&svc_api, "edge").await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+    assert_eq!(
+        addr, lb_ip,
+        "gateway address must come from the referenced Service"
+    );
+    wait_until_routed(&addr, "gw.example", "/", StatusCode::OK).await?;
+
+    // The CP never touched the operator's Service: spec identical,
+    // no adoption, no write under our field manager. (The LB
+    // controller writes status, so resourceVersion can't be pinned.)
+    let after = svc_api.get("edge").await?;
+    assert_eq!(
+        after.spec, before.spec,
+        "referenced Service spec must be untouched"
+    );
+    assert!(
+        after.labels().get("app.kubernetes.io/managed-by").is_none(),
+        "referenced Service must not be adopted"
+    );
+    assert!(after.metadata.owner_references.is_none());
+    assert!(
+        !after
+            .managed_fields()
+            .iter()
+            .any(|m| m.manager.as_deref() == Some("gateway.buoyant.io/cp")),
+        "the CP field manager must never appear on the referenced Service"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn gateway_switches_between_owned_and_existing_service() -> Result<()> {
+    let scope = Scope::new("prov-svcswap").await?;
+    let ns = scope.name();
+    let client = scope.client();
+    let (_, svc_api, _) = apis(client, ns);
+    let gw_api: Api<Gateway> = Api::namespaced(client.clone(), ns);
+
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let owned = wait_for(&svc_api, "gw-gatewayd", "provisioned service", |_| true).await?;
+    assert_managed(&owned.metadata, "gw");
+    gateway_address(client, ns, "gw").await?;
+
+    // Switching to an operator-owned Service deletes the provisioned
+    // one and flips the address.
+    svc_api
+        .create(&PostParams::default(), &operator_service(ns, "edge", "gw"))
+        .await?;
+    let edge_ip = wait_lb_ip(&svc_api, "edge").await?;
+    annotate_gateway(
+        client,
+        ns,
+        "gw",
+        "gateway.buoyant.io/service-name",
+        Some("edge"),
+    )
+    .await?;
+    wait_gone(&svc_api, "gw-gatewayd", "superseded provisioned service").await?;
+    wait_for(
+        &gw_api,
+        "gw",
+        "address flips to the referenced Service",
+        |g| {
+            g.status
+                .as_ref()
+                .and_then(|s| s.addresses.as_ref())
+                .and_then(|a| a.first())
+                .is_some_and(|a| a.value == edge_ip)
+        },
+    )
+    .await?;
+
+    // Removing the annotation provisions the usual owned Service and
+    // moves the address off the operator's one.
+    annotate_gateway(client, ns, "gw", "gateway.buoyant.io/service-name", None).await?;
+    let owned = wait_for(&svc_api, "gw-gatewayd", "re-provisioned service", |_| true).await?;
+    assert_managed(&owned.metadata, "gw");
+    wait_for(&gw_api, "gw", "address back on the owned Service", |g| {
+        g.status
+            .as_ref()
+            .and_then(|s| s.addresses.as_ref())
+            .and_then(|a| a.first())
+            .is_some_and(|a| a.value != edge_ip)
     })
     .await?;
 

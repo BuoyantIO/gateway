@@ -11,9 +11,12 @@
 //! check against the reflector cache), so steady-state write load is
 //! zero. An existing object that is neither controller-owned by its
 //! Gateway nor labeled as managed is refused, never adopted.
-//! Deletion is not handled here at all: every object is
-//! owner-referenced to its Gateway, so removal is the garbage
-//! collector's job.
+//! Deletion of a whole Gateway's infra is not handled here: every
+//! object is owner-referenced to its Gateway, so removal is the
+//! garbage collector's job. The one exception is a provisioned
+//! Service whose Gateway switches to an operator-owned one — no
+//! longer desired while its Gateway lives on, so this task deletes
+//! it (only ever a managed, controller-owned object).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,7 +27,7 @@ use futures::StreamExt;
 use k8s_openapi::NamespaceResourceScope;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use kube::runtime::reflector::{self, ObjectRef, Store};
 use kube::runtime::watcher::{self, Config};
 use kube::{Client, Resource};
@@ -164,9 +167,12 @@ impl Reconciler {
             let results = [
                 self.apply_one("ServiceAccount", &infra.service_account, observed)
                     .await,
-                {
-                    let observed = lookup(&self.services, &infra.service);
-                    self.apply_one("Service", &infra.service, observed).await
+                match &infra.service {
+                    Some(service) => {
+                        let observed = lookup(&self.services, service);
+                        self.apply_one("Service", service, observed).await
+                    }
+                    None => self.delete_owned_service(infra).await,
                 },
                 {
                     let observed = lookup(&self.deployments, &infra.deployment);
@@ -248,6 +254,79 @@ impl Reconciler {
         Ok(())
     }
 
+    /// Delete the provisioned Service of a Gateway that has switched
+    /// to an operator-owned one. Deleting by name alone is never
+    /// safe: the object must carry the managed-by label *and* a
+    /// `controller: true` ownerReference matching the Gateway's uid,
+    /// or it is left alone. Absence (including a 404 racing the
+    /// delete) is success.
+    async fn delete_owned_service(&mut self, infra: &GatewayInfra) -> Result<(), kube::Error> {
+        // The provisioned Service shares the Deployment's object
+        // name, namespace, and owning Gateway.
+        let meta = &infra.deployment.metadata;
+        let (Some(namespace), Some(name)) = (meta.namespace.as_deref(), meta.name.as_deref())
+        else {
+            return Ok(());
+        };
+        let api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let observed = match self
+            .services
+            .get(&ObjectRef::new(name).within(namespace))
+            .map(|o| (*o).clone())
+        {
+            Some(o) => Some(o),
+            // The cache is label-filtered to managed objects; an
+            // unmanaged same-name Service is invisible to it. Ask the
+            // cluster so the ownership guard below sees it.
+            None => api.get_opt(name).await?,
+        };
+        let Some(observed) = observed else {
+            return Ok(());
+        };
+
+        let labeled =
+            observed.metadata.labels.as_ref().is_some_and(|l| {
+                l.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANAGED_BY_VALUE)
+            });
+        let owner_uid = meta
+            .owner_references
+            .as_deref()
+            .and_then(|o| o.first())
+            .map(|o| o.uid.as_str());
+        let owned = observed
+            .metadata
+            .owner_references
+            .as_deref()
+            .is_some_and(|o| {
+                o.iter()
+                    .any(|r| r.controller == Some(true) && Some(r.uid.as_str()) == owner_uid)
+            });
+        if !labeled || !owned {
+            tracing::warn!(
+                kind = "Service",
+                namespace,
+                name,
+                "refusing to delete an existing object this controller does not manage"
+            );
+            return Ok(());
+        }
+
+        match api.delete(name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(e) => return Err(e),
+        }
+        tracing::info!(
+            kind = "Service",
+            namespace,
+            name,
+            "deleted provisioned Service superseded by an operator-owned one"
+        );
+        self.last_applied
+            .remove(&("Service", namespace.to_string(), name.to_string()));
+        Ok(())
+    }
+
     /// Drop memory for objects no longer in the desired set (their
     /// Gateways are gone; the GC owns the objects themselves).
     fn prune_last_applied(&mut self, desired: &[GatewayInfra]) {
@@ -263,9 +342,10 @@ impl Reconciler {
                 };
                 [
                     id("ServiceAccount", &i.service_account.metadata),
-                    id("Service", &i.service.metadata),
                     id("Deployment", &i.deployment.metadata),
                 ]
+                .into_iter()
+                .chain(i.service.as_ref().map(|s| id("Service", &s.metadata)))
             })
             .collect();
         self.last_applied.retain(|k, _| expected.contains(k));
@@ -610,6 +690,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_name_mode_deletes_the_provisioned_service() {
+        // The cluster holds the previously provisioned (managed,
+        // controller-owned) Service; the Gateway now names an
+        // operator-owned one, so the desired set carries no Service.
+        let owned = infra("demo", "web");
+        let fx_get = [(
+            "services/web-gatewayd",
+            serde_json::to_value(owned.service.clone().unwrap()).unwrap(),
+        )]
+        .into();
+        let mut fx = fixture_with(MockBehavior {
+            get: fx_get,
+            ..Default::default()
+        });
+        let mut set = vec![owned];
+        set[0].service = None;
+
+        fx.reconciler.reconcile(&set).await.unwrap();
+        let requests = fx.requests.lock().unwrap().clone();
+        assert!(
+            requests.contains(&"DELETE /api/v1/namespaces/demo/services/web-gatewayd".to_string()),
+            "expected a delete of the superseded Service, got {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_name_mode_never_deletes_an_unmanaged_service() {
+        // Same-name Service without our label or owner ref — the
+        // guard must leave it alone.
+        let squatter = json!({"metadata": {
+            "name": "web-gatewayd",
+            "namespace": "demo",
+            "labels": {"app": "user-thing"}
+        }});
+        let mut fx = fixture_with(MockBehavior {
+            get: [("services/web-gatewayd", squatter)].into(),
+            ..Default::default()
+        });
+        let mut set = vec![infra("demo", "web")];
+        set[0].service = None;
+
+        fx.reconciler.reconcile(&set).await.unwrap();
+        assert!(
+            !fx.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("DELETE")),
+            "an unmanaged object must never be deleted"
+        );
+    }
+
+    #[tokio::test]
     async fn second_pass_with_agreeing_cache_writes_nothing() {
         let mut fx = fixture();
         let set = vec![infra("demo", "web")];
@@ -621,7 +754,7 @@ mod tests {
         fx.sa_writer
             .apply_watcher_event(&Event::Apply(set[0].service_account.clone()));
         fx.svc_writer
-            .apply_watcher_event(&Event::Apply(set[0].service.clone()));
+            .apply_watcher_event(&Event::Apply(set[0].service.clone().unwrap()));
         fx.dep_writer
             .apply_watcher_event(&Event::Apply(set[0].deployment.clone()));
 
@@ -646,7 +779,7 @@ mod tests {
         fx.sa_writer
             .apply_watcher_event(&Event::Apply(set[0].service_account.clone()));
         fx.svc_writer
-            .apply_watcher_event(&Event::Apply(set[0].service.clone()));
+            .apply_watcher_event(&Event::Apply(set[0].service.clone().unwrap()));
         fx.dep_writer.apply_watcher_event(&Event::Apply(drifted));
 
         fx.reconciler.reconcile(&set).await.unwrap();

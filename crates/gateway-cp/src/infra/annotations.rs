@@ -17,7 +17,8 @@ use kube::Resource;
 
 use super::{
     DP_CPU_LIMIT_ANNOTATION, DP_CPU_REQUEST_ANNOTATION, DP_MEMORY_LIMIT_ANNOTATION,
-    DP_MEMORY_REQUEST_ANNOTATION, DP_REPLICAS_ANNOTATION, SERVICE_TYPE_ANNOTATION,
+    DP_MEMORY_REQUEST_ANNOTATION, DP_REPLICAS_ANNOTATION, SERVICE_NAME_ANNOTATION,
+    SERVICE_TYPE_ANNOTATION,
 };
 
 /// The Service types the annotation may select. Anything else falls
@@ -132,6 +133,23 @@ fn is_quantity(v: &str) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// The operator-owned `Service` this Gateway attaches to instead of
+/// a provisioned one, resolved in the Gateway's own namespace. An
+/// empty value cannot name a Service and is treated as unset (with a
+/// warning). `pub(crate)`: address writeback reads it too.
+pub(crate) fn service_name(gw: &Gateway) -> Option<&str> {
+    let v = annotation(gw, SERVICE_NAME_ANNOTATION)?;
+    if v.is_empty() {
+        tracing::warn!(
+            gateway = identity(gw),
+            annotation = SERVICE_NAME_ANNOTATION,
+            "empty service name; ignoring"
+        );
+        return None;
+    }
+    Some(v)
+}
+
 /// The `Service` type for the provisioned Service: the annotation
 /// when it names a supported type, the default otherwise (with a
 /// warning).
@@ -163,6 +181,40 @@ fn identity(gw: &Gateway) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use gateway_api::apis::standard::gateways::GatewaySpec;
+    use kube::api::ObjectMeta;
+
+    fn gw_with(annotations: &[(&str, &str)]) -> Gateway {
+        Gateway {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some("web".into()),
+                annotations: Some(
+                    annotations
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            spec: GatewaySpec::default(),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn service_name_requires_a_nonempty_value() {
+        assert_eq!(service_name(&gw_with(&[])), None);
+        assert_eq!(
+            service_name(&gw_with(&[(SERVICE_NAME_ANNOTATION, "edge")])),
+            Some("edge")
+        );
+        assert_eq!(
+            service_name(&gw_with(&[(SERVICE_NAME_ANNOTATION, "")])),
+            None
+        );
+    }
 
     #[test]
     fn quantity_grammar() {
