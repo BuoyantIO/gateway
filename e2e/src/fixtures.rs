@@ -619,6 +619,26 @@ async fn deploy_backend(
     Ok(())
 }
 
+/// Merge-patch one annotation on an existing `Gateway`; `None`
+/// removes the key.
+///
+/// # Errors
+/// Returns an error if the patch call fails.
+pub async fn annotate_gateway(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    let patch = serde_json::json!({ "metadata": { "annotations": { key: value } } });
+    Api::<Gateway>::namespaced(client.clone(), ns)
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|| format!("annotating Gateway {ns}/{name}"))?;
+    Ok(())
+}
+
 /// Scale an existing `Deployment` to `replicas`.
 ///
 /// # Errors

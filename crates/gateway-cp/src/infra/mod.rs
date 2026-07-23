@@ -45,3 +45,8 @@ pub const PROVISIONING_DISABLED: &str = "disabled";
 /// `ClusterIP`, `NodePort`, or `LoadBalancer` (the default). Any
 /// other value falls back to the default with a warning.
 pub const SERVICE_TYPE_ANNOTATION: &str = "gateway.buoyant.io/service-type";
+
+/// Per-Gateway replica count for the provisioned data-plane
+/// `Deployment`: a positive integer, default 1. Anything else falls
+/// back to the default with a warning.
+pub const DP_REPLICAS_ANNOTATION: &str = "gateway.buoyant.io/dp-replicas";

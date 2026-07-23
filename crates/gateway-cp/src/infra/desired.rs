@@ -17,8 +17,8 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Resource;
 
 use super::{
-    GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE, PROVISIONING_ANNOTATION,
-    PROVISIONING_DISABLED, SERVICE_TYPE_ANNOTATION,
+    DP_REPLICAS_ANNOTATION, GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    PROVISIONING_ANNOTATION, PROVISIONING_DISABLED, SERVICE_TYPE_ANNOTATION,
 };
 
 /// Kubernetes object-name length cap (RFC 1123 label).
@@ -80,12 +80,8 @@ pub fn desired(gw: &Gateway, cfg: &InfraConfig) -> Option<GatewayInfra> {
     let namespace = gw.meta().namespace.as_deref()?;
     let uid = gw.meta().uid.as_deref()?;
 
-    let self_managed = gw
-        .meta()
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(PROVISIONING_ANNOTATION))
-        .is_some_and(|v| v == PROVISIONING_DISABLED);
+    let self_managed =
+        annotation(gw, PROVISIONING_ANNOTATION).is_some_and(|v| v == PROVISIONING_DISABLED);
     if self_managed {
         return None;
     }
@@ -179,7 +175,7 @@ fn deployment(
     Deployment {
         metadata,
         spec: Some(DeploymentSpec {
-            replicas: Some(1),
+            replicas: Some(dp_replicas(gw)),
             selector: LabelSelector {
                 match_labels: Some(selector_labels.clone()),
                 ..Default::default()
@@ -220,6 +216,41 @@ fn deployment(
     }
 }
 
+/// A Gateway metadata annotation by key.
+fn annotation<'a>(gw: &'a Gateway, key: &str) -> Option<&'a str> {
+    gw.meta()
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(key))
+        .map(String::as_str)
+}
+
+/// Replica count for the provisioned Deployment: the annotation as a
+/// positive integer, or 1 (also the fallback for anything that isn't
+/// one, with a warning).
+fn dp_replicas(gw: &Gateway) -> i32 {
+    match annotation(gw, DP_REPLICAS_ANNOTATION) {
+        None => 1,
+        Some(v) => match v.parse::<i32>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                let gateway = format!(
+                    "{}/{}",
+                    gw.meta().namespace.as_deref().unwrap_or_default(),
+                    gw.meta().name.as_deref().unwrap_or_default(),
+                );
+                tracing::warn!(
+                    gateway,
+                    value = %v,
+                    annotation = DP_REPLICAS_ANNOTATION,
+                    "replicas must be a positive integer; using 1"
+                );
+                1
+            }
+        },
+    }
+}
+
 /// The Service types the annotation may select. Anything else falls
 /// back to the default with a warning — passing a bad value through
 /// would produce a Service the apiserver never accepts and wedge the
@@ -234,13 +265,9 @@ fn service(
     selector_labels: &BTreeMap<String, String>,
     ports: &[(String, i32)],
 ) -> Service {
-    let annotated = gw
-        .meta()
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(SERVICE_TYPE_ANNOTATION));
+    let annotated = annotation(gw, SERVICE_TYPE_ANNOTATION);
     let service_type = match annotated {
-        Some(v) if SERVICE_TYPES.contains(&v.as_str()) => v.clone(),
+        Some(v) if SERVICE_TYPES.contains(&v) => v.to_string(),
         Some(v) => {
             let gateway = format!(
                 "{}/{}",
@@ -635,6 +662,34 @@ mod tests {
             infra.service.spec.as_ref().unwrap().type_.as_deref(),
             Some("ClusterIP")
         );
+    }
+
+    #[test]
+    fn replicas_default_to_one_and_honor_annotation() {
+        let gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        let infra = desired(&gw, &config()).unwrap();
+        assert_eq!(infra.deployment.spec.as_ref().unwrap().replicas, Some(1));
+
+        let mut gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+        gw.metadata.annotations =
+            Some([(DP_REPLICAS_ANNOTATION.to_string(), "6".to_string())].into());
+        let infra = desired(&gw, &config()).unwrap();
+        assert_eq!(infra.deployment.spec.as_ref().unwrap().replicas, Some(6));
+    }
+
+    #[test]
+    fn invalid_replicas_annotation_falls_back_to_one() {
+        for bad in ["0", "-3", "lots", ""] {
+            let mut gw = gateway("demo", "web", vec![listener("http", "HTTP", 80)]);
+            gw.metadata.annotations =
+                Some([(DP_REPLICAS_ANNOTATION.to_string(), bad.to_string())].into());
+            let infra = desired(&gw, &config()).unwrap();
+            assert_eq!(
+                infra.deployment.spec.as_ref().unwrap().replicas,
+                Some(1),
+                "value {bad:?} must fall back to 1"
+            );
+        }
     }
 
     #[test]
