@@ -31,6 +31,18 @@ pub struct Gateway {
     pub(crate) http_client: HttpClient,
 }
 
+/// Everything an accepted connection needs from its bind, bundled so
+/// the accept/serve chain threads one clone instead of a parameter
+/// per concern. `drain` stays a separate parameter: it is connection
+/// lifecycle, not request context.
+#[derive(Clone)]
+pub(crate) struct ProxyCtx {
+    pub(crate) store: Store,
+    pub(crate) bind_key: BindKey,
+    pub(crate) lb: Arc<LoadBalancer>,
+    pub(crate) http_client: HttpClient,
+}
+
 impl Gateway {
     /// Default gateway: P2C-EWMA picker with default scoring + state policy.
     pub fn new(store: Store) -> Self {
@@ -138,16 +150,18 @@ impl Gateway {
         let bind = self.store.read().bind(key)?;
         let addr = SocketAddr::new(bind.address, bind.port);
         let protocol = bind.bind_protocol;
-        let store = self.store.clone();
-        let lb = Arc::clone(&self.lb);
-        let http_client = self.http_client.clone();
-        let bind_key = key.clone();
+        let ctx = ProxyCtx {
+            store: self.store.clone(),
+            bind_key: key.clone(),
+            lb: Arc::clone(&self.lb),
+            http_client: self.http_client.clone(),
+        };
         let (bind_signal, bind_drain) = drain::channel();
         // One merged watch per bind: connections fire on process
         // shutdown OR this bind's teardown through a single future.
         let conn_drain = process_drain.clone().merge(bind_drain);
         let task = tokio::spawn(async move {
-            accept::run_bind(store, bind_key, addr, protocol, lb, http_client, conn_drain).await;
+            accept::run_bind(ctx, addr, protocol, conn_drain).await;
         });
         Some(BindSession {
             task,

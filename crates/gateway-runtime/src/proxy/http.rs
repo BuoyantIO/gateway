@@ -39,7 +39,8 @@ use hyper_util::server::conn::auto;
 use rand::Rng;
 
 use crate::drain;
-use crate::lb::{EndpointInfo, LoadBalancer};
+use crate::gateway::ProxyCtx;
+use crate::lb::EndpointInfo;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResponseBody = BoxBody<Bytes, BoxError>;
@@ -355,26 +356,20 @@ fn apply_header_ops(
 /// otherwise HTTP/1.1, so the gateway itself never has to
 /// distinguish H1 from H2C.
 pub(crate) async fn handle_connection<I>(
-    store: Store,
-    bind_key: BindKey,
+    ctx: ProxyCtx,
     stream: I,
     peer: SocketAddr,
-    lb: Arc<LoadBalancer>,
-    client: HttpClient,
     drain: drain::Watch,
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::debug!(bind = %bind_key, %peer, "connection accepted");
+    tracing::debug!(bind = %ctx.bind_key, %peer, "connection accepted");
 
     let io = TokioIo::new(stream);
     let svc = service_fn(move |req: Request<Incoming>| {
-        let store = store.clone();
-        let bind_key = bind_key.clone();
-        let lb = Arc::clone(&lb);
-        let client = client.clone();
+        let ctx = ctx.clone();
         async move {
-            let resp = serve_request(store, bind_key, lb, client, req).await;
+            let resp = serve_request(ctx, req).await;
             Ok::<_, Infallible>(resp)
         }
     });
@@ -415,13 +410,7 @@ pub(crate) async fn handle_connection<I>(
 /// Top-level per-request handler. Resolves a route, applies filters,
 /// dials a backend endpoint, forwards the request, and returns the
 /// upstream's response (or a synthesized error response on any failure).
-async fn serve_request(
-    store: Store,
-    bind_key: BindKey,
-    lb: Arc<LoadBalancer>,
-    client: HttpClient,
-    req: Request<Incoming>,
-) -> Response<ResponseBody> {
+async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<ResponseBody> {
     let host_owned = host_from_request(&req).map(str::to_owned);
     let host_stripped = host_owned.as_deref().map(strip_port).map(str::to_owned);
     let path = req.uri().path().to_owned();
@@ -429,7 +418,7 @@ async fn serve_request(
     let method = req.method().clone();
     let headers = req.headers().clone();
 
-    let ctx = MatchContext {
+    let match_ctx = MatchContext {
         host: host_stripped.as_deref(),
         path: &path,
         method: &method,
@@ -437,7 +426,7 @@ async fn serve_request(
         query: query.as_deref(),
     };
 
-    let resolved = match resolve_http_route(&store, &bind_key, &ctx) {
+    let resolved = match resolve_http_route(&ctx.store, &ctx.bind_key, &match_ctx) {
         Ok(r) => r,
         Err(e) => return synthesize_error(e),
     };
@@ -469,20 +458,20 @@ async fn serve_request(
             return synthesize_error(RouteResolveError::BackendUnresolved);
         }
     };
-    let Some((endpoint, info)) = lb.pick_endpoint(&backend) else {
+    let Some((endpoint, info)) = ctx.lb.pick_endpoint(&backend) else {
         return synthesize_status(StatusCode::SERVICE_UNAVAILABLE);
     };
     let _active = info.acquire();
 
     tracing::debug!(
-        bind = %bind_key,
+        bind = %ctx.bind_key,
         route = %resolved.route_name,
         endpoint = %endpoint.name,
         upstream = %format!("{}:{}", endpoint.address, endpoint.port),
         "http request routed"
     );
 
-    let upstream = forward(&client, backend.protocol, req, &endpoint, &info).await;
+    let upstream = forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
 
     // Response-filter pipeline: iterate the route's filters in
     // **reverse** order per Area 03 ("response-side runs
