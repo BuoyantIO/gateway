@@ -10,9 +10,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::LazyConfigAcceptor;
 
 use crate::drain;
-use crate::lb::LoadBalancer;
+use crate::gateway::ProxyCtx;
 use crate::proxy::http;
-use crate::proxy::http::{HttpClient, pick_listener_by_hostname};
+use crate::proxy::http::pick_listener_by_hostname;
 
 /// Per-bind accept task. Opens a `TcpListener` on `addr`, loops on
 /// accept, and hands each accepted connection to the HTTP handler —
@@ -25,43 +25,36 @@ use crate::proxy::http::{HttpClient, pick_listener_by_hostname};
 /// drain watch (process shutdown merged with this bind's teardown) and
 /// closes gracefully when it fires.
 pub(crate) async fn run_bind(
-    store: Store,
-    bind_key: BindKey,
+    ctx: ProxyCtx,
     addr: SocketAddr,
     protocol: BindProtocol,
-    lb: Arc<LoadBalancer>,
-    http_client: HttpClient,
     drain: drain::Watch,
 ) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(bind = %bind_key, %addr, error = %e, "failed to bind");
+            tracing::error!(bind = %ctx.bind_key, %addr, error = %e, "failed to bind");
             return;
         }
     };
     let local_addr = listener.local_addr().unwrap_or(addr);
-    tracing::info!(bind = %bind_key, %local_addr, ?protocol, "bind listening");
+    tracing::info!(bind = %ctx.bind_key, %local_addr, ?protocol, "bind listening");
 
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                tracing::warn!(bind = %bind_key, error = %e, "accept failed");
+                tracing::warn!(bind = %ctx.bind_key, error = %e, "accept failed");
                 continue;
             }
         };
-        let store = store.clone();
-        let bind_key = bind_key.clone();
-        let lb = Arc::clone(&lb);
-        let http_client = http_client.clone();
+        let ctx = ctx.clone();
         let drain = drain.clone();
 
         match protocol {
             BindProtocol::Http => {
                 tokio::spawn(async move {
-                    http::handle_connection(store, bind_key, stream, peer, lb, http_client, drain)
-                        .await;
+                    http::handle_connection(ctx, stream, peer, drain).await;
                 });
             }
             BindProtocol::Tls => {
@@ -71,39 +64,31 @@ pub(crate) async fn run_bind(
                     let start = match LazyConfigAcceptor::new(Acceptor::default(), stream).await {
                         Ok(start) => start,
                         Err(e) => {
-                            tracing::debug!(bind = %bind_key, %peer, error = %e,
+                            tracing::debug!(bind = %ctx.bind_key, %peer, error = %e,
                                 "TLS ClientHello read failed");
                             return;
                         }
                     };
                     let sni = start.client_hello().server_name().map(str::to_owned);
-                    let Some(config) = server_config(&store, &bind_key, sni.as_deref()) else {
-                        tracing::debug!(bind = %bind_key, %peer, sni = ?sni,
+                    let Some(config) = server_config(&ctx.store, &ctx.bind_key, sni.as_deref())
+                    else {
+                        tracing::debug!(bind = %ctx.bind_key, %peer, sni = ?sni,
                             "no TLS listener matched (cert absent or unknown SNI); dropping");
                         return;
                     };
                     match start.into_stream(config).await {
                         Ok(tls) => {
-                            http::handle_connection(
-                                store,
-                                bind_key,
-                                tls,
-                                peer,
-                                lb,
-                                http_client,
-                                drain,
-                            )
-                            .await;
+                            http::handle_connection(ctx, tls, peer, drain).await;
                         }
                         Err(e) => {
-                            tracing::debug!(bind = %bind_key, %peer, error = %e,
+                            tracing::debug!(bind = %ctx.bind_key, %peer, error = %e,
                                 "TLS handshake failed");
                         }
                     }
                 });
             }
             BindProtocol::Tcp => {
-                tracing::warn!(bind = %bind_key, "TCP binds are not served; dropping connection");
+                tracing::warn!(bind = %ctx.bind_key, "TCP binds are not served; dropping connection");
             }
         }
     }
