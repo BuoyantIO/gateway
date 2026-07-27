@@ -11,6 +11,7 @@ use crate::accept;
 use crate::drain;
 use crate::error::RuntimeError;
 use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
+use crate::metrics::Metrics;
 use crate::proxy::http::HttpClient;
 
 /// The gateway data-plane runtime. Subscribes to `BindEvent`s from a
@@ -29,18 +30,22 @@ pub struct Gateway {
     /// TODO: replace hyper's default pool with a destination-keyed
     /// pool (see proxy/http.rs for the full rationale).
     pub(crate) http_client: HttpClient,
+    /// Metric families the request path records into. Detached
+    /// (never scraped) unless the caller registered them.
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 /// Everything an accepted connection needs from its bind, bundled so
 /// the accept/serve chain threads one clone instead of a parameter
-/// per concern. `drain` stays a separate parameter: it is connection
-/// lifecycle, not request context.
+/// per concern. `drain` stays separate: it is connection lifecycle,
+/// not request context.
 #[derive(Clone)]
 pub(crate) struct ProxyCtx {
     pub(crate) store: Store,
     pub(crate) bind_key: BindKey,
     pub(crate) lb: Arc<LoadBalancer>,
     pub(crate) http_client: HttpClient,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl Gateway {
@@ -57,6 +62,16 @@ impl Gateway {
             store,
             lb: Arc::new(lb),
             http_client: HttpClient::default(),
+            metrics: Metrics::new(),
+        }
+    }
+
+    /// Default gateway recording into caller-owned metric families
+    /// (register them with the scrape registry before serving).
+    pub fn with_metrics(store: Store, metrics: Arc<Metrics>) -> Self {
+        Self {
+            metrics,
+            ..Self::new(store)
         }
     }
 
@@ -155,6 +170,7 @@ impl Gateway {
             bind_key: key.clone(),
             lb: Arc::clone(&self.lb),
             http_client: self.http_client.clone(),
+            metrics: Arc::clone(&self.metrics),
         };
         let (bind_signal, bind_drain) = drain::channel();
         // One merged watch per bind: connections fire on process

@@ -23,11 +23,12 @@ use gateway_api::apis::standard::httproutes::{
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, PodSpec, PodTemplateSpec, Secret, Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, Pod, PodSpec, PodTemplateSpec, Secret, Service, ServicePort,
+    ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
@@ -637,6 +638,35 @@ pub async fn annotate_gateway(
         .await
         .with_context(|| format!("annotating Gateway {ns}/{name}"))?;
     Ok(())
+}
+
+/// GET a path from a provisioned DP pod's admin server (:15021)
+/// through the apiserver's pod proxy subresource — the admin port is
+/// not exposed on any Service, so the proxy is how tests reach it.
+/// Targets the first pod carrying `gw_name`'s gateway-name label.
+///
+/// # Errors
+/// Returns an error if no DP pod exists or the proxied request fails.
+pub async fn dp_admin_get(client: &Client, ns: &str, gw_name: &str, path: &str) -> Result<String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let selector = format!("gateway.networking.k8s.io/gateway-name={gw_name}");
+    let pod = pods
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .with_context(|| format!("no DP pod labeled {selector}"))?;
+    let pod_name = pod.metadata.name.context("pod has no name")?;
+
+    let uri = format!("/api/v1/namespaces/{ns}/pods/{pod_name}:15021/proxy{path}");
+    let req = http::Request::get(&uri)
+        .body(Vec::new())
+        .context("building pod proxy request")?;
+    client
+        .request_text(req)
+        .await
+        .with_context(|| format!("GET {uri}"))
 }
 
 /// Scale an existing `Deployment` to `replicas`.

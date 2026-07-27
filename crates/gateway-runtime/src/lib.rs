@@ -6,9 +6,11 @@ mod accept;
 mod error;
 mod gateway;
 pub mod lb;
+pub mod metrics;
 mod proxy;
 
 pub use error::RuntimeError;
 pub use gateway::Gateway;
 pub use gateway_drain as drain;
+pub use metrics::Metrics;
 pub use proxy::http::HttpClient;

@@ -50,6 +50,13 @@ async fn main() -> anyhow::Result<()> {
 
     let store = gateway_state::Store::new();
 
+    // Metric families the proxy records into, registered under the
+    // `gateway_` prefix; the admin server renders the registry.
+    let metrics = gateway_runtime::Metrics::new();
+    let mut registry = prometheus_client::registry::Registry::with_prefix("gateway");
+    metrics.register(&mut registry);
+    let registry = std::sync::Arc::new(registry);
+
     // Readiness latch for the admin endpoint: flipped once the
     // config bootstrap has been applied, never flipped back.
     let (ready_tx, ready_rx) = watch::channel(false);
@@ -79,7 +86,12 @@ async fn main() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!(%addr, "admin server listening");
         let probe_rx = spawn_probe_state(ready_rx.clone(), shutting_down_rx.clone());
-        Some(tokio::spawn(admin::serve(listener, probe_rx, admin_watch)))
+        Some(tokio::spawn(admin::serve(
+            listener,
+            probe_rx,
+            std::sync::Arc::clone(&registry),
+            admin_watch,
+        )))
     } else {
         None
     };
@@ -105,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let gateway = gateway_runtime::Gateway::new(store);
+    let gateway = gateway_runtime::Gateway::with_metrics(store, metrics);
     gateway.run(drain_watch).await?;
 
     // The run loop exited: on a signal the driver is already waiting

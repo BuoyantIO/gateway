@@ -41,6 +41,7 @@ use rand::Rng;
 use crate::drain;
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
+use crate::metrics::Reason;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResponseBody = BoxBody<Bytes, BoxError>;
@@ -407,10 +408,47 @@ pub(crate) async fn handle_connection<I>(
     }
 }
 
-/// Top-level per-request handler. Resolves a route, applies filters,
-/// dials a backend endpoint, forwards the request, and returns the
-/// upstream's response (or a synthesized error response on any failure).
+/// Top-level per-request handler: `serve_request_inner` does the
+/// work; this wrapper is the single point every response passes, so
+/// the request counter and duration histogram see synthesized errors
+/// and proxied traffic alike.
 async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<ResponseBody> {
+    let start = Instant::now();
+    let (resp, route, reason) = serve_request_inner(&ctx, req).await;
+    ctx.metrics.record_request(
+        &ctx.bind_key.0,
+        route.listener.as_deref(),
+        route.name.as_deref(),
+        resp.status().as_u16(),
+        reason,
+        start.elapsed(),
+    );
+    resp
+}
+
+/// The identity a request acquired by matching, for metric labels.
+/// Empty until route resolution succeeds — an unmatched request has
+/// neither a listener nor a route.
+#[derive(Default)]
+struct RouteId {
+    listener: Option<String>,
+    name: Option<String>,
+}
+
+impl RouteId {
+    fn unknown() -> Self {
+        Self::default()
+    }
+}
+
+/// Resolves a route, applies filters, dials a backend endpoint,
+/// forwards the request, and returns the upstream's response (or a
+/// synthesized error response on any failure) — plus the matched
+/// identity and the [`Reason`] the response ended the way it did.
+async fn serve_request_inner(
+    ctx: &ProxyCtx,
+    req: Request<Incoming>,
+) -> (Response<ResponseBody>, RouteId, Reason) {
     let host_owned = host_from_request(&req).map(str::to_owned);
     let host_stripped = host_owned.as_deref().map(strip_port).map(str::to_owned);
     let path = req.uri().path().to_owned();
@@ -428,7 +466,11 @@ async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<Respon
 
     let resolved = match resolve_http_route(&ctx.store, &ctx.bind_key, &match_ctx) {
         Ok(r) => r,
-        Err(e) => return synthesize_error(e),
+        Err(e) => return (synthesize_error(e), RouteId::unknown(), Reason::from(e)),
+    };
+    let route = RouteId {
+        listener: Some(resolved.listener_name.clone()),
+        name: Some(resolved.route_name.clone()),
     };
 
     let filter_ctx = RequestFilterCtx {
@@ -440,10 +482,16 @@ async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<Respon
         let filter = build_http_filter(cfg);
         match filter.apply_request(&mut parts, &filter_ctx) {
             Ok(HttpFilterDecision::Continue) => {}
-            Ok(HttpFilterDecision::Respond(resp)) => return resp,
+            // A filter answering directly (e.g. a redirect) is the
+            // route working as configured.
+            Ok(HttpFilterDecision::Respond(resp)) => return (resp, route, Reason::Ok),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to apply request filter");
-                return synthesize_status(StatusCode::INTERNAL_SERVER_ERROR);
+                return (
+                    synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                    route,
+                    Reason::Internal,
+                );
             }
         }
     }
@@ -453,13 +501,27 @@ async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<Respon
     // backend with a pickable endpoint.
     let backend = match resolved.backend {
         BackendChoice::Picked(b) => b,
-        BackendChoice::None => return synthesize_error(RouteResolveError::NoBackend),
+        BackendChoice::None => {
+            return (
+                synthesize_error(RouteResolveError::NoBackend),
+                route,
+                Reason::NoBackend,
+            );
+        }
         BackendChoice::Unresolved => {
-            return synthesize_error(RouteResolveError::BackendUnresolved);
+            return (
+                synthesize_error(RouteResolveError::BackendUnresolved),
+                route,
+                Reason::BackendUnresolved,
+            );
         }
     };
     let Some((endpoint, info)) = ctx.lb.pick_endpoint(&backend) else {
-        return synthesize_status(StatusCode::SERVICE_UNAVAILABLE);
+        return (
+            synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
+            route,
+            Reason::NoEndpoint,
+        );
     };
     let _active = info.acquire();
 
@@ -471,7 +533,8 @@ async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<Respon
         "http request routed"
     );
 
-    let upstream = forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
+    let (upstream, reason) =
+        forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
 
     // Response-filter pipeline: iterate the route's filters in
     // **reverse** order per Area 03 ("response-side runs
@@ -485,11 +548,15 @@ async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<Respon
         let filter = build_http_filter(cfg);
         if let Err(e) = filter.apply_response_headers(&mut parts) {
             tracing::warn!(error = %e, "failed to apply response filter");
-            return synthesize_status(StatusCode::INTERNAL_SERVER_ERROR);
+            return (
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                route,
+                Reason::Internal,
+            );
         }
     }
     strip_hop_by_hop_headers(&mut parts.headers);
-    Response::from_parts(parts, body)
+    (Response::from_parts(parts, body), route, reason)
 }
 
 // =================== route resolution ===================
@@ -498,6 +565,9 @@ struct ResolvedRoute {
     backend: BackendChoice,
     filters: Vec<HttpFilterConfig>,
     route_name: String,
+    /// Name of the listener the route hangs off — the `listener`
+    /// metric label.
+    listener_name: String,
     /// The route's `PathPrefix` value that matched this request
     matched_path_prefix: Option<String>,
 }
@@ -596,6 +666,7 @@ fn resolve_http_route(
         backend,
         filters: chosen.filters.clone(),
         route_name: chosen.key.name.clone(),
+        listener_name: chosen.key.listener.name.clone(),
         matched_path_prefix: matched_prefix(&chosen.matches, ctx.path).map(str::to_owned),
     })
 }
@@ -922,7 +993,7 @@ async fn forward(
     mut req: Request<Incoming>,
     endpoint: &Endpoint,
     info: &Arc<EndpointInfo>,
-) -> Response<ResponseBody> {
+) -> (Response<ResponseBody>, Reason) {
     let authority = format!("{}:{}", endpoint.address, endpoint.port);
     let pq = req
         .uri()
@@ -937,7 +1008,10 @@ async fn forward(
         Ok(u) => u,
         Err(e) => {
             tracing::warn!(error = %e, "failed to build upstream uri");
-            return synthesize_status(StatusCode::INTERNAL_SERVER_ERROR);
+            return (
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                Reason::Internal,
+            );
         }
     };
     *req.uri_mut() = upstream_uri;
@@ -964,7 +1038,10 @@ async fn forward(
         Err(e) => {
             info.record_failure();
             tracing::warn!(error = %e, "upstream dial failed");
-            return synthesize_status(StatusCode::BAD_GATEWAY);
+            return (
+                synthesize_status(StatusCode::BAD_GATEWAY),
+                Reason::DialFailure,
+            );
         }
     };
 
@@ -973,7 +1050,7 @@ async fn forward(
     // raw upstream headers first.
     let (parts, body) = upstream_resp.into_parts();
     let boxed: ResponseBody = body.map_err(|e| Box::new(e) as BoxError).boxed();
-    Response::from_parts(parts, boxed)
+    (Response::from_parts(parts, boxed), Reason::Ok)
 }
 
 // =================== error → status synthesis ===================
@@ -990,6 +1067,20 @@ enum RouteResolveError {
     NoBackend,
     #[error("route backend ref does not resolve")]
     BackendUnresolved,
+}
+
+impl From<RouteResolveError> for Reason {
+    fn from(err: RouteResolveError) -> Self {
+        match err {
+            // All three answer 404: the request never matched
+            // anything the config names.
+            RouteResolveError::BindGone
+            | RouteResolveError::NoListener
+            | RouteResolveError::NoRoute => Reason::NoRoute,
+            RouteResolveError::NoBackend => Reason::NoBackend,
+            RouteResolveError::BackendUnresolved => Reason::BackendUnresolved,
+        }
+    }
 }
 
 fn synthesize_error(err: RouteResolveError) -> Response<ResponseBody> {
