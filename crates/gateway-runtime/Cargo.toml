@@ -15,6 +15,7 @@ gateway-config = { path = "../gateway-config" }
 gateway-drain = { path = "../gateway-drain" }
 gateway-state = { path = "../gateway-state" }
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
@@ -29,6 +30,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tracing = "0.1"
 
 [dev-dependencies]
+futures = "0.3"
 h2 = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
@@ -36,3 +38,4 @@ hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tok
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+tracing-subscriber = "0.3"

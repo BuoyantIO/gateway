@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::sync::watch;
 
 mod admin;
@@ -32,18 +32,37 @@ struct Args {
     /// termination grace period (30s) so draining beats the SIGKILL.
     #[arg(long, default_value_t = 25)]
     drain_grace: u64,
+
+    /// Log output format: text for humans, json for log pipelines.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // Nothing logs during parsing; --help/--version exit here.
     let args = Args::parse();
+
+    let env_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    match args.log_format {
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter())
+            .init(),
+    }
+
     if args.config.is_none() && args.control_plane.is_none() {
         anyhow::bail!("either --config or --control-plane must be set");
     }

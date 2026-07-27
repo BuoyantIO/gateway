@@ -132,7 +132,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Reason::Ok => "ok",
             Reason::NoRoute => "no_route",

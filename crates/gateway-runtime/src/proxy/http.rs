@@ -42,9 +42,10 @@ use crate::drain;
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
 use crate::metrics::Reason;
+use crate::proxy::access::{Access, RequestOutcome};
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type ResponseBody = BoxBody<Bytes, BoxError>;
+pub(super) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(super) type ResponseBody = BoxBody<Bytes, BoxError>;
 
 /// Process-wide HTTP client used to dial upstreams. Wraps
 /// `hyper_util::client::legacy::Client` — internally it owns a
@@ -370,7 +371,7 @@ pub(crate) async fn handle_connection<I>(
     let svc = service_fn(move |req: Request<Incoming>| {
         let ctx = ctx.clone();
         async move {
-            let resp = serve_request(ctx, req).await;
+            let resp = serve_request(ctx, peer, req).await;
             Ok::<_, Infallible>(resp)
         }
     });
@@ -408,47 +409,27 @@ pub(crate) async fn handle_connection<I>(
     }
 }
 
-/// Top-level per-request handler: `serve_request_inner` does the
-/// work; this wrapper is the single point every response passes, so
-/// the request counter and duration histogram see synthesized errors
-/// and proxied traffic alike.
-async fn serve_request(ctx: ProxyCtx, req: Request<Incoming>) -> Response<ResponseBody> {
-    let start = Instant::now();
-    let (resp, route, reason) = serve_request_inner(&ctx, req).await;
-    ctx.metrics.record_request(
-        &ctx.bind_key.0,
-        route.listener.as_deref(),
-        route.name.as_deref(),
-        resp.status().as_u16(),
-        reason,
-        start.elapsed(),
-    );
-    resp
+/// Top-level per-request handler. Every response passes through
+/// here, so the [`Access`] record sees served and synthesized
+/// traffic alike.
+async fn serve_request(
+    ctx: ProxyCtx,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+) -> Response<ResponseBody> {
+    let access = Access::begin(Arc::clone(&ctx.metrics), &ctx.bind_key.0, peer, &req);
+    let (resp, outcome) = serve_request_inner(&ctx, req).await;
+    access.finish(outcome, resp)
 }
 
-/// The identity a request acquired by matching, for metric labels.
-/// Empty until route resolution succeeds — an unmatched request has
-/// neither a listener nor a route.
-#[derive(Default)]
-struct RouteId {
-    listener: Option<String>,
-    name: Option<String>,
-}
-
-impl RouteId {
-    fn unknown() -> Self {
-        Self::default()
-    }
-}
-
-/// Resolves a route, applies filters, dials a backend endpoint,
-/// forwards the request, and returns the upstream's response (or a
-/// synthesized error response on any failure) — plus the matched
-/// identity and the [`Reason`] the response ended the way it did.
+/// Resolves a route, applies filters, dials a backend endpoint, and
+/// forwards the request. Returns the response (upstream's or a
+/// synthesized error) plus the [`RequestOutcome`] describing how it
+/// went.
 async fn serve_request_inner(
     ctx: &ProxyCtx,
     req: Request<Incoming>,
-) -> (Response<ResponseBody>, RouteId, Reason) {
+) -> (Response<ResponseBody>, RequestOutcome) {
     let host_owned = host_from_request(&req).map(str::to_owned);
     let host_stripped = host_owned.as_deref().map(strip_port).map(str::to_owned);
     let path = req.uri().path().to_owned();
@@ -466,12 +447,15 @@ async fn serve_request_inner(
 
     let resolved = match resolve_http_route(&ctx.store, &ctx.bind_key, &match_ctx) {
         Ok(r) => r,
-        Err(e) => return (synthesize_error(e), RouteId::unknown(), Reason::from(e)),
+        Err(e) => {
+            return (
+                synthesize_error(e),
+                RequestOutcome::short_circuit(None, None, Reason::from(e)),
+            );
+        }
     };
-    let route = RouteId {
-        listener: Some(resolved.listener_name.clone()),
-        name: Some(resolved.route_name.clone()),
-    };
+    let listener = Some(resolved.listener_name.as_str());
+    let route = Some(resolved.route_name.as_str());
 
     let filter_ctx = RequestFilterCtx {
         matched_path_prefix: resolved.matched_path_prefix.as_deref(),
@@ -484,13 +468,17 @@ async fn serve_request_inner(
             Ok(HttpFilterDecision::Continue) => {}
             // A filter answering directly (e.g. a redirect) is the
             // route working as configured.
-            Ok(HttpFilterDecision::Respond(resp)) => return (resp, route, Reason::Ok),
+            Ok(HttpFilterDecision::Respond(resp)) => {
+                return (
+                    resp,
+                    RequestOutcome::short_circuit(listener, route, Reason::Ok),
+                );
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to apply request filter");
                 return (
                     synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                    route,
-                    Reason::Internal,
+                    RequestOutcome::short_circuit(listener, route, Reason::Internal),
                 );
             }
         }
@@ -504,37 +492,34 @@ async fn serve_request_inner(
         BackendChoice::None => {
             return (
                 synthesize_error(RouteResolveError::NoBackend),
-                route,
-                Reason::NoBackend,
+                RequestOutcome::short_circuit(listener, route, Reason::NoBackend),
             );
         }
         BackendChoice::Unresolved => {
             return (
                 synthesize_error(RouteResolveError::BackendUnresolved),
-                route,
-                Reason::BackendUnresolved,
+                RequestOutcome::short_circuit(listener, route, Reason::BackendUnresolved),
             );
         }
     };
     let Some((endpoint, info)) = ctx.lb.pick_endpoint(&backend) else {
         return (
             synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
-            route,
-            Reason::NoEndpoint,
+            RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
         );
     };
     let _active = info.acquire();
+    let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
 
-    tracing::debug!(
-        bind = %ctx.bind_key,
-        route = %resolved.route_name,
-        endpoint = %endpoint.name,
-        upstream = %format!("{}:{}", endpoint.address, endpoint.port),
-        "http request routed"
-    );
-
-    let (upstream, reason) =
+    let (upstream, reason, dial_ms) =
         forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
+    let outcome = RequestOutcome {
+        listener: listener.map(str::to_owned),
+        route: route.map(str::to_owned),
+        reason,
+        endpoint: Some(endpoint_authority),
+        dial_ms,
+    };
 
     // Response-filter pipeline: iterate the route's filters in
     // **reverse** order per Area 03 ("response-side runs
@@ -550,13 +535,15 @@ async fn serve_request_inner(
             tracing::warn!(error = %e, "failed to apply response filter");
             return (
                 synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                route,
-                Reason::Internal,
+                RequestOutcome {
+                    reason: Reason::Internal,
+                    ..outcome
+                },
             );
         }
     }
     strip_hop_by_hop_headers(&mut parts.headers);
-    (Response::from_parts(parts, body), route, reason)
+    (Response::from_parts(parts, body), outcome)
 }
 
 // =================== route resolution ===================
@@ -930,7 +917,7 @@ fn strip_port(authority: &str) -> &str {
         .map_or(authority, |(host, _port)| host)
 }
 
-fn host_from_request<B>(req: &Request<B>) -> Option<&str> {
+pub(super) fn host_from_request<B>(req: &Request<B>) -> Option<&str> {
     if let Some(auth) = req.uri().authority() {
         return Some(auth.as_str());
     }
@@ -993,7 +980,7 @@ async fn forward(
     mut req: Request<Incoming>,
     endpoint: &Endpoint,
     info: &Arc<EndpointInfo>,
-) -> (Response<ResponseBody>, Reason) {
+) -> (Response<ResponseBody>, Reason, Option<f64>) {
     let authority = format!("{}:{}", endpoint.address, endpoint.port);
     let pq = req
         .uri()
@@ -1011,6 +998,7 @@ async fn forward(
             return (
                 synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
                 Reason::Internal,
+                None,
             );
         }
     };
@@ -1029,18 +1017,21 @@ async fn forward(
     strip_hop_by_hop_headers(req.headers_mut());
 
     let dial_start = Instant::now();
-    let upstream_resp = match upstream_client.request(req).await {
+    let (upstream_resp, dial_ms) = match upstream_client.request(req).await {
         Ok(r) => {
             let dial_ms = dial_start.elapsed().as_secs_f64() * 1000.0;
             info.record_success(dial_ms);
-            r
+            (r, dial_ms)
         }
         Err(e) => {
             info.record_failure();
             tracing::warn!(error = %e, "upstream dial failed");
+            // The elapsed time still reaches the log: how long the
+            // dial waited before the 502.
             return (
                 synthesize_status(StatusCode::BAD_GATEWAY),
                 Reason::DialFailure,
+                Some(dial_start.elapsed().as_secs_f64() * 1000.0),
             );
         }
     };
@@ -1050,7 +1041,11 @@ async fn forward(
     // raw upstream headers first.
     let (parts, body) = upstream_resp.into_parts();
     let boxed: ResponseBody = body.map_err(|e| Box::new(e) as BoxError).boxed();
-    (Response::from_parts(parts, boxed), Reason::Ok)
+    (
+        Response::from_parts(parts, boxed),
+        Reason::Ok,
+        Some(dial_ms),
+    )
 }
 
 // =================== error → status synthesis ===================
