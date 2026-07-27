@@ -49,7 +49,7 @@ Install the Gateway API CRDs, the chart (pointed at the local
 images), and the sample app:
 
 ```sh
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
 helm upgrade --install gateway deploy/chart/gateway \
     --namespace gateway-system --create-namespace \
     --set controlPlane.image.repository=gateway-control-plane \

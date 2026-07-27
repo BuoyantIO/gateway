@@ -8,7 +8,7 @@ CP_IMAGE_REPO := "gateway-control-plane"
 CP_IMAGE_TAG := "latest"
 CP_IMAGE := CP_IMAGE_REPO + ":" + CP_IMAGE_TAG
 ECHO_IMAGE := "gateway-test-echo:e2e"
-GATEWAY_API_CRDS := "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml"
+GATEWAY_API_CRDS := "https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml"
 # Assigns docker-network IPs to LoadBalancer Services in the kind
 # cluster (host-routable on Linux). Runs as a container beside the
 # cluster; no toolchain requirement.
