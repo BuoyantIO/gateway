@@ -2249,7 +2249,9 @@ mod tests {
     }
 
     #[test]
-    fn cross_namespace_certref_skipped() {
+    fn cross_namespace_certref_resolves_permissively() {
+        // Accepted without a ReferenceGrant check for now; the
+        // secret is emitted under its own namespace-qualified key.
         let state = K8sState {
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
@@ -2269,10 +2271,7 @@ mod tests {
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).expect("snapshot");
-        assert!(
-            s.secrets.is_empty(),
-            "cross-namespace ref needs a ReferenceGrant"
-        );
+        assert!(s.secrets.contains_key(&SecretKey::new("other", "foo")));
     }
 
     #[test]
@@ -2403,7 +2402,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_namespace_certref_excluded_from_listener() {
+    fn cross_namespace_certref_carried_on_listener() {
         let state = K8sState {
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
@@ -2429,10 +2428,11 @@ mod tests {
             .tls
             .as_ref()
             .expect("tls config");
-        assert!(
-            tls.certificate_refs.is_empty(),
-            "cross-namespace certificateRef must be excluded"
-        );
+        // Accepted permissively (no ReferenceGrant check yet), with
+        // the referenced namespace carried through.
+        assert_eq!(tls.certificate_refs.len(), 1);
+        assert_eq!(tls.certificate_refs[0].namespace, "other");
+        assert_eq!(tls.certificate_refs[0].name, "foo");
     }
 
     #[test]

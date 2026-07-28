@@ -94,6 +94,19 @@ pub fn gateway_https(
     hostname: Option<&str>,
     secret: &str,
 ) -> Gateway {
+    gateway_https_with_cert_ns(ns, name, port, hostname, None, secret)
+}
+
+/// [`gateway_https`] with an explicit certificate namespace — the
+/// cross-namespace certificateRef shape.
+pub fn gateway_https_with_cert_ns(
+    ns: &str,
+    name: &str,
+    port: i32,
+    hostname: Option<&str>,
+    secret_ns: Option<&str>,
+    secret: &str,
+) -> Gateway {
     Gateway {
         metadata: ObjectMeta {
             namespace: Some(ns.into()),
@@ -114,7 +127,7 @@ pub fn gateway_https(
                         group: None,
                         kind: Some("Secret".into()),
                         name: secret.into(),
-                        namespace: None,
+                        namespace: secret_ns.map(String::from),
                     }]),
                 }),
                 allowed_routes: Some(GatewayListenersAllowedRoutes {

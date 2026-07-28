@@ -66,8 +66,9 @@ pub struct ListenerResolution<'a> {
     pub attached_routes: u32,
     /// Accepted certificateRefs, with the Secret if present.
     pub cert_refs: Vec<CertRef<'a>>,
-    /// certificateRefs rejected outright: non-core group, non-Secret
-    /// kind, or cross-namespace without a `ReferenceGrant`.
+    /// certificateRefs rejected outright: non-core group or
+    /// non-Secret kind. Cross-namespace refs are currently accepted
+    /// without a `ReferenceGrant` check.
     pub rejected_cert_refs: u32,
 }
 
@@ -375,8 +376,15 @@ fn resolve_listeners<'a>(
 }
 
 /// Resolve a listener's `certificateRefs`: core-group `Secret` refs
-/// in the Gateway's namespace are accepted (with the Secret attached
-/// when present); anything else is rejected with a warn.
+/// are accepted (with the Secret attached when present); non-core
+/// and non-Secret refs are rejected with a warn.
+///
+/// Cross-namespace refs resolve in the referenced namespace and are
+/// accepted unconditionally for now — permissive until
+/// `ReferenceGrant` enforcement lands, at which point a grant in
+/// the Secret's namespace becomes required (the same
+/// permissive-now posture route attachment has with
+/// `allowedRoutes`).
 fn resolve_cert_refs<'a>(
     gateway_ns: &str,
     listener: &GatewayListeners,
@@ -402,19 +410,18 @@ fn resolve_cert_refs<'a>(
             rejected += 1;
             continue;
         }
-        if r.namespace
-            .as_deref()
-            .is_some_and(|n| !n.is_empty() && n != gateway_ns)
-        {
-            tracing::warn!(name = %r.name, namespace = ?r.namespace,
-                "skipping cross-namespace certificateRef");
-            rejected += 1;
-            continue;
+        let ref_ns = match r.namespace.as_deref() {
+            Some(n) if !n.is_empty() => n,
+            _ => gateway_ns,
+        };
+        if ref_ns != gateway_ns {
+            tracing::info!(name = %r.name, namespace = %ref_ns,
+                "accepting cross-namespace certificateRef without a ReferenceGrant check");
         }
         accepted.push(CertRef {
-            namespace: gateway_ns.to_string(),
+            namespace: ref_ns.to_string(),
             name: r.name.clone(),
-            secret: secrets_by_id.get(&(gateway_ns, r.name.as_str())).copied(),
+            secret: secrets_by_id.get(&(ref_ns, r.name.as_str())).copied(),
         });
     }
     (accepted, rejected)
@@ -1643,15 +1650,54 @@ mod tests {
                 namespace: Some("elsewhere".into()),
                 ..Default::default()
             });
+        listener
+            .tls
+            .as_mut()
+            .unwrap()
+            .certificate_refs
+            .as_mut()
+            .unwrap()
+            .push(GatewayListenersTlsCertificateRefs {
+                name: "cm".into(),
+                kind: Some("ConfigMap".into()),
+                ..Default::default()
+            });
         let mut s = state(vec![gw("demo", "gw", "zd", vec![listener])], vec![]);
-        s.secrets = vec![secret("demo", "present")];
+        s.secrets = vec![secret("demo", "present"), secret("elsewhere", "cross")];
         let r = resolve(&s, OURS);
 
         let lr = &r.gateways[0].listeners[0];
-        assert_eq!(lr.cert_refs.len(), 2);
+        // present, absent, and the cross-namespace ref all resolve
+        // as refs; only the non-Secret kind is rejected.
+        assert_eq!(lr.cert_refs.len(), 3);
         assert!(lr.cert_refs[0].secret.is_some());
         assert!(lr.cert_refs[1].secret.is_none());
+        // Cross-namespace: accepted permissively, secret found in
+        // the referenced namespace, namespace carried through.
+        assert!(lr.cert_refs[2].secret.is_some());
+        assert_eq!(lr.cert_refs[2].namespace, "elsewhere");
         assert_eq!(lr.rejected_cert_refs, 1);
+    }
+
+    #[test]
+    fn cross_namespace_cert_ref_with_missing_secret_is_unresolved() {
+        let mut listener = https_listener("https", 443, &[]);
+        listener.tls.as_mut().unwrap().certificate_refs =
+            Some(vec![GatewayListenersTlsCertificateRefs {
+                name: "ghost".into(),
+                namespace: Some("elsewhere".into()),
+                ..Default::default()
+            }]);
+        let s = state(vec![gw("demo", "gw", "zd", vec![listener])], vec![]);
+        let r = resolve(&s, OURS);
+
+        let lr = &r.gateways[0].listeners[0];
+        // Accepted (not rejected), but unresolved — same treatment
+        // as a missing same-namespace secret.
+        assert_eq!(lr.cert_refs.len(), 1);
+        assert!(lr.cert_refs[0].secret.is_none());
+        assert_eq!(lr.cert_refs[0].namespace, "elsewhere");
+        assert_eq!(lr.rejected_cert_refs, 0);
     }
 
     // ----- addresses -----
