@@ -7,10 +7,10 @@
 //! connection preface. From the request handler's point of view the
 //! version is invisible.
 //!
-//! Filters apply through a `HttpFilter` trait declared in this
-//! module — one impl struct per `gateway_config::filter::HttpFilter`
-//! variant, plus a `build_http_filter(cfg)` shim that converts the
-//! config-shaped enum into a trait object at use time.
+//! Filters run as extensions (`crate::extension`): one instance per
+//! filter per request, built from the config by
+//! `extension::builtin::instance_for`, executing request hooks in
+//! route order and response hooks in reverse.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -20,16 +20,14 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
-use gateway_config::filter::{
-    HeaderOps, HttpFilter as HttpFilterConfig, RedirectPath, RedirectStatus, Scheme,
-};
+use gateway_config::filter::HttpFilter as HttpFilterConfig;
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
 use gateway_state::{
     ActiveBackend, ActiveBackendRef, ActiveHttpRoute, ActiveListener, BindKey, Store,
 };
-use http::{HeaderValue, Method, Request, Response, StatusCode, Uri};
+use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -39,7 +37,8 @@ use hyper_util::server::conn::auto;
 use rand::Rng;
 
 use crate::drain;
-use crate::extension::builtin::{FilterError, apply_header_ops, authority, replace_prefix};
+use crate::extension::builtin::instance_for;
+use crate::extension::{Action, Cx, Extension, LocalResponse};
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
 use crate::metrics::Reason;
@@ -96,186 +95,6 @@ impl std::fmt::Debug for HttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpClient").finish_non_exhaustive()
     }
-}
-
-// =================== filter trait + impls ===================
-
-/// Runtime-side HTTP filter contract. Each
-/// `gateway_config::filter::HttpFilter` variant maps to one impl of
-/// this trait via [`build_http_filter`]. Both hooks have no-op
-/// defaults so each concrete filter opts in to only the side(s)
-/// it cares about.
-pub(crate) trait HttpFilter: Send + Sync {
-    fn apply_request(
-        &self,
-        _parts: &mut http::request::Parts,
-        _ctx: &RequestFilterCtx<'_>,
-    ) -> Result<HttpFilterDecision, FilterError> {
-        Ok(HttpFilterDecision::Continue)
-    }
-
-    /// Response-side hook. Runs in reverse-of-request order across
-    /// the route's filter list.
-    fn apply_response_headers(
-        &self,
-        _parts: &mut http::response::Parts,
-    ) -> Result<(), FilterError> {
-        Ok(())
-    }
-}
-
-pub(crate) struct RequestFilterCtx<'a> {
-    pub matched_path_prefix: Option<&'a str>,
-    pub request_host: Option<&'a str>,
-}
-
-pub(crate) enum HttpFilterDecision {
-    Continue,
-    Respond(Response<ResponseBody>),
-}
-
-/// Build a runtime filter trait object from a config-shaped variant.
-fn build_http_filter(cfg: &HttpFilterConfig) -> Arc<dyn HttpFilter> {
-    match cfg {
-        HttpFilterConfig::RequestHeaderModifier {
-            request_headers, ..
-        } => Arc::new(RequestHeaderModifierFilter {
-            ops: request_headers.clone(),
-        }),
-        HttpFilterConfig::ResponseHeaderModifier {
-            response_headers, ..
-        } => Arc::new(ResponseHeaderModifierFilter {
-            ops: response_headers.clone(),
-        }),
-        HttpFilterConfig::RequestRedirect {
-            scheme,
-            hostname,
-            port,
-            status_code,
-            path,
-            ..
-        } => Arc::new(RequestRedirectFilter {
-            scheme: *scheme,
-            hostname: hostname.clone(),
-            port: *port,
-            status_code: *status_code,
-            path: path.clone(),
-        }),
-    }
-}
-
-struct RequestHeaderModifierFilter {
-    ops: HeaderOps,
-}
-
-impl HttpFilter for RequestHeaderModifierFilter {
-    fn apply_request(
-        &self,
-        parts: &mut http::request::Parts,
-        _ctx: &RequestFilterCtx<'_>,
-    ) -> Result<HttpFilterDecision, FilterError> {
-        apply_header_ops(
-            &mut parts.headers,
-            &self.ops.set,
-            &self.ops.add,
-            &self.ops.remove,
-        )?;
-        Ok(HttpFilterDecision::Continue)
-    }
-}
-
-struct ResponseHeaderModifierFilter {
-    ops: HeaderOps,
-}
-
-impl HttpFilter for ResponseHeaderModifierFilter {
-    fn apply_response_headers(&self, parts: &mut http::response::Parts) -> Result<(), FilterError> {
-        apply_header_ops(
-            &mut parts.headers,
-            &self.ops.set,
-            &self.ops.add,
-            &self.ops.remove,
-        )
-    }
-}
-
-/// Gateway API `RequestRedirect`: short-circuits the request with a 3xx
-/// and a `Location` built from the request plus the configured
-/// overrides.
-struct RequestRedirectFilter {
-    scheme: Option<Scheme>,
-    hostname: Option<String>,
-    port: Option<u16>,
-    status_code: RedirectStatus,
-    path: Option<RedirectPath>,
-}
-
-impl HttpFilter for RequestRedirectFilter {
-    fn apply_request(
-        &self,
-        parts: &mut http::request::Parts,
-        ctx: &RequestFilterCtx<'_>,
-    ) -> Result<HttpFilterDecision, FilterError> {
-        // Scheme: explicit config wins; else the request's own scheme
-        // (present on h2), else plain http.
-        let scheme = self
-            .scheme
-            .map(Scheme::as_str)
-            .or_else(|| parts.uri.scheme_str())
-            .unwrap_or("http");
-
-        // Host: explicit config wins; else the request host (already
-        // port-stripped by the caller).
-        let host = self
-            .hostname
-            .clone()
-            .or_else(|| ctx.request_host.map(str::to_owned))
-            .unwrap_or_default();
-
-        // Path: full replace, prefix replace against the matched
-        // prefix, or the request path unchanged.
-        let orig_path = parts.uri.path();
-        let new_path = match &self.path {
-            None => orig_path.to_owned(),
-            Some(RedirectPath::ReplaceFullPath(p)) => p.clone(),
-            Some(RedirectPath::ReplacePrefixMatch(replacement)) => {
-                if let Some(prefix) = ctx.matched_path_prefix {
-                    replace_prefix(orig_path, prefix, replacement)
-                } else {
-                    tracing::warn!(
-                        "RequestRedirect ReplacePrefixMatch on a non-prefix route; \
-                         leaving path unchanged"
-                    );
-                    orig_path.to_owned()
-                }
-            }
-        };
-
-        let mut location = format!("{scheme}://{}", authority(&host, scheme, self.port));
-        location.push_str(&new_path);
-        if let Some(q) = parts.uri.query() {
-            location.push('?');
-            location.push_str(q);
-        }
-
-        let location = HeaderValue::try_from(location)
-            .map_err(|_| FilterError::InvalidHeaderValue("location".to_owned()))?;
-        let status = StatusCode::from_u16(self.status_code.code()).unwrap_or(StatusCode::FOUND);
-        Ok(HttpFilterDecision::Respond(redirect_response(
-            status, location,
-        )))
-    }
-}
-
-fn redirect_response(status: StatusCode, location: HeaderValue) -> Response<ResponseBody> {
-    let body = Full::new(Bytes::new())
-        .map_err(|never: Infallible| match never {})
-        .boxed();
-    Response::builder()
-        .status(status)
-        .header(http::header::LOCATION, location)
-        .body(body)
-        .expect("redirect response is well-formed")
 }
 
 // =================== connection + request handlers ===================
@@ -388,30 +207,40 @@ async fn serve_request_inner(
     let listener = Some(resolved.listener_name.as_str());
     let route = Some(resolved.route_name.as_str());
 
-    let filter_ctx = RequestFilterCtx {
-        matched_path_prefix: resolved.matched_path_prefix.as_deref(),
-        request_host: host_stripped.as_deref(),
+    let mut cx = Cx::new();
+    cx.set_matched_path_prefix(resolved.matched_path_prefix.as_deref());
+    cx.set_request_host(host_stripped.as_deref());
+
+    // One extension instance per filter, alive from the request phase
+    // through the response phase. Invalid filter config fails here,
+    // before dispatch.
+    let mut extensions = match build_extensions(&resolved.filters) {
+        Ok(exts) => exts,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build filter extension");
+            return (
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                RequestOutcome::short_circuit(listener, route, Reason::Internal),
+            );
+        }
     };
+
     let (mut parts, body) = req.into_parts();
-    for cfg in &resolved.filters {
-        let filter = build_http_filter(cfg);
-        match filter.apply_request(&mut parts, &filter_ctx) {
-            Ok(HttpFilterDecision::Continue) => {}
-            // A filter answering directly (e.g. a redirect) is the
-            // route working as configured.
-            Ok(HttpFilterDecision::Respond(resp)) => {
-                return (
-                    resp,
-                    RequestOutcome::short_circuit(listener, route, Reason::Ok),
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to apply request filter");
-                return (
-                    synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                    RequestOutcome::short_circuit(listener, route, Reason::Internal),
-                );
-            }
+    match run_request_hooks(&mut extensions, &mut parts, &mut cx).await {
+        RequestPhase::Continue => {}
+        // An extension answering directly (e.g. a redirect) is the
+        // route working as configured.
+        RequestPhase::Respond(resp) => {
+            return (
+                local_response(resp),
+                RequestOutcome::short_circuit(listener, route, Reason::Ok),
+            );
+        }
+        RequestPhase::Failed => {
+            return (
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                RequestOutcome::short_circuit(listener, route, Reason::Internal),
+            );
         }
     }
     let req = Request::from_parts(parts, body);
@@ -452,29 +281,67 @@ async fn serve_request_inner(
         dial_ms,
     };
 
-    // Response-filter pipeline: iterate the route's filters in
-    // **reverse** order per Area 03 ("response-side runs
-    // reverse-of-request"). Each filter's response hook is no-op
-    // by default; only `ResponseHeaderModifier`-style filters
-    // mutate the response. Hop-by-hop stripping (below) runs
-    // after, so a filter can't accidentally keep a hop-by-hop
-    // header alive.
+    // Response hooks run in **reverse** order per Area 03
+    // ("response-side runs reverse-of-request"). Hop-by-hop
+    // stripping (below) runs after, so an extension can't
+    // accidentally keep a hop-by-hop header alive.
     let (mut parts, body) = upstream.into_parts();
-    for cfg in resolved.filters.iter().rev() {
-        let filter = build_http_filter(cfg);
-        if let Err(e) = filter.apply_response_headers(&mut parts) {
-            tracing::warn!(error = %e, "failed to apply response filter");
-            return (
-                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                RequestOutcome {
-                    reason: Reason::Internal,
-                    ..outcome
-                },
-            );
-        }
+    for ext in extensions.iter_mut().rev() {
+        ext.on_response_start(&mut parts, &mut cx);
     }
     strip_hop_by_hop_headers(&mut parts.headers);
     (Response::from_parts(parts, body), outcome)
+}
+
+/// Build one extension instance per filter, in route order.
+fn build_extensions(
+    filters: &[HttpFilterConfig],
+) -> Result<Vec<Box<dyn Extension>>, crate::extension::builtin::FilterError> {
+    filters.iter().map(instance_for).collect()
+}
+
+/// What the request-side hooks decided for this request.
+enum RequestPhase {
+    Continue,
+    Respond(LocalResponse),
+    Failed,
+}
+
+/// Run the request-side hooks in route order.
+async fn run_request_hooks(
+    extensions: &mut [Box<dyn Extension>],
+    parts: &mut http::request::Parts,
+    cx: &mut Cx<'_>,
+) -> RequestPhase {
+    for ext in extensions.iter_mut() {
+        match ext.on_request_start(parts, cx).await {
+            Ok(Action::Continue) => {}
+            Ok(Action::Respond(resp)) => return RequestPhase::Respond(resp),
+            // No core filter selects targets; selector semantics
+            // arrive with configurable extensions.
+            Ok(Action::Select(_)) => {
+                tracing::error!("core filter returned a target selection");
+                return RequestPhase::Failed;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to apply request filter");
+                return RequestPhase::Failed;
+            }
+        }
+    }
+    RequestPhase::Continue
+}
+
+/// Turn an extension's [`LocalResponse`] into the wire response.
+/// Headers land verbatim — nothing is injected.
+fn local_response(resp: LocalResponse) -> Response<ResponseBody> {
+    let body = Full::new(resp.body)
+        .map_err(|never: Infallible| match never {})
+        .boxed();
+    let mut out = Response::new(body);
+    *out.status_mut() = resp.status;
+    *out.headers_mut() = resp.headers;
+    out
 }
 
 // =================== route resolution ===================
@@ -1036,8 +903,6 @@ fn synthesize_status(status: StatusCode) -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
-    use gateway_config::filter::HeaderPair;
-
     use super::*;
 
     fn pm(v: &str) -> PathMatch {
@@ -1054,105 +919,27 @@ mod tests {
         }
     }
 
-    // --- ResponseHeaderModifierFilter ---
-
-    fn response_filter(
-        add: &[(&str, &str)],
-        set: &[(&str, &str)],
-        remove: &[&str],
-    ) -> ResponseHeaderModifierFilter {
-        ResponseHeaderModifierFilter {
-            ops: HeaderOps {
-                add: add
-                    .iter()
-                    .map(|(n, v)| HeaderPair {
-                        name: (*n).into(),
-                        value: (*v).into(),
-                    })
-                    .collect(),
-                set: set
-                    .iter()
-                    .map(|(n, v)| HeaderPair {
-                        name: (*n).into(),
-                        value: (*v).into(),
-                    })
-                    .collect(),
-                remove: remove.iter().map(|s| (*s).into()).collect(),
-            },
-        }
-    }
-
-    fn build_response_parts(initial: &[(&str, &str)]) -> http::response::Parts {
-        let mut builder = http::Response::builder();
-        for (n, v) in initial {
-            builder = builder.header(*n, *v);
-        }
-        let resp = builder.body(()).unwrap();
-        resp.into_parts().0
-    }
+    // --- local_response ---
 
     #[test]
-    fn response_header_filter_adds_sets_and_removes() {
-        let filter = response_filter(
-            &[("x-csp", "default-src 'self'")],
-            &[("x-frame-options", "sameorigin")],
-            &["x-server-version"],
+    fn local_response_preserves_parts_verbatim() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::LOCATION,
+            "https://x.example/".parse().unwrap(),
         );
-        let mut parts =
-            build_response_parts(&[("x-frame-options", "STALE"), ("x-server-version", "leaked")]);
-        filter.apply_response_headers(&mut parts).unwrap();
-        assert_eq!(parts.headers.get("x-csp").unwrap(), "default-src 'self'");
-        assert_eq!(parts.headers.get("x-frame-options").unwrap(), "sameorigin");
-        assert!(!parts.headers.contains_key("x-server-version"));
-    }
-
-    #[test]
-    fn request_filter_default_response_hook_is_noop() {
-        // RequestHeaderModifierFilter only mutates the request side;
-        // its inherited default `apply_response_headers` impl must
-        // leave the response untouched.
-        let req_filter = RequestHeaderModifierFilter {
-            ops: HeaderOps {
-                add: vec![],
-                set: vec![],
-                remove: vec!["x-unused".into()],
-            },
-        };
-        let mut parts = build_response_parts(&[("x-keep", "value")]);
-        req_filter.apply_response_headers(&mut parts).unwrap();
-        assert_eq!(parts.headers.get("x-keep").unwrap(), "value");
-    }
-
-    #[test]
-    fn response_filter_default_request_hook_is_noop() {
-        // ResponseHeaderModifierFilter only mutates the response
-        // side; its inherited default `apply_request_headers` impl
-        // returns `Continue` without touching the request.
-        let rsp_filter = ResponseHeaderModifierFilter {
-            ops: HeaderOps {
-                add: vec![HeaderPair {
-                    name: "x-server".into(),
-                    value: "gw".into(),
-                }],
-                set: vec![],
-                remove: vec![],
-            },
-        };
-        let req = http::Request::builder()
-            .header("x-keep", "value")
-            .body(())
-            .unwrap();
-        let (mut parts, ()) = req.into_parts();
-        let ctx = RequestFilterCtx {
-            matched_path_prefix: None,
-            request_host: None,
-        };
-        let decision = rsp_filter.apply_request(&mut parts, &ctx).unwrap();
-        assert!(matches!(decision, HttpFilterDecision::Continue));
-        assert_eq!(parts.headers.get("x-keep").unwrap(), "value");
-        // The response-only add must NOT have leaked onto the
-        // request headers.
-        assert!(!parts.headers.contains_key("x-server"));
+        let resp = local_response(LocalResponse {
+            status: StatusCode::MOVED_PERMANENTLY,
+            headers,
+            body: Bytes::new(),
+        });
+        assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+        // Exactly the extension's headers — nothing injected.
+        assert_eq!(resp.headers().len(), 1);
+        assert_eq!(
+            resp.headers().get(http::header::LOCATION).unwrap(),
+            "https://x.example/"
+        );
     }
 
     // --- hop-by-hop header stripping ---
@@ -1771,119 +1558,6 @@ mod tests {
         let ls = [listener("catchall", None)];
         assert_eq!(picked(&ls, Some("anything.com")), Some("catchall"));
         assert_eq!(picked(&ls, None), Some("catchall"));
-    }
-
-    // --- RequestRedirect ---
-
-    fn redirect(
-        scheme: Option<Scheme>,
-        host: Option<&str>,
-        port: Option<u16>,
-        status: RedirectStatus,
-        path: Option<RedirectPath>,
-    ) -> RequestRedirectFilter {
-        RequestRedirectFilter {
-            scheme,
-            hostname: host.map(str::to_owned),
-            port,
-            status_code: status,
-            path,
-        }
-    }
-
-    fn run_redirect(
-        f: &RequestRedirectFilter,
-        uri: &str,
-        req_host: Option<&str>,
-        matched_prefix: Option<&str>,
-    ) -> (StatusCode, String) {
-        let req = http::Request::builder().uri(uri).body(()).unwrap();
-        let (mut parts, ()) = req.into_parts();
-        let ctx = RequestFilterCtx {
-            matched_path_prefix: matched_prefix,
-            request_host: req_host,
-        };
-        match f.apply_request(&mut parts, &ctx).expect("redirect ok") {
-            HttpFilterDecision::Respond(resp) => {
-                let loc = resp
-                    .headers()
-                    .get(http::header::LOCATION)
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned();
-                (resp.status(), loc)
-            }
-            HttpFilterDecision::Continue => panic!("expected a redirect response"),
-        }
-    }
-
-    #[test]
-    fn redirect_scheme_only_keeps_host_and_path() {
-        let f = redirect(
-            Some(Scheme::Https),
-            None,
-            None,
-            RedirectStatus::MovedPermanently,
-            None,
-        );
-        let (status, loc) = run_redirect(&f, "/foo/bar?x=1", Some("app.example"), None);
-        assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
-        assert_eq!(loc, "https://app.example/foo/bar?x=1");
-    }
-
-    #[test]
-    fn redirect_omits_well_known_port() {
-        let f = redirect(
-            Some(Scheme::Https),
-            Some("h"),
-            Some(443),
-            RedirectStatus::Found,
-            None,
-        );
-        assert_eq!(run_redirect(&f, "/", None, None).1, "https://h/");
-        let f2 = redirect(
-            Some(Scheme::Https),
-            Some("h"),
-            Some(8443),
-            RedirectStatus::Found,
-            None,
-        );
-        assert_eq!(run_redirect(&f2, "/", None, None).1, "https://h:8443/");
-    }
-
-    #[test]
-    fn redirect_replace_full_path() {
-        let f = redirect(
-            Some(Scheme::Https),
-            Some("h"),
-            None,
-            RedirectStatus::Found,
-            Some(RedirectPath::ReplaceFullPath("/new".into())),
-        );
-        assert_eq!(
-            run_redirect(&f, "/old/thing", None, None).1,
-            "https://h/new"
-        );
-    }
-
-    #[test]
-    fn redirect_replace_prefix_match() {
-        let f = redirect(
-            Some(Scheme::Https),
-            Some("h"),
-            None,
-            RedirectStatus::Found,
-            Some(RedirectPath::ReplacePrefixMatch("/new".into())),
-        );
-        assert_eq!(
-            run_redirect(&f, "/foo/bar", None, Some("/foo")).1,
-            "https://h/new/bar"
-        );
-        assert_eq!(
-            run_redirect(&f, "/foo", None, Some("/foo")).1,
-            "https://h/new"
-        );
     }
 
     // --- pick_backend_ref ---

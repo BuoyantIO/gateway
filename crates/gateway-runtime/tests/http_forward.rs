@@ -11,7 +11,7 @@ use bytes::Bytes;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
-use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
+use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, Scheme};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::{Gateway, drain};
@@ -1099,6 +1099,142 @@ async fn weighted_refs_split_between_resolved_and_missing() {
     // 64 fair coin flips: both outcomes appear (P(one-sided) ~ 1e-19).
     assert!(oks > 0, "resolved ref received no traffic");
     assert!(errors > 0, "unresolved ref received no traffic");
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// A short-circuiting filter (redirect) answers without response-side
+/// filter treatment: the 301 carries no `ResponseHeaderModifier`
+/// headers. Pins deliberately preserved pre-extension behavior.
+#[tokio::test]
+async fn redirect_short_circuit_skips_response_filters() {
+    let bind_port = free_port().await;
+
+    let route = HttpRoute {
+        name: "r".into(),
+        matches: vec![HttpMatch {
+            host: None,
+            path: PathMatch::PathPrefix { value: "/".into() },
+            method: None,
+            headers: vec![],
+            query_params: vec![],
+        }],
+        backend_refs: vec![],
+        filters: vec![
+            HttpFilter::ResponseHeaderModifier {
+                name: "rsp".into(),
+                response_headers: HeaderOps {
+                    add: vec![HeaderPair {
+                        name: "x-test-csp".into(),
+                        value: "default-src 'self'".into(),
+                    }],
+                    set: vec![],
+                    remove: vec![],
+                },
+            },
+            HttpFilter::RequestRedirect {
+                name: "to-https".into(),
+                scheme: Some(Scheme::Https),
+                hostname: None,
+                port: None,
+                status_code: RedirectStatus::MovedPermanently,
+                path: None,
+            },
+        ],
+    };
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![route])],
+        }],
+        backends: vec![],
+        secrets: vec![],
+    };
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .uri(format!("http://127.0.0.1:{bind_port}/foo?x=1"))
+        .header("host", "app.example")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        resp.headers()
+            .get(http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.example/foo?x=1"),
+    );
+    assert!(
+        resp.headers().get("x-test-csp").is_none(),
+        "response filters must not run on a short-circuited response"
+    );
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// An invalid header name in filter config fails the request before
+/// dispatch: 500, and the upstream (a dead port here) is never dialed
+/// (a dial attempt would 502 instead).
+#[tokio::test]
+async fn invalid_filter_config_answers_500_before_dispatch() {
+    let dead_port = free_port().await;
+    let bind_port = free_port().await;
+
+    let filter = HttpFilter::RequestHeaderModifier {
+        name: "bad".into(),
+        request_headers: HeaderOps {
+            add: vec![HeaderPair {
+                name: "bad name".into(),
+                value: "v".into(),
+            }],
+            set: vec![],
+            remove: vec![],
+        },
+    };
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener(
+                "l",
+                None,
+                vec![http_route_with_filter("r", "/", "be", filter)],
+            )],
+        }],
+        backends: vec![static_backend("be", dead_port)],
+        secrets: vec![],
+    };
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)

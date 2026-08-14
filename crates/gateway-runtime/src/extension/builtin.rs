@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use gateway_config::filter::{HeaderOps, HeaderPair, RedirectPath, RedirectStatus, Scheme};
+use gateway_config::filter::{
+    HeaderOps, HeaderPair, HttpFilter as ConfigFilter, RedirectPath, RedirectStatus, Scheme,
+};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse};
@@ -75,37 +77,34 @@ fn parse_pairs(pairs: &[HeaderPair]) -> Result<Vec<(HeaderName, HeaderValue)>, F
         .collect()
 }
 
-/// String-based variant used by the pre-extension filter path, which
-/// parses per request. Kept until that path is removed.
+/// Build the extension instance for one core filter config.
 ///
 /// # Errors
-/// A `set` or `add` entry with an invalid name or value.
-pub fn apply_header_ops(
-    headers: &mut HeaderMap,
-    set: &[HeaderPair],
-    add: &[HeaderPair],
-    remove: &[String],
-) -> Result<(), FilterError> {
-    for HeaderPair { name, value } in set {
-        let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
-        let header_value = HeaderValue::try_from(value.as_str())
-            .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
-        headers.insert(header_name, header_value);
+/// Invalid header names or values in the filter's config.
+pub fn instance_for(cfg: &ConfigFilter) -> Result<Box<dyn Extension>, FilterError> {
+    match cfg {
+        ConfigFilter::RequestHeaderModifier {
+            request_headers, ..
+        } => Ok(RequestHeaderModifierBuilder::try_new(request_headers)?.build()),
+        ConfigFilter::ResponseHeaderModifier {
+            response_headers, ..
+        } => Ok(ResponseHeaderModifierBuilder::try_new(response_headers)?.build()),
+        ConfigFilter::RequestRedirect {
+            scheme,
+            hostname,
+            port,
+            status_code,
+            path,
+            ..
+        } => Ok(RequestRedirectBuilder::new(
+            *scheme,
+            hostname.clone(),
+            *port,
+            *status_code,
+            path.clone(),
+        )
+        .build()),
     }
-    for HeaderPair { name, value } in add {
-        let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
-        let header_value = HeaderValue::try_from(value.as_str())
-            .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
-        headers.append(header_name, header_value);
-    }
-    for name in remove {
-        if let Ok(n) = HeaderName::try_from(name.as_str()) {
-            headers.remove(n);
-        }
-    }
-    Ok(())
 }
 
 /// Build the authority (`host` or `host:port`), omitting the port for
