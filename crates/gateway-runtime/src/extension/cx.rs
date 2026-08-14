@@ -54,6 +54,14 @@ impl<'a> Cx<'a> {
     pub fn request_host(&self) -> Option<&str> {
         self.request_host
     }
+
+    pub fn set_matched_path_prefix(&mut self, prefix: Option<&'a str>) {
+        self.matched_path_prefix = prefix;
+    }
+
+    pub fn set_request_host(&mut self, host: Option<&'a str>) {
+        self.request_host = host;
+    }
 }
 
 impl Default for Cx<'_> {
