@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 bytes = "1"
 form_urlencoded = "1"
 gateway-config = { path = "../gateway-config" }
