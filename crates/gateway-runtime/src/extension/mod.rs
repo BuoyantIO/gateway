@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 
+pub mod builtin;
 mod cx;
 mod registry;
 

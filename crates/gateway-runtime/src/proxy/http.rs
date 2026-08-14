@@ -21,7 +21,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::filter::{
-    HeaderOps, HeaderPair, HttpFilter as HttpFilterConfig, RedirectPath, RedirectStatus, Scheme,
+    HeaderOps, HttpFilter as HttpFilterConfig, RedirectPath, RedirectStatus, Scheme,
 };
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
@@ -29,7 +29,7 @@ use gateway_config::route::{
 use gateway_state::{
     ActiveBackend, ActiveBackendRef, ActiveHttpRoute, ActiveListener, BindKey, Store,
 };
-use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -39,6 +39,7 @@ use hyper_util::server::conn::auto;
 use rand::Rng;
 
 use crate::drain;
+use crate::extension::builtin::{FilterError, apply_header_ops, authority, replace_prefix};
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
 use crate::metrics::Reason;
@@ -131,14 +132,6 @@ pub(crate) struct RequestFilterCtx<'a> {
 pub(crate) enum HttpFilterDecision {
     Continue,
     Respond(Response<ResponseBody>),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum FilterError {
-    #[error("invalid header name `{0}`")]
-    InvalidHeaderName(String),
-    #[error("invalid header value for `{0}`")]
-    InvalidHeaderValue(String),
 }
 
 /// Build a runtime filter trait object from a config-shaped variant.
@@ -274,40 +267,6 @@ impl HttpFilter for RequestRedirectFilter {
     }
 }
 
-/// Build the authority (`host` or `host:port`), omitting the port for
-/// the scheme's well-known value per the Gateway API spec.
-fn authority(host: &str, scheme: &str, port: Option<u16>) -> String {
-    let Some(p) = port else {
-        return host.to_owned();
-    };
-    let well_known = (scheme == "http" && p == 80) || (scheme == "https" && p == 443);
-    if well_known {
-        host.to_owned()
-    } else {
-        format!("{host}:{p}")
-    }
-}
-
-/// Replace the matched `PathPrefix` of `path` with `replacement`,
-/// segment-aware: `/foo` + `/foo/bar` → `<replacement>/bar`; `/foo` +
-/// `/foo` → `<replacement>`. Trailing slashes on the prefix and
-/// replacement are trimmed first (per Gateway API).
-fn replace_prefix(path: &str, matched_prefix: &str, replacement: &str) -> String {
-    let matched = matched_prefix.trim_end_matches('/');
-    let replacement = replacement.trim_end_matches('/');
-    let rest = path.strip_prefix(matched).unwrap_or("");
-    if rest.is_empty() {
-        if replacement.is_empty() {
-            "/".to_owned()
-        } else {
-            replacement.to_owned()
-        }
-    } else {
-        // `rest` begins with '/', so this yields e.g. "/xyz" + "/bar".
-        format!("{replacement}{rest}")
-    }
-}
-
 fn redirect_response(status: StatusCode, location: HeaderValue) -> Response<ResponseBody> {
     let body = Full::new(Bytes::new())
         .map_err(|never: Infallible| match never {})
@@ -317,34 +276,6 @@ fn redirect_response(status: StatusCode, location: HeaderValue) -> Response<Resp
         .header(http::header::LOCATION, location)
         .body(body)
         .expect("redirect response is well-formed")
-}
-
-fn apply_header_ops(
-    headers: &mut http::HeaderMap,
-    set: &[HeaderPair],
-    add: &[HeaderPair],
-    remove: &[String],
-) -> Result<(), FilterError> {
-    for HeaderPair { name, value } in set {
-        let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
-        let header_value = HeaderValue::try_from(value.as_str())
-            .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
-        headers.insert(header_name, header_value);
-    }
-    for HeaderPair { name, value } in add {
-        let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|_| FilterError::InvalidHeaderName(name.clone()))?;
-        let header_value = HeaderValue::try_from(value.as_str())
-            .map_err(|_| FilterError::InvalidHeaderValue(name.clone()))?;
-        headers.append(header_name, header_value);
-    }
-    for name in remove {
-        if let Ok(n) = HeaderName::try_from(name.as_str()) {
-            headers.remove(n);
-        }
-    }
-    Ok(())
 }
 
 // =================== connection + request handlers ===================
@@ -1105,6 +1036,8 @@ fn synthesize_status(status: StatusCode) -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
+    use gateway_config::filter::HeaderPair;
+
     use super::*;
 
     fn pm(v: &str) -> PathMatch {
@@ -1951,15 +1884,6 @@ mod tests {
             run_redirect(&f, "/foo", None, Some("/foo")).1,
             "https://h/new"
         );
-    }
-
-    #[test]
-    fn replace_prefix_helper_cases() {
-        assert_eq!(replace_prefix("/foo/bar", "/foo", "/xyz"), "/xyz/bar");
-        assert_eq!(replace_prefix("/foo", "/foo", "/xyz"), "/xyz");
-        assert_eq!(replace_prefix("/foo/", "/foo", "/xyz"), "/xyz/");
-        assert_eq!(replace_prefix("/foo/bar", "/foo", "/"), "/bar");
-        assert_eq!(replace_prefix("/foo", "/foo", "/"), "/");
     }
 
     // --- pick_backend_ref ---
