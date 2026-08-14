@@ -4,6 +4,7 @@
 
 mod accept;
 mod error;
+pub mod extension;
 mod gateway;
 pub mod lb;
 pub mod metrics;
