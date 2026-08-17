@@ -5,6 +5,7 @@
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,6 +15,9 @@ use gateway_config::config::GatewayConfig;
 use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, Scheme};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
+use gateway_runtime::extension::{
+    Action, Cx, Error as ExtensionError, Extension, ExtensionBuilder, Registry, async_trait,
+};
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
 use http::{Request, StatusCode};
@@ -1226,6 +1230,121 @@ async fn invalid_filter_config_answers_500_before_dispatch() {
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+// =================== extension refs ===================
+
+/// Stamps a header on the response. Defined here rather than in the
+/// crate to exercise the extension traits from outside.
+struct StampBuilder;
+
+struct Stamp;
+
+impl ExtensionBuilder for StampBuilder {
+    fn build(&self) -> Box<dyn Extension> {
+        Box::new(Stamp)
+    }
+}
+
+#[async_trait]
+impl Extension for Stamp {
+    async fn on_request_start(
+        &mut self,
+        _head: &mut http::request::Parts,
+        _cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        Ok(Action::Continue)
+    }
+
+    fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx<'_>) {
+        head.headers
+            .insert("x-stamped", "by-extension".parse().unwrap());
+    }
+}
+
+fn extension_ref_config(bind_port: u16, upstream_port: u16, plugin: &str) -> GatewayConfig {
+    let filter = HttpFilter::ExtensionRef {
+        name: plugin.into(),
+    };
+    GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener(
+                "l",
+                None,
+                vec![http_route_with_filter("r", "/", "be", filter)],
+            )],
+        }],
+        backends: vec![static_backend("be", upstream_port)],
+        secrets: vec![],
+    }
+}
+
+#[tokio::test]
+async fn registered_extension_runs_for_a_route_that_references_it() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream_port, "stamp");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let mut registry = Registry::new();
+    registry.register("stamp", Arc::new(StampBuilder)).unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-stamped")
+            .and_then(|v| v.to_str().ok()),
+        Some("by-extension"),
+    );
+
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// A route referencing a plugin nobody registered must not serve —
+/// skipping the member silently would be worse than failing.
+#[tokio::test]
+async fn unregistered_extension_ref_answers_500() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream_port, "absent");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
     let (gw_handle, shutdown_tx) = spawn_gateway(store);
     wait_for_listening(bind_port).await;
 

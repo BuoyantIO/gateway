@@ -11,7 +11,7 @@ use gateway_config::filter::{
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse};
+use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Registry};
 
 /// Reserved plugin names for the built-ins.
 pub const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
@@ -24,6 +24,8 @@ pub enum FilterError {
     InvalidHeaderName(String),
     #[error("invalid header value for `{0}`")]
     InvalidHeaderValue(String),
+    #[error("no extension registered under `{0}`")]
+    UnknownPlugin(String),
 }
 
 /// `HeaderOps` with names and values parsed up front. Invalid `remove`
@@ -77,11 +79,17 @@ fn parse_pairs(pairs: &[HeaderPair]) -> Result<Vec<(HeaderName, HeaderValue)>, F
         .collect()
 }
 
-/// Build the extension instance for one core filter config.
+/// Build the extension instance for one filter config. Core filters
+/// build from their inline config; a reference resolves against the
+/// registry.
 ///
 /// # Errors
-/// Invalid header names or values in the filter's config.
-pub fn instance_for(cfg: &ConfigFilter) -> Result<Box<dyn Extension>, FilterError> {
+/// Invalid header names or values, or a reference to a name the
+/// registry does not hold.
+pub fn instance_for(
+    cfg: &ConfigFilter,
+    registry: &Registry,
+) -> Result<Box<dyn Extension>, FilterError> {
     match cfg {
         ConfigFilter::RequestHeaderModifier {
             request_headers, ..
@@ -104,6 +112,10 @@ pub fn instance_for(cfg: &ConfigFilter) -> Result<Box<dyn Extension>, FilterErro
             path.clone(),
         )
         .build()),
+        ConfigFilter::ExtensionRef { name } => registry
+            .get(name)
+            .map(|builder| builder.build())
+            .ok_or_else(|| FilterError::UnknownPlugin(name.clone())),
     }
 }
 
@@ -531,6 +543,47 @@ mod tests {
         );
         let (_, location) = run_redirect(&builder, "/foo/bar", Some("h.example"), None).await;
         assert_eq!(location, "http://h.example/foo/bar");
+    }
+
+    #[tokio::test]
+    async fn instance_for_resolves_refs_through_the_registry() {
+        struct NoopBuilder;
+        struct Noop;
+
+        impl ExtensionBuilder for NoopBuilder {
+            fn build(&self) -> Box<dyn Extension> {
+                Box::new(Noop)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Extension for Noop {
+            async fn on_request_start(
+                &mut self,
+                _head: &mut http::request::Parts,
+                _cx: &mut Cx<'_>,
+            ) -> Result<Action, Error> {
+                Ok(Action::Continue)
+            }
+        }
+
+        let mut registry = Registry::new();
+        registry
+            .register("noop", std::sync::Arc::new(NoopBuilder))
+            .expect("register");
+
+        let known = ConfigFilter::ExtensionRef {
+            name: "noop".to_owned(),
+        };
+        assert!(instance_for(&known, &registry).is_ok());
+
+        let unknown = ConfigFilter::ExtensionRef {
+            name: "absent".to_owned(),
+        };
+        assert!(matches!(
+            instance_for(&unknown, &registry),
+            Err(FilterError::UnknownPlugin(name)) if name == "absent"
+        ));
     }
 
     #[test]
