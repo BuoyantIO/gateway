@@ -7,6 +7,7 @@
 pub mod p2c;
 pub mod state;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -110,6 +111,31 @@ impl LoadBalancer {
         let chosen = self.picker.pick(candidates)?;
         Some((chosen.endpoint.clone(), Arc::clone(&chosen.info)))
     }
+
+    /// Look up the backend endpoint at `addr` and its runtime state,
+    /// for a caller that chose the address itself. Returning the same
+    /// pair as [`LoadBalancer::pick_endpoint`] keeps in-flight and
+    /// latency accounting on one path.
+    ///
+    /// Eviction is not consulted: the caller has already decided, and
+    /// its information about the endpoint is better than our
+    /// dial-failure counters. If a backend lists one address twice,
+    /// the first entry wins and its state is the one returned.
+    pub fn endpoint_by_addr(
+        &self,
+        backend: &Arc<ActiveBackend>,
+        addr: SocketAddr,
+    ) -> Option<(Endpoint, Arc<EndpointInfo>)> {
+        let endpoint = backend
+            .endpoints
+            .iter()
+            .find(|ep| ep.address == addr.ip() && ep.port == addr.port())?;
+        let info = self.endpoint_state.get_or_create(EndpointKey {
+            backend: backend.key.clone(),
+            endpoint: endpoint.name.clone(),
+        });
+        Some((endpoint.clone(), info))
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +202,45 @@ mod tests {
                 "all-evicted backend must still yield a pick"
             );
         }
+    }
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn endpoint_by_addr_finds_healthy_and_evicted_alike() {
+        let lb = lb();
+        let be = backend(vec![endpoint("e0", 1), endpoint("e1", 2)]);
+        evict(&lb, &be, "e0");
+
+        let (chosen, _) = lb.endpoint_by_addr(&be, addr(1)).expect("evicted is found");
+        assert_eq!(chosen.name, "e0");
+        let (chosen, _) = lb.endpoint_by_addr(&be, addr(2)).expect("healthy is found");
+        assert_eq!(chosen.name, "e1");
+    }
+
+    #[test]
+    fn endpoint_by_addr_misses_an_address_the_backend_lacks() {
+        let lb = lb();
+        let be = backend(vec![endpoint("e0", 1)]);
+        assert!(lb.endpoint_by_addr(&be, addr(9)).is_none());
+    }
+
+    #[test]
+    fn endpoint_by_addr_shares_state_with_the_picked_path() {
+        let lb = lb();
+        let be = backend(vec![endpoint("e0", 1)]);
+
+        let (_, looked_up) = lb.endpoint_by_addr(&be, addr(1)).unwrap();
+        let picked = lb.endpoint_state.get_or_create(EndpointKey {
+            backend: be.key.clone(),
+            endpoint: "e0".into(),
+        });
+        assert!(
+            Arc::ptr_eq(&looked_up, &picked),
+            "both paths must record into one state instance"
+        );
     }
 
     #[test]
