@@ -28,6 +28,7 @@ use gateway_state::{
     ActiveBackend, ActiveBackendRef, ActiveHttpRoute, ActiveListener, BindKey, Store,
 };
 use http::{Method, Request, Response, StatusCode, Uri};
+use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -47,6 +48,53 @@ use crate::proxy::access::{Access, RequestOutcome};
 pub(super) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(super) type ResponseBody = BoxBody<Bytes, BoxError>;
 
+/// Request body forwarded upstream. An enum, not a boxed body:
+/// every source is known at compile time.
+pub(super) enum UpstreamBody {
+    /// The client's own stream, forwarded as-is.
+    Incoming(Incoming),
+    /// A complete body supplied by the host or an extension. Unused
+    /// until the host can buffer or replace a body.
+    #[allow(dead_code)]
+    Full(Full<Bytes>),
+}
+
+// Both variants are `Unpin`, so no pin projection is needed.
+impl Body for UpstreamBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            Self::Incoming(b) => std::pin::Pin::new(b)
+                .poll_frame(cx)
+                .map(|frame| frame.map(|r| r.map_err(Into::into))),
+            Self::Full(b) => std::pin::Pin::new(b)
+                .poll_frame(cx)
+                .map(|frame| frame.map(|r| r.map_err(Into::into))),
+        }
+    }
+
+    // Forwarded, not defaulted: hyper picks content-length vs
+    // chunked framing from `size_hint`.
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Incoming(b) => b.is_end_stream(),
+            Self::Full(b) => b.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Incoming(b) => b.size_hint(),
+            Self::Full(b) => b.size_hint(),
+        }
+    }
+}
+
 /// Process-wide HTTP client used to dial upstreams. Wraps
 /// `hyper_util::client::legacy::Client` — internally it owns a
 /// connection pool that is shared across every cloned handle.
@@ -60,8 +108,8 @@ pub(super) type ResponseBody = BoxBody<Bytes, BoxError>;
 /// TODO: replace these two hyper legacy clients
 #[derive(Clone)]
 pub struct HttpClient {
-    h1: hyper_util::client::legacy::Client<HttpConnector, Incoming>,
-    h2: hyper_util::client::legacy::Client<HttpConnector, Incoming>,
+    h1: hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
+    h2: hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
 }
 
 impl HttpClient {
@@ -70,7 +118,7 @@ impl HttpClient {
         &self,
         protocol: BackendProtocol,
     ) -> (
-        &hyper_util::client::legacy::Client<HttpConnector, Incoming>,
+        &hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
         http::Version,
     ) {
         match protocol {
@@ -83,10 +131,10 @@ impl HttpClient {
 impl Default for HttpClient {
     fn default() -> Self {
         let h1 = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-            .build_http::<Incoming>();
+            .build_http::<UpstreamBody>();
         let h2 = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
             .http2_only(true)
-            .build_http::<Incoming>();
+            .build_http::<UpstreamBody>();
         Self { h1, h2 }
     }
 }
@@ -243,7 +291,7 @@ async fn serve_request_inner(
             );
         }
     }
-    let req = Request::from_parts(parts, body);
+    let req = Request::from_parts(parts, UpstreamBody::Incoming(body));
 
     // No filter short-circuited, so this route must proxy — it needs a
     // backend with a pickable endpoint.
@@ -775,7 +823,7 @@ fn strip_hop_by_hop_headers(headers: &mut http::HeaderMap) {
 async fn forward(
     client: &HttpClient,
     protocol: BackendProtocol,
-    mut req: Request<Incoming>,
+    mut req: Request<UpstreamBody>,
     endpoint: &Endpoint,
     info: &Arc<EndpointInfo>,
 ) -> (Response<ResponseBody>, Reason, Option<f64>) {
@@ -917,6 +965,26 @@ mod tests {
         PathMatch::Regex {
             value: regex::Regex::new(pattern).unwrap(),
         }
+    }
+
+    // --- UpstreamBody ---
+
+    #[test]
+    fn upstream_body_forwards_full_framing() {
+        let empty = UpstreamBody::Full(Full::new(Bytes::new()));
+        assert!(empty.is_end_stream());
+        assert_eq!(empty.size_hint().exact(), Some(0));
+
+        let filled = UpstreamBody::Full(Full::new(Bytes::from_static(b"hello")));
+        assert!(!filled.is_end_stream());
+        assert_eq!(filled.size_hint().exact(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn upstream_body_full_yields_its_bytes() {
+        let body = UpstreamBody::Full(Full::new(Bytes::from_static(b"payload")));
+        let collected = body.collect().await.expect("collect").to_bytes();
+        assert_eq!(collected, Bytes::from_static(b"payload"));
     }
 
     // --- local_response ---
