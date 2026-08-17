@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use crate::accept;
 use crate::drain;
 use crate::error::RuntimeError;
+use crate::extension::Registry;
 use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
 use crate::metrics::Metrics;
 use crate::proxy::http::HttpClient;
@@ -33,6 +34,9 @@ pub struct Gateway {
     /// Metric families the request path records into. Detached
     /// (never scraped) unless the caller registered them.
     pub(crate) metrics: Arc<Metrics>,
+    /// Extensions a route may reference by name. Empty unless the
+    /// caller registered some.
+    pub(crate) extensions: Arc<Registry>,
 }
 
 /// Everything an accepted connection needs from its bind, bundled so
@@ -46,6 +50,7 @@ pub(crate) struct ProxyCtx {
     pub(crate) lb: Arc<LoadBalancer>,
     pub(crate) http_client: HttpClient,
     pub(crate) metrics: Arc<Metrics>,
+    pub(crate) extensions: Arc<Registry>,
 }
 
 impl Gateway {
@@ -63,6 +68,7 @@ impl Gateway {
             lb: Arc::new(lb),
             http_client: HttpClient::default(),
             metrics: Metrics::new(),
+            extensions: Arc::new(Registry::new()),
         }
     }
 
@@ -73,6 +79,15 @@ impl Gateway {
             metrics,
             ..Self::new(store)
         }
+    }
+
+    /// Extensions routes may reference by name. Consuming builder
+    /// rather than another constructor: lb, metrics and registry are
+    /// independent, and a constructor per combination does not scale.
+    #[must_use]
+    pub fn with_extensions(mut self, registry: Registry) -> Self {
+        self.extensions = Arc::new(registry);
+        self
     }
 
     /// Run until `drain` fires — the drain watch doubles as the
@@ -171,6 +186,7 @@ impl Gateway {
             lb: Arc::clone(&self.lb),
             http_client: self.http_client.clone(),
             metrics: Arc::clone(&self.metrics),
+            extensions: Arc::clone(&self.extensions),
         };
         let (bind_signal, bind_drain) = drain::channel();
         // One merged watch per bind: connections fire on process

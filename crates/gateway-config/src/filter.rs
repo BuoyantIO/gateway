@@ -29,6 +29,12 @@ pub enum HttpFilter {
         #[serde(default)]
         path: Option<RedirectPath>,
     },
+    /// Runs the extension registered under `name`. `name` is also the
+    /// filter's identity within the rule, so a rule references a
+    /// given extension at most once.
+
+    #[serde(rename_all = "camelCase")]
+    ExtensionRef { name: String },
 }
 
 /// The scheme a redirect's `Location` uses. Gateway API restricts
@@ -133,7 +139,8 @@ impl HttpFilter {
         match self {
             Self::RequestHeaderModifier { name, .. }
             | Self::ResponseHeaderModifier { name, .. }
-            | Self::RequestRedirect { name, .. } => name,
+            | Self::RequestRedirect { name, .. }
+            | Self::ExtensionRef { name } => name,
         }
     }
 }

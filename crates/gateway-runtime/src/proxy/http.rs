@@ -39,7 +39,7 @@ use rand::Rng;
 
 use crate::drain;
 use crate::extension::builtin::instance_for;
-use crate::extension::{Action, Cx, Extension, LocalResponse};
+use crate::extension::{Action, Cx, Extension, LocalResponse, Registry};
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
 use crate::metrics::Reason;
@@ -262,7 +262,7 @@ async fn serve_request_inner(
     // One extension instance per filter, alive from the request phase
     // through the response phase. Invalid filter config fails here,
     // before dispatch.
-    let mut extensions = match build_extensions(&resolved.filters) {
+    let mut extensions = match build_extensions(&resolved.filters, &ctx.extensions) {
         Ok(exts) => exts,
         Err(e) => {
             tracing::warn!(error = %e, "failed to build filter extension");
@@ -344,8 +344,12 @@ async fn serve_request_inner(
 /// Build one extension instance per filter, in route order.
 fn build_extensions(
     filters: &[HttpFilterConfig],
+    registry: &Registry,
 ) -> Result<Vec<Box<dyn Extension>>, crate::extension::builtin::FilterError> {
-    filters.iter().map(instance_for).collect()
+    filters
+        .iter()
+        .map(|cfg| instance_for(cfg, registry))
+        .collect()
 }
 
 /// What the request-side hooks decided for this request.

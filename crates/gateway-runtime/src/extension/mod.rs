@@ -7,7 +7,6 @@
 
 use std::net::SocketAddr;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 
@@ -15,6 +14,9 @@ pub mod builtin;
 mod cx;
 mod registry;
 
+// Re-exported so extensions implemented outside this crate use the
+// same macro version the trait was defined with.
+pub use async_trait::async_trait;
 pub use cx::{Backend, BackendKind, Cx, Targets};
 pub use registry::{Registry, RegistryError};
 
