@@ -29,37 +29,43 @@ use gateway_state::{
 };
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body::{Body, Frame, SizeHint};
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rand::Rng;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::drain;
 use crate::extension::builtin::instance_for;
-use crate::extension::{Action, Cx, Extension, LocalResponse, Registry};
+use crate::extension::{Action, BodyMode, Cx, LocalResponse, Member, Registry};
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
 use crate::metrics::Reason;
 use crate::proxy::access::{Access, RequestOutcome};
+use crate::proxy::gate;
 
 pub(super) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(super) type ResponseBody = BoxBody<Bytes, BoxError>;
 
 /// Request body forwarded upstream. An enum, not a boxed body:
-/// every source is known at compile time.
+/// every source is known at compile time, and only routes that
+/// declare body access pay for anything beyond the passthrough.
 pub(super) enum UpstreamBody {
     /// The client's own stream, forwarded as-is.
     Incoming(Incoming),
-    /// A complete body supplied by the host or an extension. Unused
-    /// until the host can buffer or replace a body.
-    #[allow(dead_code)]
+    /// A complete body the gate drained and re-materialized.
     Full(Full<Bytes>),
+    /// Frames pumped through the extension hooks while the request
+    /// is in flight. Unknown size hint: the client's own
+    /// content-length header (if any) frames the request.
+    Stream(StreamBody<ReceiverStream<Result<Frame<Bytes>, BoxError>>>),
 }
 
-// Both variants are `Unpin`, so no pin projection is needed.
+// Every variant is `Unpin`, so no pin projection is needed.
 impl Body for UpstreamBody {
     type Data = Bytes;
     type Error = BoxError;
@@ -75,6 +81,7 @@ impl Body for UpstreamBody {
             Self::Full(b) => std::pin::Pin::new(b)
                 .poll_frame(cx)
                 .map(|frame| frame.map(|r| r.map_err(Into::into))),
+            Self::Stream(b) => std::pin::Pin::new(b).poll_frame(cx),
         }
     }
 
@@ -84,6 +91,7 @@ impl Body for UpstreamBody {
         match self {
             Self::Incoming(b) => b.is_end_stream(),
             Self::Full(b) => b.is_end_stream(),
+            Self::Stream(b) => b.is_end_stream(),
         }
     }
 
@@ -91,6 +99,7 @@ impl Body for UpstreamBody {
         match self {
             Self::Incoming(b) => b.size_hint(),
             Self::Full(b) => b.size_hint(),
+            Self::Stream(b) => b.size_hint(),
         }
     }
 }
@@ -291,10 +300,11 @@ async fn serve_request_inner(
             );
         }
     }
-    let req = Request::from_parts(parts, UpstreamBody::Incoming(body));
 
-    // No filter short-circuited, so this route must proxy — it needs a
-    // backend with a pickable endpoint.
+    // No filter short-circuited, so this route must proxy — it needs
+    // a backend with a pickable endpoint. Checked before the body
+    // phase: a route that cannot proxy answers without reading the
+    // upload.
     let backend = match resolved.backend {
         BackendChoice::Picked(b) => b,
         BackendChoice::None => {
@@ -310,7 +320,49 @@ async fn serve_request_inner(
             );
         }
     };
-    let Some((endpoint, info)) = ctx.lb.pick_endpoint(&backend) else {
+    dispatch(
+        ctx,
+        parts,
+        body,
+        &mut extensions,
+        &mut cx,
+        &backend,
+        (listener, route),
+    )
+    .await
+}
+
+/// Body phase and upstream dispatch, in the order the strictest
+/// declared body mode requires. Routes whose members want nothing
+/// take the passthrough and never read a frame.
+async fn dispatch(
+    ctx: &ProxyCtx,
+    parts: http::request::Parts,
+    body: Incoming,
+    members: &mut [Member],
+    cx: &mut Cx<'_>,
+    backend: &Arc<ActiveBackend>,
+    (listener, route): (Option<&str>, Option<&str>),
+) -> (Response<ResponseBody>, RequestOutcome) {
+    let mode = members
+        .iter()
+        .map(|m| m.request_body)
+        .max()
+        .unwrap_or_default();
+    if mode == BodyMode::Stream {
+        return serve_streamed(ctx, parts, body, members, cx, backend, (listener, route)).await;
+    }
+    let upstream_body = if mode == BodyMode::Buffer {
+        match gate::run(members, &parts, body, cx).await {
+            gate::GateOutcome::Forward(forwarded) => forwarded,
+            gate::GateOutcome::Halt(halt) => return halt_response(halt, listener, route),
+        }
+    } else {
+        UpstreamBody::Incoming(body)
+    };
+    let req = Request::from_parts(parts, upstream_body);
+
+    let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
         return (
             synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
@@ -328,24 +380,105 @@ async fn serve_request_inner(
         endpoint: Some(endpoint_authority),
         dial_ms,
     };
+    finish_response(members, cx, upstream, outcome)
+}
 
-    // Response hooks run in **reverse** order per Area 03
-    // ("response-side runs reverse-of-request"). Hop-by-hop
-    // stripping (below) runs after, so an extension can't
-    // accidentally keep a hop-by-hop header alive.
+/// Stream tier: the destination is already known, so dispatch first
+/// and pump body frames through the hooks while the request is in
+/// flight. Joined, not spawned — the pump borrows the members and the
+/// context, and the borrow ends at the join.
+async fn serve_streamed(
+    ctx: &ProxyCtx,
+    parts: http::request::Parts,
+    body: Incoming,
+    members: &mut [Member],
+    cx: &mut Cx<'_>,
+    backend: &Arc<ActiveBackend>,
+    (listener, route): (Option<&str>, Option<&str>),
+) -> (Response<ResponseBody>, RequestOutcome) {
+    let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
+        return (
+            synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
+            RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
+        );
+    };
+    let _active = info.acquire();
+    let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
+
+    let (tx, rx) = mpsc::channel(gate::BODY_PIPE_CAPACITY);
+    let req = Request::from_parts(
+        parts,
+        UpstreamBody::Stream(StreamBody::new(ReceiverStream::new(rx))),
+    );
+    let forward_fut = forward(&ctx.http_client, backend.protocol, req, &endpoint, &info);
+    let pump_fut = gate::pump(members, body, tx, cx);
+    let ((upstream, reason, dial_ms), pump) = tokio::join!(forward_fut, pump_fut);
+
+    // The pump's verdict wins: nothing has reached the client yet, so
+    // a mid-body respond or limit still goes out as a clean status,
+    // and the upstream send was already reset through the pipe.
+    if let gate::PumpOutcome::Halt(halt) = pump {
+        return halt_response(halt, listener, route);
+    }
+    let outcome = RequestOutcome {
+        listener: listener.map(str::to_owned),
+        route: route.map(str::to_owned),
+        reason,
+        endpoint: Some(endpoint_authority),
+        dial_ms,
+    };
+    finish_response(members, cx, upstream, outcome)
+}
+
+/// Response hooks run in **reverse** order per Area 03
+/// ("response-side runs reverse-of-request"). Hop-by-hop stripping
+/// runs after, so an extension can't accidentally keep a hop-by-hop
+/// header alive.
+fn finish_response(
+    members: &mut [Member],
+    cx: &mut Cx<'_>,
+    upstream: Response<ResponseBody>,
+    outcome: RequestOutcome,
+) -> (Response<ResponseBody>, RequestOutcome) {
     let (mut parts, body) = upstream.into_parts();
-    for ext in extensions.iter_mut().rev() {
-        ext.on_response_start(&mut parts, &mut cx);
+    for member in members.iter_mut().rev() {
+        member.ext.on_response_start(&mut parts, cx);
     }
     strip_hop_by_hop_headers(&mut parts.headers);
     (Response::from_parts(parts, body), outcome)
 }
 
-/// Build one extension instance per filter, in route order.
+/// Status + metrics reason for a body phase that ended the request.
+fn halt_response(
+    halt: gate::Halt,
+    listener: Option<&str>,
+    route: Option<&str>,
+) -> (Response<ResponseBody>, RequestOutcome) {
+    let (resp, reason) = match halt {
+        // An extension answering mid-body is the route working as
+        // configured.
+        gate::Halt::Respond(resp) => (local_response(resp), Reason::Ok),
+        gate::Halt::Failed => (
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Reason::Internal,
+        ),
+        gate::Halt::TooLarge => (
+            synthesize_status(StatusCode::PAYLOAD_TOO_LARGE),
+            Reason::BodyTooLarge,
+        ),
+        gate::Halt::TimedOut => (
+            synthesize_status(StatusCode::REQUEST_TIMEOUT),
+            Reason::BodyTimeout,
+        ),
+    };
+    (resp, RequestOutcome::short_circuit(listener, route, reason))
+}
+
+/// Build one member per filter, in route order.
 fn build_extensions(
     filters: &[HttpFilterConfig],
     registry: &Registry,
-) -> Result<Vec<Box<dyn Extension>>, crate::extension::builtin::FilterError> {
+) -> Result<Vec<Member>, crate::extension::builtin::FilterError> {
     filters
         .iter()
         .map(|cfg| instance_for(cfg, registry))
@@ -361,20 +494,14 @@ enum RequestPhase {
 
 /// Run the request-side hooks in route order.
 async fn run_request_hooks(
-    extensions: &mut [Box<dyn Extension>],
+    members: &mut [Member],
     parts: &mut http::request::Parts,
     cx: &mut Cx<'_>,
 ) -> RequestPhase {
-    for ext in extensions.iter_mut() {
-        match ext.on_request_start(parts, cx).await {
+    for member in members.iter_mut() {
+        match member.ext.on_request_start(parts, cx).await {
             Ok(Action::Continue) => {}
             Ok(Action::Respond(resp)) => return RequestPhase::Respond(resp),
-            // No core filter selects targets; selector semantics
-            // arrive with configurable extensions.
-            Ok(Action::Select(_)) => {
-                tracing::error!("core filter returned a target selection");
-                return RequestPhase::Failed;
-            }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to apply request filter");
                 return RequestPhase::Failed;

@@ -129,6 +129,10 @@ pub enum Reason {
     #[allow(dead_code)]
     Draining,
     Internal,
+    /// The request body exceeded the gate's size cap.
+    BodyTooLarge,
+    /// The client stalled past the gate's idle bound mid-body.
+    BodyTimeout,
 }
 
 impl Reason {
@@ -142,6 +146,8 @@ impl Reason {
             Reason::DialFailure => "dial_failure",
             Reason::Draining => "draining",
             Reason::Internal => "internal",
+            Reason::BodyTooLarge => "body_too_large",
+            Reason::BodyTimeout => "body_timeout",
         }
     }
 }

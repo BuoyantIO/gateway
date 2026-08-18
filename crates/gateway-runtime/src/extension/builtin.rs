@@ -11,7 +11,7 @@ use gateway_config::filter::{
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Registry};
+use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Member, Registry};
 
 /// Reserved plugin names for the built-ins.
 pub const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
@@ -79,24 +79,25 @@ fn parse_pairs(pairs: &[HeaderPair]) -> Result<Vec<(HeaderName, HeaderValue)>, F
         .collect()
 }
 
-/// Build the extension instance for one filter config. Core filters
-/// build from their inline config; a reference resolves against the
-/// registry.
+/// Build the member for one filter config: the extension instance
+/// plus its builder's declarations. Core filters build from their
+/// inline config; a reference resolves against the registry.
 ///
 /// # Errors
 /// Invalid header names or values, or a reference to a name the
 /// registry does not hold.
-pub fn instance_for(
-    cfg: &ConfigFilter,
-    registry: &Registry,
-) -> Result<Box<dyn Extension>, FilterError> {
+pub fn instance_for(cfg: &ConfigFilter, registry: &Registry) -> Result<Member, FilterError> {
     match cfg {
         ConfigFilter::RequestHeaderModifier {
             request_headers, ..
-        } => Ok(RequestHeaderModifierBuilder::try_new(request_headers)?.build()),
+        } => Ok(Member::from_builder(
+            &RequestHeaderModifierBuilder::try_new(request_headers)?,
+        )),
         ConfigFilter::ResponseHeaderModifier {
             response_headers, ..
-        } => Ok(ResponseHeaderModifierBuilder::try_new(response_headers)?.build()),
+        } => Ok(Member::from_builder(
+            &ResponseHeaderModifierBuilder::try_new(response_headers)?,
+        )),
         ConfigFilter::RequestRedirect {
             scheme,
             hostname,
@@ -104,17 +105,16 @@ pub fn instance_for(
             status_code,
             path,
             ..
-        } => Ok(RequestRedirectBuilder::new(
+        } => Ok(Member::from_builder(&RequestRedirectBuilder::new(
             *scheme,
             hostname.clone(),
             *port,
             *status_code,
             path.clone(),
-        )
-        .build()),
+        ))),
         ConfigFilter::ExtensionRef { name } => registry
             .get(name)
-            .map(|builder| builder.build())
+            .map(|builder| Member::from_builder(builder.as_ref()))
             .ok_or_else(|| FilterError::UnknownPlugin(name.clone())),
     }
 }
@@ -409,7 +409,7 @@ mod tests {
                     .to_owned();
                 (resp.status, location)
             }
-            _ => panic!("expected a redirect response"),
+            Action::Continue => panic!("expected a redirect response"),
         }
     }
 

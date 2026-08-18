@@ -1,7 +1,7 @@
 //! Per-request context shared down the extension list. The host owns
 //! and populates it; extensions read it.
 
-use bytes::Bytes;
+use bytes::BytesMut;
 
 use crate::lb::Candidate;
 
@@ -9,8 +9,8 @@ use crate::lb::Candidate;
 /// the accessors.
 pub struct Cx<'a> {
     targets: Targets<'a>,
-    request_buffer: Option<Bytes>,
-    response_buffer: Option<Bytes>,
+    request_buffer: Option<BytesMut>,
+    response_buffer: Option<BytesMut>,
     matched_path_prefix: Option<&'a str>,
     request_host: Option<&'a str>,
 }
@@ -31,17 +31,36 @@ impl<'a> Cx<'a> {
         &self.targets
     }
 
-    /// The request body buffered so far. `None` unless some extension
-    /// declared `Buffer`; during body hooks it includes the current
-    /// chunk; complete once the body ended.
-    pub fn request_buffer(&self) -> Option<&Bytes> {
-        self.request_buffer.as_ref()
+    /// The request body accumulated so far. `Some` exactly when a
+    /// member declared `Buffer`: during body hooks it includes the
+    /// current chunk, and it is complete once `end_of_stream` was
+    /// delivered. `None` on rules whose members stream — nothing is
+    /// retained for them. A borrow, not an owned handle: the buffer
+    /// is still growing while hooks run, so an extension that wants
+    /// to keep bytes copies them.
+    pub fn request_buffer(&self) -> Option<&[u8]> {
+        self.request_buffer.as_deref()
     }
 
-    /// The response body buffered so far. Same rules as
+    /// The response body accumulated so far. Same rules as
     /// [`Cx::request_buffer`], response direction.
-    pub fn response_buffer(&self) -> Option<&Bytes> {
-        self.response_buffer.as_ref()
+    pub fn response_buffer(&self) -> Option<&[u8]> {
+        self.response_buffer.as_deref()
+    }
+
+    /// Append a chunk to the request accumulation, creating it on
+    /// first use. Written by the body gate only.
+    pub(crate) fn append_request_buffer(&mut self, chunk: &[u8]) {
+        self.request_buffer
+            .get_or_insert_with(BytesMut::new)
+            .extend_from_slice(chunk);
+    }
+
+    /// Take the accumulated request body, leaving the accessor
+    /// `None`. The gate calls this once, after end-of-stream, to
+    /// forward the bytes without a copy.
+    pub(crate) fn take_request_buffer(&mut self) -> Option<BytesMut> {
+        self.request_buffer.take()
     }
 
     /// The `PathPrefix` the route matched on, when it matched by

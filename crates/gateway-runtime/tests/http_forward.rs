@@ -6,6 +6,7 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,7 +17,8 @@ use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, 
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
-    Action, Cx, Error as ExtensionError, Extension, ExtensionBuilder, Registry, async_trait,
+    Action, BodyMode, Cx, Error as ExtensionError, Extension, ExtensionBuilder, LocalResponse,
+    Registry, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
@@ -1360,4 +1362,340 @@ async fn unregistered_extension_ref_answers_500() {
         .await
         .expect("gateway did not shut down")
         .unwrap();
+}
+
+// =================== body gate ===================
+
+/// What a body probe saw at each hook call.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct SeenChunk {
+    len: usize,
+    end_of_stream: bool,
+    buffered: Option<usize>,
+}
+
+/// Test extension with a configurable body mode. Records every body
+/// hook call; optionally answers 429 at a given call index.
+struct BodyProbeBuilder {
+    mode: BodyMode,
+    respond_at: Option<usize>,
+    seen: Arc<StdMutex<Vec<SeenChunk>>>,
+}
+
+struct BodyProbe {
+    respond_at: Option<usize>,
+    seen: Arc<StdMutex<Vec<SeenChunk>>>,
+}
+
+impl ExtensionBuilder for BodyProbeBuilder {
+    fn request_body(&self) -> BodyMode {
+        self.mode
+    }
+
+    fn build(&self) -> Box<dyn Extension> {
+        Box::new(BodyProbe {
+            respond_at: self.respond_at,
+            seen: Arc::clone(&self.seen),
+        })
+    }
+}
+
+#[async_trait]
+impl Extension for BodyProbe {
+    async fn on_request_start(
+        &mut self,
+        _head: &mut http::request::Parts,
+        _cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        Ok(Action::Continue)
+    }
+
+    async fn on_request_body(
+        &mut self,
+        chunk: &[u8],
+        end_of_stream: bool,
+        cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        let mut seen = self.seen.lock().unwrap();
+        seen.push(SeenChunk {
+            len: chunk.len(),
+            end_of_stream,
+            buffered: cx.request_buffer().map(<[u8]>::len),
+        });
+        if self.respond_at == Some(seen.len() - 1) {
+            return Ok(Action::Respond(LocalResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: http::HeaderMap::new(),
+                body: Bytes::from_static(b"limited"),
+            }));
+        }
+        Ok(Action::Continue)
+    }
+}
+
+/// A None-mode member whose body hook must never run.
+struct NoBodyBuilder;
+struct NoBody;
+
+impl ExtensionBuilder for NoBodyBuilder {
+    fn build(&self) -> Box<dyn Extension> {
+        Box::new(NoBody)
+    }
+}
+
+#[async_trait]
+impl Extension for NoBody {
+    async fn on_request_start(
+        &mut self,
+        _head: &mut http::request::Parts,
+        _cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        Ok(Action::Continue)
+    }
+
+    async fn on_request_body(
+        &mut self,
+        _chunk: &[u8],
+        _end_of_stream: bool,
+        _cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        panic!("body hook ran for a member that declared no body access");
+    }
+}
+
+/// Echo that also reports the request framing it saw:
+/// `x-recv-content-length` and `x-recv-transfer-encoding` (or "none").
+async fn spawn_framing_echo() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    let framing = |name: http::header::HeaderName| {
+                        req.headers()
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("none")
+                            .to_owned()
+                    };
+                    let cl = framing(http::header::CONTENT_LENGTH);
+                    let te = framing(http::header::TRANSFER_ENCODING);
+                    let body = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(http_body_util::Collected::to_bytes)
+                        .unwrap_or_default();
+                    let resp = http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("x-recv-content-length", cl)
+                        .header("x-recv-transfer-encoding", te)
+                        .body(Full::new(body))
+                        .unwrap();
+                    Ok::<_, Infallible>(resp)
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+struct GatedRoute {
+    bind_port: u16,
+    seen: Arc<StdMutex<Vec<SeenChunk>>>,
+    _gw: tokio::task::JoinHandle<()>,
+    _stop: drain::Signal,
+}
+
+/// Gateway with one route through a body probe of the given mode.
+async fn spawn_gated_route(
+    upstream_port: u16,
+    mode: BodyMode,
+    respond_at: Option<usize>,
+) -> GatedRoute {
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream_port, "probe");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    registry
+        .register(
+            "probe",
+            Arc::new(BodyProbeBuilder {
+                mode,
+                respond_at,
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move {
+        gw.run(watch).await.unwrap();
+    });
+    wait_for_listening(bind_port).await;
+    GatedRoute {
+        bind_port,
+        seen,
+        _gw: gw_handle,
+        _stop: stop,
+    }
+}
+
+#[tokio::test]
+async fn stream_member_sees_chunks_and_framing_survives() {
+    let upstream = spawn_framing_echo().await;
+    let gated = spawn_gated_route(upstream, BodyMode::Stream, None).await;
+
+    // Fixed-length client body: the content-length must pass through.
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{}/", gated.bind_port))
+        .body(Full::new(Bytes::from_static(b"streamed body")))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "13");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"streamed body"));
+
+    let seen = gated.seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.last().unwrap().end_of_stream);
+    // Nothing retained on the stream tier.
+    assert!(seen.iter().all(|c| c.buffered.is_none()));
+}
+
+#[tokio::test]
+async fn stream_member_responding_mid_upload_answers_the_client() {
+    let upstream = spawn_framing_echo().await;
+    let gated = spawn_gated_route(upstream, BodyMode::Stream, Some(0)).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{}/", gated.bind_port))
+        .body(Full::new(Bytes::from_static(b"denied payload")))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"limited"));
+}
+
+#[tokio::test]
+async fn oversized_upload_answers_413_on_the_buffer_tier() {
+    let upstream = spawn_framing_echo().await;
+    let gated = spawn_gated_route(upstream, BodyMode::Buffer, None).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{}/", gated.bind_port))
+        .body(Full::new(Bytes::from(vec![0u8; 9 * 1024 * 1024])))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // Rejected from the declared length, before any chunk reached a hook.
+    assert!(gated.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn routes_without_body_members_never_read_a_frame() {
+    let upstream = spawn_framing_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream, "no-body");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let mut registry = Registry::new();
+    registry
+        .register("no-body", Arc::new(NoBodyBuilder))
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{bind_port}/"))
+        .body(Full::new(Bytes::from_static(b"passthrough")))
+        .unwrap();
+    // A panic in the body hook would kill the connection; a clean 200
+    // with the echoed body proves the hook never ran.
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"passthrough"));
+
+    drop(stop);
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+}
+
+#[tokio::test]
+async fn chunked_upload_through_the_buffer_tier_gets_a_content_length() {
+    let upstream = spawn_framing_echo().await;
+    let gated = spawn_gated_route(upstream, BodyMode::Buffer, None).await;
+
+    // A multi-frame body with no size hint: the client sends chunked.
+    let frames: Vec<Result<http_body::Frame<Bytes>, Infallible>> = vec![
+        Ok(http_body::Frame::data(Bytes::from_static(b"chun"))),
+        Ok(http_body::Frame::data(Bytes::from_static(b"ked"))),
+    ];
+    let body = http_body_util::StreamBody::new(futures::stream::iter(frames));
+    let client: Client<_, http_body_util::StreamBody<_>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{}/", gated.bind_port))
+        .body(body)
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Buffering turned the chunked upload into a fixed-length one.
+    assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "7");
+    assert_eq!(
+        resp.headers().get("x-recv-transfer-encoding").unwrap(),
+        "none"
+    );
+    let echoed = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(echoed, Bytes::from_static(b"chunked"));
+
+    // Two data frames, then the terminal empty call.
+    let seen = gated.seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        vec![
+            SeenChunk {
+                len: 4,
+                end_of_stream: false,
+                buffered: Some(4)
+            },
+            SeenChunk {
+                len: 3,
+                end_of_stream: false,
+                buffered: Some(7)
+            },
+            SeenChunk {
+                len: 0,
+                end_of_stream: true,
+                buffered: Some(7)
+            },
+        ]
+    );
 }
