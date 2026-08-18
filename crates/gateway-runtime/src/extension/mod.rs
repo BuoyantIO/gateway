@@ -54,10 +54,12 @@ pub trait Extension: Send {
     ) -> Result<Action, Error>;
 
     /// One request-body chunk, in arrival order. Fires only for
-    /// builders that declared [`BodyMode::Observe`] or
-    /// [`BodyMode::Buffer`]. The final call always has
-    /// `end_of_stream: true`, with an empty chunk when the body ended
-    /// on a frame boundary.
+    /// builders that declared [`BodyMode::Stream`] or
+    /// [`BodyMode::Buffer`] — the same view in both; the mode changes
+    /// what the host does with the bytes, never what the hook sees.
+    /// The final call always has `end_of_stream: true`, with an empty
+    /// chunk when the body ended on a frame boundary. The chunk is
+    /// borrowed and read-only: copy what you keep.
     ///
     /// # Errors
     /// An error fails the request per the extension's configured
@@ -74,7 +76,7 @@ pub trait Extension: Send {
     fn on_response_start(&mut self, _head: &mut http::response::Parts, _cx: &mut Cx<'_>) {}
 
     /// One response-body chunk. Read-only tap; fires only for
-    /// builders that declared a response [`BodyMode::Observe`].
+    /// builders that declared a response [`BodyMode::Stream`].
     fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx<'_>) {}
 
     /// Runs exactly once per request, whatever the ending: clean end,
@@ -83,15 +85,25 @@ pub trait Extension: Send {
     fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx<'_>) {}
 }
 
-/// Body access an extension declares, per direction. `Observe` sees
-/// chunks as they stream through; `Buffer` makes the host accumulate
-/// the body and, on the request side, hold dispatch until it is
-/// complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Body access an extension declares, per direction. The rule's
+/// effective mode is the strictest across its members
+/// (`Buffer` > `Stream` > `None`) and selects the host machinery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub enum BodyMode {
+    /// Never sees the body. When every member of a rule declares
+    /// `None`, the gateway forwards the body without reading a frame.
     #[default]
     None,
-    Observe,
+    /// Chunks delivered as they arrive; the gateway retains nothing
+    /// and [`Cx::request_buffer`] stays `None`. On a rule with no
+    /// selector, dispatch happens first and frames flow through to
+    /// the upstream as the hooks see them — memory stays flat in the
+    /// body size and trailers pass through.
+    Stream,
+    /// The host drains the body before dispatch, delivering each
+    /// chunk and accumulating the whole into
+    /// [`Cx::request_buffer`]. Bounded by a size cap and an idle
+    /// timeout.
     Buffer,
 }
 
@@ -99,12 +111,11 @@ pub enum BodyMode {
 #[derive(Debug)]
 pub enum Action {
     Continue,
-    /// Short-circuit with a local response.
+    /// Short-circuit with a local response. From a body hook this
+    /// stops the drain and discards the rest of the upload; on a
+    /// streaming rule it also aborts the in-flight upstream request.
+    /// The client receives this response either way.
     Respond(LocalResponse),
-    /// Route to the selected target. Only instances whose builder
-    /// declared [`ExtensionBuilder::selects_targets`], at most once
-    /// per chain/request.
-    Select(Selection),
 }
 
 /// A response produced by an extension instead of an upstream.
@@ -115,8 +126,33 @@ pub struct LocalResponse {
     pub body: Bytes,
 }
 
+/// An instantiated member of a route's filter list: the per-request
+/// extension instance plus its builder's declarations, copied at
+/// build time. The declarations live on the builder so the host can
+/// choose machinery before instances run; the copy is what makes
+/// them readable afterwards.
+pub struct Member {
+    pub request_body: BodyMode,
+    pub response_body: BodyMode,
+    pub selects_targets: bool,
+    pub ext: Box<dyn Extension>,
+}
+
+impl Member {
+    /// Build one instance and record what its builder declared.
+    pub fn from_builder(builder: &dyn ExtensionBuilder) -> Self {
+        Self {
+            request_body: builder.request_body(),
+            response_body: builder.response_body(),
+            selects_targets: builder.selects_targets(),
+            ext: builder.build(),
+        }
+    }
+}
+
 /// A routing decision: where the request goes and which body is
-/// forwarded there.
+/// forwarded there. No hook returns this yet — selection arrives as
+/// its own phase on [`Extension`].
 #[derive(Debug)]
 pub struct Selection {
     pub target: Target,

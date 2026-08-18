@@ -800,6 +800,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]

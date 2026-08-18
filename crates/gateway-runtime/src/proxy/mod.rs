@@ -3,4 +3,5 @@
 //! family that reaches the runtime.
 
 pub(crate) mod access;
+pub(crate) mod gate;
 pub(crate) mod http;
