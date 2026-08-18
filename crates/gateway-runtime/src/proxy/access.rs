@@ -24,7 +24,8 @@ use http_body::{Body, Frame};
 
 use crate::metrics::{Metrics, Reason};
 
-use super::http::{BoxError, ResponseBody};
+use super::body::BoxError;
+use super::http::ResponseBody;
 
 /// Label value when no listener/route matched; mirrors the metric
 /// labels.

@@ -1699,3 +1699,45 @@ async fn chunked_upload_through_the_buffer_tier_gets_a_content_length() {
         ]
     );
 }
+
+/// The framing assumption every rewritten body rests on: hyper sets
+/// `content-length` from an exact size hint when no header is
+/// present, and honors an explicit header when there is one. A body
+/// supplier that leaves a stale length behind therefore ships a
+/// request whose declared length contradicts its bytes.
+#[tokio::test]
+async fn hyper_frames_a_full_body_from_its_size_hint() {
+    let upstream = spawn_framing_echo().await;
+    let bind_port = free_port().await;
+    let cfg = http_config_one_listener(bind_port, upstream, "/");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let uri = format!("http://127.0.0.1:{bind_port}/");
+
+    // No content-length set by the caller: hyper computes it.
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .body(Full::new(Bytes::from_static(b"seventeen chars..")))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "17");
+
+    // An explicit header wins over the size hint — which is why a
+    // stale one has to be removed rather than left to be corrected.
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header(http::header::CONTENT_LENGTH, "4")
+        .body(Full::new(Bytes::from_static(b"four")))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "4");
+
+    drop(shutdown_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+}

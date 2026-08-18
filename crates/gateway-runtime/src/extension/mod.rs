@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
+use http_body_util::combinators::BoxBody;
 
 pub mod builtin;
 mod cx;
@@ -21,6 +22,9 @@ pub use cx::{Backend, BackendKind, Cx, Targets};
 pub use registry::{Registry, RegistryError};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Error type of a body an extension supplies.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Built once per configured extension
 pub trait ExtensionBuilder: Send + Sync {
@@ -169,12 +173,30 @@ pub enum Target {
 }
 
 /// The request body the host forwards upstream.
-#[derive(Debug)]
 pub enum BodySource {
+    /// The bytes the host kept while draining. Only valid where it
+    /// kept some — a rule that streams retains nothing.
     Original,
     /// A complete body replacing the original. The host reframes
     /// content-length and discards the rest of the client upload.
     Replace(Bytes),
+    /// A body the extension supplies — for a picker, the stream it
+    /// pulls back from its own service. The length, when the
+    /// extension knows it, is what lets the upstream tell a truncated
+    /// request from a complete one; the host holds the body to it.
+    Stream(BoxBody<Bytes, BoxError>, Option<u64>),
+}
+
+// Hand-written: a supplied body is not `Debug`, and its contents are
+// not something to log anyway.
+impl std::fmt::Debug for BodySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Original => f.write_str("Original"),
+            Self::Replace(bytes) => f.debug_tuple("Replace").field(&bytes.len()).finish(),
+            Self::Stream(_, len) => f.debug_tuple("Stream").field(len).finish(),
+        }
+    }
 }
 
 /// Terminal summary handed to [`Extension::on_response_end`].
