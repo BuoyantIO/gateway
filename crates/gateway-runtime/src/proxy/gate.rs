@@ -12,7 +12,7 @@ use http_body_util::{BodyExt, Full};
 use tokio::sync::mpsc;
 
 use crate::extension::{Action, BodyMode, Cx, LocalResponse, Member};
-use crate::proxy::http::{BoxError, UpstreamBody};
+use crate::proxy::body::{BoxError, UpstreamBody};
 
 /// Buffer-tier size cap. A memory bound: the whole body is held until
 /// dispatch. Provisional global; per-extension caps arrive with the
