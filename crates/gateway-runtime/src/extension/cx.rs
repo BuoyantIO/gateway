@@ -1,6 +1,8 @@
 //! Per-request context shared down the extension list. The host owns
 //! and populates it; extensions read it.
 
+use std::sync::Arc;
+
 use bytes::BytesMut;
 
 use crate::lb::Candidate;
@@ -11,8 +13,8 @@ pub struct Cx<'a> {
     targets: Targets<'a>,
     request_buffer: Option<BytesMut>,
     response_buffer: Option<BytesMut>,
-    matched_path_prefix: Option<&'a str>,
-    request_host: Option<&'a str>,
+    matched_path_prefix: Option<Arc<str>>,
+    request_host: Option<Arc<str>>,
 }
 
 impl<'a> Cx<'a> {
@@ -66,20 +68,34 @@ impl<'a> Cx<'a> {
     /// The `PathPrefix` the route matched on, when it matched by
     /// prefix.
     pub fn matched_path_prefix(&self) -> Option<&str> {
-        self.matched_path_prefix
+        self.matched_path_prefix.as_deref()
     }
 
     /// The request's host, with any port stripped.
     pub fn request_host(&self) -> Option<&str> {
-        self.request_host
+        self.request_host.as_deref()
     }
 
-    pub fn set_matched_path_prefix(&mut self, prefix: Option<&'a str>) {
-        self.matched_path_prefix = prefix;
+    pub fn set_matched_path_prefix(&mut self, prefix: Option<&str>) {
+        self.matched_path_prefix = prefix.map(Arc::from);
     }
 
-    pub fn set_request_host(&mut self, host: Option<&'a str>) {
-        self.request_host = host;
+    pub fn set_request_host(&mut self, host: Option<&str>) {
+        self.request_host = host.map(Arc::from);
+    }
+
+    /// Hand the context to the response phase, which outlives the
+    /// request data it was built from. Everything the response side
+    /// can use is owned and moves across; `targets` is dropped
+    /// because selection is over by the time this runs.
+    pub(crate) fn into_response_phase(self) -> Cx<'static> {
+        Cx {
+            targets: Targets { backends: &[] },
+            request_buffer: self.request_buffer,
+            response_buffer: self.response_buffer,
+            matched_path_prefix: self.matched_path_prefix,
+            request_host: self.request_host,
+        }
     }
 }
 

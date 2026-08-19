@@ -338,7 +338,7 @@ mod tests {
         Response::new(
             Full::new(Bytes::from_static(body))
                 .map_err(|never: std::convert::Infallible| match never {})
-                .boxed(),
+                .boxed_unsync(),
         )
     }
 
@@ -402,7 +402,7 @@ mod tests {
         // the response headers — the trailers-only gRPC error shape.
         let body: ResponseBody = http_body_util::Empty::new()
             .map_err(|never: std::convert::Infallible| match never {})
-            .boxed();
+            .boxed_unsync();
         let resp = Response::builder()
             .status(200)
             .header("grpc-status", "13")
@@ -426,7 +426,7 @@ mod tests {
             Ok(Frame::trailers(trailers)),
         ];
         let body: ResponseBody =
-            http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed();
+            http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed_unsync();
         let mut resp = begin().finish(outcome(), Response::new(body));
         while let Some(frame) = resp.body_mut().frame().await {
             frame.unwrap();

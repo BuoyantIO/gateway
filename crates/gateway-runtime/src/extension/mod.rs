@@ -36,6 +36,15 @@ pub trait ExtensionBuilder: Send + Sync {
         BodyMode::None
     }
 
+    /// Whether instances want [`Extension::on_response_end`]. Nothing
+    /// else implies it: a member can want the terminal without
+    /// wanting response chunks — a limiter settling a reservation
+    /// reads no bytes — and the host wraps the response only for
+    /// routes that declared one or the other.
+    fn observes_response_end(&self) -> bool {
+        false
+    }
+
     /// Whether instances may return [`Action::Select`]. At most one
     /// builder per rule declares this.
     fn selects_targets(&self) -> bool {
@@ -83,9 +92,12 @@ pub trait Extension: Send {
     /// builders that declared a response [`BodyMode::Stream`].
     fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx<'_>) {}
 
-    /// Runs exactly once per request, whatever the ending: clean end,
-    /// mid-stream failure, client disconnect, or an upstream that
-    /// never produced a response.
+    /// Runs exactly once per request, whatever the ending: a clean
+    /// finish, a mid-stream failure, a client disconnect, or a
+    /// request answered before it reached an upstream. Fires only for
+    /// builders that declared
+    /// [`ExtensionBuilder::observes_response_end`] or a response
+    /// [`BodyMode`].
     fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx<'_>) {}
 }
 
@@ -138,6 +150,7 @@ pub struct LocalResponse {
 pub struct Member {
     pub request_body: BodyMode,
     pub response_body: BodyMode,
+    pub observes_response_end: bool,
     pub selects_targets: bool,
     pub ext: Box<dyn Extension>,
 }
@@ -148,6 +161,7 @@ impl Member {
         Self {
             request_body: builder.request_body(),
             response_body: builder.response_body(),
+            observes_response_end: builder.observes_response_end(),
             selects_targets: builder.selects_targets(),
             ext: builder.build(),
         }
@@ -202,8 +216,13 @@ impl std::fmt::Debug for BodySource {
 /// Terminal summary handed to [`Extension::on_response_end`].
 #[derive(Debug)]
 pub struct ResponseEnd {
-    /// `None` when the upstream never produced a response.
-    pub status: Option<StatusCode>,
+    /// What the client was answered with, whether that came from an
+    /// upstream or was synthesized here.
+    pub status: StatusCode,
+    /// Response body bytes that reached the client.
     pub body_bytes: u64,
+    /// Whether the response ran to its end. `false` covers a client
+    /// that disconnected mid-stream, a failed body, and a request
+    /// answered before any upstream response existed.
     pub complete: bool,
 }
