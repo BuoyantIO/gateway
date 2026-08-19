@@ -11,6 +11,8 @@ use std::task::{Context, Poll};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::extension::BodySource;
+#[cfg(test)]
+use crate::extension::Held;
 
 pub(super) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -76,8 +78,19 @@ impl Body for UpstreamBody {
     }
 }
 
+/// The host's side of [`crate::extension::Held`]: what actually
+/// remains of the client body when selection has decided. The
+/// extension sees the shape; this carries the goods.
+pub(super) enum HeldBody {
+    /// Drained and kept — the buffer tier.
+    Buffered(BytesMut),
+    /// Never read — a selector that decided from headers alone.
+    Untouched(Incoming),
+    /// Drained through the hooks, nothing retained.
+    Nothing,
+}
+
 /// A body source the host cannot honor.
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SupplyError {
     #[error("extension asked to forward the original body, but none was kept")]
@@ -96,20 +109,22 @@ pub(super) enum SupplyError {
 ///
 /// # Errors
 /// `Original` when the gate kept nothing to forward.
-// Reachable once selection can return a `BodySource`; until then the
-// unit tests below are the only callers.
-#[allow(dead_code)]
 pub(super) fn apply_body_source(
     source: BodySource,
     parts: &mut http::request::Parts,
-    held: Option<BytesMut>,
+    held: HeldBody,
 ) -> Result<UpstreamBody, SupplyError> {
     match source {
         // Unaltered bytes, so whatever the client declared is still
-        // true. Nothing to fix.
-        BodySource::Original => held
-            .map(|buf| UpstreamBody::Full(Full::new(buf.freeze())))
-            .ok_or(SupplyError::NothingHeld),
+        // true. Nothing to fix. The `Kept` token proves the caller
+        // got this source from `Held::forward`, so the `Nothing` arm
+        // is unreachable through the public API; it stays as the
+        // honest answer if an internal caller violates that.
+        BodySource::Original(_) => match held {
+            HeldBody::Buffered(buf) => Ok(UpstreamBody::Full(Full::new(buf.freeze()))),
+            HeldBody::Untouched(body) => Ok(UpstreamBody::Incoming(body)),
+            HeldBody::Nothing => Err(SupplyError::NothingHeld),
+        },
 
         // Different bytes, so the client's length is now a lie.
         // Removing it lets hyper set the true one from `Full`'s exact
@@ -275,7 +290,8 @@ mod tests {
     async fn original_forwards_held_bytes_and_keeps_the_declared_length() {
         let mut parts = parts_with_len(Some(5));
         let held = BytesMut::from(&b"hello"[..]);
-        let body = apply_body_source(BodySource::Original, &mut parts, Some(held)).unwrap();
+        let source = Held::Buffered(b"hello").forward().expect("kept");
+        let body = apply_body_source(source, &mut parts, HeldBody::Buffered(held)).unwrap();
         // Bytes are unaltered, so the client's length still describes
         // them and must survive untouched.
         assert_eq!(declared(&parts), Some(5));
@@ -285,7 +301,11 @@ mod tests {
     #[test]
     fn original_without_a_held_body_is_an_error() {
         let mut parts = parts_with_len(Some(5));
-        let err = apply_body_source(BodySource::Original, &mut parts, None);
+        // `Held::Nothing` refuses to mint an `Original`, so this arm
+        // is only reachable through a host bug; forge the source via
+        // the one legitimate mint to test the guard.
+        let source = Held::Buffered(b"").forward().expect("kept");
+        let err = apply_body_source(source, &mut parts, HeldBody::Nothing);
         // Never a silent empty body: the request would reach the
         // upstream stripped of its payload.
         assert!(matches!(err, Err(SupplyError::NothingHeld)));
@@ -298,8 +318,12 @@ mod tests {
         for replacement in [&b"much longer than eleven"[..], &b"tiny"[..]] {
             let mut parts = parts_with_len(Some(11));
             let bytes = Bytes::copy_from_slice(replacement);
-            let body =
-                apply_body_source(BodySource::Replace(bytes.clone()), &mut parts, None).unwrap();
+            let body = apply_body_source(
+                BodySource::Replace(bytes.clone()),
+                &mut parts,
+                HeldBody::Nothing,
+            )
+            .unwrap();
             assert_eq!(declared(&parts), None, "stale length survived a replace");
             // The exact size hint is what hyper frames from instead.
             assert_eq!(body.size_hint().exact(), Some(replacement.len() as u64));
@@ -311,7 +335,7 @@ mod tests {
     async fn supplied_stream_declares_the_length_it_was_given() {
         let mut parts = parts_with_len(Some(11));
         let source = BodySource::Stream(supplied(&[b"one", b"two"]), Some(6));
-        let body = apply_body_source(source, &mut parts, None).unwrap();
+        let body = apply_body_source(source, &mut parts, HeldBody::Nothing).unwrap();
         assert_eq!(declared(&parts), Some(6));
         assert_eq!(drain(body).await.unwrap(), Bytes::from_static(b"onetwo"));
     }
@@ -320,7 +344,7 @@ mod tests {
     async fn supplied_stream_without_a_length_goes_chunked() {
         let mut parts = parts_with_len(Some(11));
         let source = BodySource::Stream(supplied(&[b"body"]), None);
-        let body = apply_body_source(source, &mut parts, None).unwrap();
+        let body = apply_body_source(source, &mut parts, HeldBody::Nothing).unwrap();
         // The client's length described a different body, so it goes;
         // an unknown size hint leaves hyper to chunk it.
         assert_eq!(declared(&parts), None);
@@ -336,7 +360,7 @@ mod tests {
         ] {
             let mut parts = parts_with_len(None);
             let source = BodySource::Stream(supplied(chunks), Some(declared_len));
-            let body = apply_body_source(source, &mut parts, None).unwrap();
+            let body = apply_body_source(source, &mut parts, HeldBody::Nothing).unwrap();
             let err = drain(body).await.expect_err("length mismatch must fail");
             assert!(
                 err.to_string().contains("length mismatch"),
@@ -349,7 +373,7 @@ mod tests {
     async fn a_stream_matching_its_declared_length_passes_through() {
         let mut parts = parts_with_len(None);
         let source = BodySource::Stream(supplied(&[b"ab", b"cd"]), Some(4));
-        let body = apply_body_source(source, &mut parts, None).unwrap();
+        let body = apply_body_source(source, &mut parts, HeldBody::Nothing).unwrap();
         assert_eq!(drain(body).await.unwrap(), Bytes::from_static(b"abcd"));
     }
 }

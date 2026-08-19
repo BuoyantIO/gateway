@@ -18,7 +18,7 @@ mod registry;
 // Re-exported so extensions implemented outside this crate use the
 // same macro version the trait was defined with.
 pub use async_trait::async_trait;
-pub use cx::{Backend, BackendKind, Cx, Targets};
+pub use cx::{Cx, TargetBackend, Targets};
 pub use registry::{Registry, RegistryError};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -63,7 +63,7 @@ pub trait Extension: Send {
     async fn on_request_start(
         &mut self,
         head: &mut http::request::Parts,
-        cx: &mut Cx<'_>,
+        cx: &mut Cx,
     ) -> Result<Action, Error>;
 
     /// One request-body chunk, in arrival order. Fires only for
@@ -81,16 +81,16 @@ pub trait Extension: Send {
         &mut self,
         _chunk: &[u8],
         _end_of_stream: bool,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, Error> {
         Ok(Action::Continue)
     }
 
-    fn on_response_start(&mut self, _head: &mut http::response::Parts, _cx: &mut Cx<'_>) {}
+    fn on_response_start(&mut self, _head: &mut http::response::Parts, _cx: &mut Cx) {}
 
     /// One response-body chunk. Read-only tap; fires only for
     /// builders that declared a response [`BodyMode::Stream`].
-    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx<'_>) {}
+    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx) {}
 
     /// Runs exactly once per request, whatever the ending: a clean
     /// finish, a mid-stream failure, a client disconnect, or a
@@ -98,8 +98,65 @@ pub trait Extension: Send {
     /// builders that declared
     /// [`ExtensionBuilder::observes_response_end`] or a response
     /// [`BodyMode`].
-    fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx<'_>) {}
+    fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx) {}
+
+    /// Pick where the request goes. Called exactly once, on the
+    /// rule's single member whose builder declared
+    /// [`ExtensionBuilder::selects_targets`], after the request body
+    /// has been fully delivered. Members that did not declare it are
+    /// never asked.
+    ///
+    /// `held` is what the host kept of the request body, and the only
+    /// source of [`BodySource::Original`] — a selector on a streaming
+    /// rule consumed the body and must supply the one to forward.
+    ///
+    /// # Errors
+    /// An error fails the request. There is no fallback to the
+    /// default load balancer: a selector that cannot decide is a
+    /// failed request, not a differently routed one.
+    async fn select(&mut self, _held: Held<'_>, _cx: &mut Cx) -> Result<Selected, Error> {
+        Err("member declared selects_targets but does not implement select".into())
+    }
 }
+
+/// A selector's decision.
+pub enum Selected {
+    /// Route to this target with this body.
+    Target(Selection),
+    /// Short-circuit with a local response — the selector's own
+    /// error path (a shed, an overload) rather than a failure.
+    Respond(LocalResponse),
+}
+
+/// What the host kept of the request body by the time selection runs.
+pub enum Held<'a> {
+    /// The drained body, complete. Rules whose strictest mode is
+    /// `Buffer`.
+    Buffered(&'a [u8]),
+    /// Never read: the selector decided from headers alone, so the
+    /// client's stream is intact and can flow to the target as-is.
+    Untouched,
+    /// Nothing — the body streamed through the hooks unretained.
+    Nothing,
+}
+
+impl Held<'_> {
+    /// Forward the body the host kept (or never touched). `None`
+    /// when it kept none: there is nothing to forward, and the
+    /// selector must supply a body instead. This is the only
+    /// constructor of [`BodySource::Original`].
+    pub fn forward(&self) -> Option<BodySource> {
+        match self {
+            Self::Buffered(_) | Self::Untouched => Some(BodySource::Original(Kept(()))),
+            Self::Nothing => None,
+        }
+    }
+}
+
+/// Proof the host holds the original body. No public constructor:
+/// obtained through [`Held::forward`], so asking to forward a body
+/// the host discarded does not compile.
+pub struct Kept(());
 
 /// Body access an extension declares, per direction. The rule's
 /// effective mode is the strictest across its members
@@ -188,9 +245,10 @@ pub enum Target {
 
 /// The request body the host forwards upstream.
 pub enum BodySource {
-    /// The bytes the host kept while draining. Only valid where it
-    /// kept some — a rule that streams retains nothing.
-    Original,
+    /// The bytes the host kept while draining. Constructed only via
+    /// [`Held::forward`], which is how "forward a body the host
+    /// discarded" is unrepresentable rather than a runtime error.
+    Original(Kept),
     /// A complete body replacing the original. The host reframes
     /// content-length and discards the rest of the client upload.
     Replace(Bytes),
@@ -206,7 +264,7 @@ pub enum BodySource {
 impl std::fmt::Debug for BodySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Original => f.write_str("Original"),
+            Self::Original(_) => f.write_str("Original"),
             Self::Replace(bytes) => f.debug_tuple("Replace").field(&bytes.len()).finish(),
             Self::Stream(_, len) => f.debug_tuple("Stream").field(len).finish(),
         }
