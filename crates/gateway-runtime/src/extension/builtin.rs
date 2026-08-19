@@ -11,7 +11,9 @@ use gateway_config::filter::{
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Member, Registry};
+use super::{
+    Action, BodyMode, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Member, Registry,
+};
 
 /// Reserved plugin names for the built-ins.
 pub const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
@@ -26,6 +28,8 @@ pub enum FilterError {
     InvalidHeaderValue(String),
     #[error("no extension registered under `{0}`")]
     UnknownPlugin(String),
+    #[error("`{0}` asked to buffer the response, which is not supported")]
+    ResponseBufferUnsupported(String),
 }
 
 /// `HeaderOps` with names and values parsed up front. Invalid `remove`
@@ -112,10 +116,18 @@ pub fn instance_for(cfg: &ConfigFilter, registry: &Registry) -> Result<Member, F
             *status_code,
             path.clone(),
         ))),
-        ConfigFilter::ExtensionRef { name } => registry
-            .get(name)
-            .map(|builder| Member::from_builder(builder.as_ref()))
-            .ok_or_else(|| FilterError::UnknownPlugin(name.clone())),
+        ConfigFilter::ExtensionRef { name } => {
+            let builder = registry
+                .get(name)
+                .ok_or_else(|| FilterError::UnknownPlugin(name.clone()))?;
+            // Holding a response back to release it later defeats a
+            // streamed one, so the declaration fails here rather than
+            // being quietly served as if it were `Stream`.
+            if builder.response_body() == BodyMode::Buffer {
+                return Err(FilterError::ResponseBufferUnsupported(name.clone()));
+            }
+            Ok(Member::from_builder(builder.as_ref()))
+        }
     }
 }
 

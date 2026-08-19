@@ -18,7 +18,7 @@ use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
     Action, BodyMode, Cx, Error as ExtensionError, Extension, ExtensionBuilder, LocalResponse,
-    Registry, async_trait,
+    Registry, ResponseEnd, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
@@ -1739,5 +1739,260 @@ async fn hyper_frames_a_full_body_from_its_size_hint() {
     assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "4");
 
     drop(shutdown_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+}
+
+// =================== response taps ===================
+
+/// What a response probe observed.
+#[derive(Default)]
+struct ResponseSeen {
+    chunks: Vec<(usize, bool)>,
+    ends: Vec<(StatusCode, u64, bool)>,
+}
+
+struct ResponseProbeBuilder {
+    mode: BodyMode,
+    /// Answer the request instead of proxying it, so the terminal
+    /// hook has to fire without an upstream response.
+    short_circuit: bool,
+    seen: Arc<StdMutex<ResponseSeen>>,
+}
+
+struct ResponseProbe {
+    short_circuit: bool,
+    seen: Arc<StdMutex<ResponseSeen>>,
+}
+
+impl ExtensionBuilder for ResponseProbeBuilder {
+    fn response_body(&self) -> BodyMode {
+        self.mode
+    }
+
+    fn observes_response_end(&self) -> bool {
+        true
+    }
+
+    fn build(&self) -> Box<dyn Extension> {
+        Box::new(ResponseProbe {
+            short_circuit: self.short_circuit,
+            seen: Arc::clone(&self.seen),
+        })
+    }
+}
+
+#[async_trait]
+impl Extension for ResponseProbe {
+    async fn on_request_start(
+        &mut self,
+        _head: &mut http::request::Parts,
+        _cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        if self.short_circuit {
+            return Ok(Action::Respond(LocalResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: http::HeaderMap::new(),
+                body: Bytes::from_static(b"no"),
+            }));
+        }
+        Ok(Action::Continue)
+    }
+
+    fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx<'_>) {
+        self.seen
+            .lock()
+            .unwrap()
+            .chunks
+            .push((chunk.len(), end_of_stream));
+    }
+
+    fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx<'_>) {
+        self.seen
+            .lock()
+            .unwrap()
+            .ends
+            .push((end.status, end.body_bytes, end.complete));
+    }
+}
+
+struct TappedRoute {
+    bind_port: u16,
+    seen: Arc<StdMutex<ResponseSeen>>,
+    _gw: tokio::task::JoinHandle<()>,
+    _stop: drain::Signal,
+}
+
+async fn spawn_tapped_route(upstream_port: u16, mode: BodyMode) -> TappedRoute {
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream_port, "resp-probe");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
+    let mut registry = Registry::new();
+    registry
+        .register(
+            "resp-probe",
+            Arc::new(ResponseProbeBuilder {
+                mode,
+                short_circuit: false,
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move {
+        gw.run(watch).await.unwrap();
+    });
+    wait_for_listening(bind_port).await;
+    TappedRoute {
+        bind_port,
+        seen,
+        _gw: gw_handle,
+        _stop: stop,
+    }
+}
+
+#[tokio::test]
+async fn a_response_tap_sees_the_body_and_the_client_still_gets_it() {
+    let upstream = spawn_http_echo().await;
+    let tapped = spawn_tapped_route(upstream, BodyMode::Stream).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(
+            format!("http://127.0.0.1:{}/hello", tapped.bind_port)
+                .parse()
+                .unwrap(),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"GET /hello"));
+
+    // The body must reach the tap and the client unaltered.
+    let seen = tapped.seen.lock().unwrap();
+    let total: usize = seen.chunks.iter().map(|(len, _)| len).sum();
+    assert_eq!(total, body.len());
+    assert!(seen.chunks.last().unwrap().1, "terminal chunk not flagged");
+    assert_eq!(seen.ends, vec![(StatusCode::OK, body.len() as u64, true)]);
+}
+
+#[tokio::test]
+async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream, "resp-probe");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    // The member answers at request time, so no upstream response
+    // ever exists — the terminal has to come from the short-circuit
+    // path rather than from the response body wrapper.
+    let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
+    let mut registry = Registry::new();
+    registry
+        .register(
+            "resp-probe",
+            Arc::new(ResponseProbeBuilder {
+                mode: BodyMode::Stream,
+                short_circuit: true,
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let _ = resp.into_body().collect().await;
+
+    {
+        let seen = seen.lock().unwrap();
+        assert!(seen.chunks.is_empty(), "no upstream body to tap");
+        assert_eq!(
+            seen.ends,
+            vec![(StatusCode::TOO_MANY_REQUESTS, 0, false)],
+            "a member that reserved on the request must still settle"
+        );
+    }
+
+    drop(stop);
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+}
+
+/// A member that declares nothing on the response side must never be
+/// asked about one — the route keeps the upstream body untouched.
+struct RequestOnlyBuilder;
+struct RequestOnly;
+
+impl ExtensionBuilder for RequestOnlyBuilder {
+    fn build(&self) -> Box<dyn Extension> {
+        Box::new(RequestOnly)
+    }
+}
+
+#[async_trait]
+impl Extension for RequestOnly {
+    async fn on_request_start(
+        &mut self,
+        head: &mut http::request::Parts,
+        _cx: &mut Cx<'_>,
+    ) -> Result<Action, ExtensionError> {
+        head.headers
+            .insert("x-touched", "request-only".parse().unwrap());
+        Ok(Action::Continue)
+    }
+
+    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx<'_>) {
+        panic!("response tap ran for a member that declared no response access");
+    }
+
+    fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx<'_>) {
+        panic!("terminal ran for a member that never asked for it");
+    }
+}
+
+#[tokio::test]
+async fn a_request_only_member_never_sees_the_response() {
+    let upstream = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream, "request-only");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let mut registry = Registry::new();
+    registry
+        .register("request-only", Arc::new(RequestOnlyBuilder))
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    // Either hook firing would panic the connection task; a clean
+    // response with the echoed body proves neither ran.
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/ok").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"GET /ok"));
+
+    drop(stop);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
 }

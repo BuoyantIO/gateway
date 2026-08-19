@@ -28,7 +28,7 @@ use gateway_state::{
     ActiveBackend, ActiveBackendRef, ActiveHttpRoute, ActiveListener, BindKey, Store,
 };
 use http::{Method, Request, Response, StatusCode, Uri};
-use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -47,8 +47,12 @@ use crate::metrics::Reason;
 use crate::proxy::access::{Access, RequestOutcome};
 use crate::proxy::body::{BoxError, UpstreamBody};
 use crate::proxy::gate;
+use crate::proxy::tap;
 
-pub(super) type ResponseBody = BoxBody<Bytes, BoxError>;
+/// Response body handed back to hyper. `Unsync` because the response
+/// phase carries per-request extension instances, which are `Send`
+/// but not `Sync` — they are never touched from two threads at once.
+pub(super) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// Process-wide HTTP client used to dial upstreams. Wraps
 /// `hyper_util::client::legacy::Client` — internally it owns a
@@ -234,13 +238,17 @@ async fn serve_request_inner(
         // An extension answering directly (e.g. a redirect) is the
         // route working as configured.
         RequestPhase::Respond(resp) => {
-            return (
+            return short_circuit(
+                &mut extensions,
+                &mut cx,
                 local_response(resp),
                 RequestOutcome::short_circuit(listener, route, Reason::Ok),
             );
         }
         RequestPhase::Failed => {
-            return (
+            return short_circuit(
+                &mut extensions,
+                &mut cx,
                 synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
                 RequestOutcome::short_circuit(listener, route, Reason::Internal),
             );
@@ -254,13 +262,17 @@ async fn serve_request_inner(
     let backend = match resolved.backend {
         BackendChoice::Picked(b) => b,
         BackendChoice::None => {
-            return (
+            return short_circuit(
+                &mut extensions,
+                &mut cx,
                 synthesize_error(RouteResolveError::NoBackend),
                 RequestOutcome::short_circuit(listener, route, Reason::NoBackend),
             );
         }
         BackendChoice::Unresolved => {
-            return (
+            return short_circuit(
+                &mut extensions,
+                &mut cx,
                 synthesize_error(RouteResolveError::BackendUnresolved),
                 RequestOutcome::short_circuit(listener, route, Reason::BackendUnresolved),
             );
@@ -270,12 +282,26 @@ async fn serve_request_inner(
         ctx,
         parts,
         body,
-        &mut extensions,
-        &mut cx,
+        extensions,
+        cx,
         &backend,
         (listener, route),
     )
     .await
+}
+
+/// Answer without ever reaching an upstream response, firing the
+/// terminal hook on members that were already built. A member that
+/// reserved something on the request — a limiter's budget — settles
+/// it here exactly as it would on a served response.
+fn short_circuit(
+    members: &mut [Member],
+    cx: &mut Cx<'_>,
+    resp: Response<ResponseBody>,
+    outcome: RequestOutcome,
+) -> (Response<ResponseBody>, RequestOutcome) {
+    tap::end_without_response(members, cx, resp.status());
+    (resp, outcome)
 }
 
 /// Body phase and upstream dispatch, in the order the strictest
@@ -285,8 +311,8 @@ async fn dispatch(
     ctx: &ProxyCtx,
     parts: http::request::Parts,
     body: Incoming,
-    members: &mut [Member],
-    cx: &mut Cx<'_>,
+    mut members: Vec<Member>,
+    mut cx: Cx<'_>,
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
@@ -299,9 +325,12 @@ async fn dispatch(
         return serve_streamed(ctx, parts, body, members, cx, backend, (listener, route)).await;
     }
     let upstream_body = if mode == BodyMode::Buffer {
-        match gate::run(members, &parts, body, cx).await {
+        match gate::run(&mut members, &parts, body, &mut cx).await {
             gate::GateOutcome::Forward(forwarded) => forwarded,
-            gate::GateOutcome::Halt(halt) => return halt_response(halt, listener, route),
+            gate::GateOutcome::Halt(halt) => {
+                let (resp, outcome) = halt_response(halt, listener, route);
+                return short_circuit(&mut members, &mut cx, resp, outcome);
+            }
         }
     } else {
         UpstreamBody::Incoming(body)
@@ -309,7 +338,9 @@ async fn dispatch(
     let req = Request::from_parts(parts, upstream_body);
 
     let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
-        return (
+        return short_circuit(
+            &mut members,
+            &mut cx,
             synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
         );
@@ -337,13 +368,15 @@ async fn serve_streamed(
     ctx: &ProxyCtx,
     parts: http::request::Parts,
     body: Incoming,
-    members: &mut [Member],
-    cx: &mut Cx<'_>,
+    mut members: Vec<Member>,
+    mut cx: Cx<'_>,
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
     let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
-        return (
+        return short_circuit(
+            &mut members,
+            &mut cx,
             synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
         );
@@ -357,14 +390,15 @@ async fn serve_streamed(
         UpstreamBody::Stream(StreamBody::new(ReceiverStream::new(rx))),
     );
     let forward_fut = forward(&ctx.http_client, backend.protocol, req, &endpoint, &info);
-    let pump_fut = gate::pump(members, body, tx, cx);
+    let pump_fut = gate::pump(&mut members, body, tx, &mut cx);
     let ((upstream, reason, dial_ms), pump) = tokio::join!(forward_fut, pump_fut);
 
     // The pump's verdict wins: nothing has reached the client yet, so
     // a mid-body respond or limit still goes out as a clean status,
     // and the upstream send was already reset through the pipe.
     if let gate::PumpOutcome::Halt(halt) = pump {
-        return halt_response(halt, listener, route);
+        let (resp, outcome) = halt_response(halt, listener, route);
+        return short_circuit(&mut members, &mut cx, resp, outcome);
     }
     let outcome = RequestOutcome {
         listener: listener.map(str::to_owned),
@@ -381,16 +415,24 @@ async fn serve_streamed(
 /// runs after, so an extension can't accidentally keep a hop-by-hop
 /// header alive.
 fn finish_response(
-    members: &mut [Member],
-    cx: &mut Cx<'_>,
+    mut members: Vec<Member>,
+    mut cx: Cx<'_>,
     upstream: Response<ResponseBody>,
     outcome: RequestOutcome,
 ) -> (Response<ResponseBody>, RequestOutcome) {
     let (mut parts, body) = upstream.into_parts();
     for member in members.iter_mut().rev() {
-        member.ext.on_response_start(&mut parts, cx);
+        member.ext.on_response_start(&mut parts, &mut cx);
     }
     strip_hop_by_hop_headers(&mut parts.headers);
+
+    // Members stay alive past this function only when a route has
+    // them: the response phase owns what the request phase borrowed.
+    let body = if tap::wants_response_phase(&members) {
+        tap::tap(body, members, cx.into_response_phase(), parts.status)
+    } else {
+        body
+    };
     (Response::from_parts(parts, body), outcome)
 }
 
@@ -462,7 +504,7 @@ async fn run_request_hooks(
 fn local_response(resp: LocalResponse) -> Response<ResponseBody> {
     let body = Full::new(resp.body)
         .map_err(|never: Infallible| match never {})
-        .boxed();
+        .boxed_unsync();
     let mut out = Response::new(body);
     *out.status_mut() = resp.status;
     *out.headers_mut() = resp.headers;
@@ -963,7 +1005,7 @@ async fn forward(
     // `serve_request` so that response filters can run on the
     // raw upstream headers first.
     let (parts, body) = upstream_resp.into_parts();
-    let boxed: ResponseBody = body.map_err(|e| Box::new(e) as BoxError).boxed();
+    let boxed: ResponseBody = body.map_err(|e| Box::new(e) as BoxError).boxed_unsync();
     (
         Response::from_parts(parts, boxed),
         Reason::Ok,
@@ -1018,7 +1060,7 @@ fn synthesize_status(status: StatusCode) -> Response<ResponseBody> {
     let reason = status.canonical_reason().unwrap_or("");
     let body = Full::new(Bytes::from(reason.to_owned()))
         .map_err(|never: Infallible| match never {})
-        .boxed();
+        .boxed_unsync();
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
