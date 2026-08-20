@@ -197,7 +197,7 @@ impl Extension for RequestHeaderModifier {
     async fn on_request_start(
         &mut self,
         head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, Error> {
         self.ops.apply(&mut head.headers);
         Ok(Action::Continue)
@@ -236,12 +236,12 @@ impl Extension for ResponseHeaderModifier {
     async fn on_request_start(
         &mut self,
         _head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, Error> {
         Ok(Action::Continue)
     }
 
-    fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx<'_>) {
+    fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
         self.ops.apply(&mut head.headers);
     }
 }
@@ -296,7 +296,7 @@ impl Extension for RequestRedirect {
     async fn on_request_start(
         &mut self,
         head: &mut http::request::Parts,
-        cx: &mut Cx<'_>,
+        cx: &mut Cx,
     ) -> Result<Action, Error> {
         let cfg = &self.config;
 
@@ -573,7 +573,7 @@ mod tests {
             async fn on_request_start(
                 &mut self,
                 _head: &mut http::request::Parts,
-                _cx: &mut Cx<'_>,
+                _cx: &mut Cx,
             ) -> Result<Action, Error> {
                 Ok(Action::Continue)
             }

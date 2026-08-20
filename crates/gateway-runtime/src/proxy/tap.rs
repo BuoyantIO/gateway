@@ -32,7 +32,7 @@ pub(super) fn wants_response_phase(members: &[Member]) -> bool {
 pub(super) fn tap(
     body: ResponseBody,
     members: Vec<Member>,
-    cx: Cx<'static>,
+    cx: Cx,
     status: StatusCode,
 ) -> ResponseBody {
     TappedBody {
@@ -50,7 +50,7 @@ pub(super) fn tap(
 /// phase — a request answered before an upstream response existed.
 /// The status is whatever was synthesized, so an extension settling
 /// a reservation sees the same shape it would on a served request.
-pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx<'_>, status: StatusCode) {
+pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx, status: StatusCode) {
     let end = ResponseEnd {
         status,
         body_bytes: 0,
@@ -64,7 +64,7 @@ pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx<'_>, stat
 struct TappedBody {
     inner: ResponseBody,
     members: Vec<Member>,
-    cx: Cx<'static>,
+    cx: Cx,
     status: StatusCode,
     bytes: u64,
     /// Cleared when the terminal fires. Still set in `Drop` means the
@@ -198,12 +198,12 @@ mod tests {
         async fn on_request_start(
             &mut self,
             _head: &mut http::request::Parts,
-            _cx: &mut Cx<'_>,
+            _cx: &mut Cx,
         ) -> Result<Action, Error> {
             Ok(Action::Continue)
         }
 
-        fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx<'_>) {
+        fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx) {
             self.seen
                 .lock()
                 .unwrap()
@@ -212,7 +212,7 @@ mod tests {
             self.order.lock().unwrap().push(self.label);
         }
 
-        fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx<'_>) {
+        fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
             self.seen
                 .lock()
                 .unwrap()

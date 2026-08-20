@@ -40,12 +40,15 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::drain;
 use crate::extension::builtin::instance_for;
-use crate::extension::{Action, BodyMode, Cx, LocalResponse, Member, Registry};
+use crate::extension::{
+    Action, BodyMode, Cx, Held, LocalResponse, Member, Registry, Selected, Target, TargetBackend,
+    Targets,
+};
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
 use crate::metrics::Reason;
 use crate::proxy::access::{Access, RequestOutcome};
-use crate::proxy::body::{BoxError, UpstreamBody};
+use crate::proxy::body::{BoxError, HeldBody, UpstreamBody, apply_body_source};
 use crate::proxy::gate;
 use crate::proxy::tap;
 
@@ -233,26 +236,44 @@ async fn serve_request_inner(
     };
 
     let (mut parts, body) = req.into_parts();
-    match run_request_hooks(&mut extensions, &mut parts, &mut cx).await {
-        RequestPhase::Continue => {}
-        // An extension answering directly (e.g. a redirect) is the
-        // route working as configured.
-        RequestPhase::Respond(resp) => {
-            return short_circuit(
-                &mut extensions,
-                &mut cx,
-                local_response(resp),
-                RequestOutcome::short_circuit(listener, route, Reason::Ok),
-            );
-        }
-        RequestPhase::Failed => {
-            return short_circuit(
-                &mut extensions,
-                &mut cx,
-                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                RequestOutcome::short_circuit(listener, route, Reason::Internal),
-            );
-        }
+    let phase = run_request_hooks(&mut extensions, &mut parts, &mut cx).await;
+    if let Some(early) = phase_response(phase, &mut extensions, &mut cx, listener, route) {
+        return early;
+    }
+
+    // At most one member may select; two is a config error the
+    // registry cannot see, so it fails here, loudly.
+    if extensions.iter().filter(|m| m.selects_targets).count() > 1 {
+        let names: Vec<&str> = resolved
+            .filters
+            .iter()
+            .map(gateway_config::filter::HttpFilter::name)
+            .collect();
+        tracing::error!(filters = ?names, "route declares more than one selecting extension");
+        return short_circuit(
+            &mut extensions,
+            &mut cx,
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            RequestOutcome::short_circuit(listener, route, Reason::Internal),
+        );
+    }
+
+    // Selector rules route by the selector's decision: the weighted
+    // pick above is not consulted, and the full ref set becomes the
+    // selection allowlist. Built only here — plain routes never pay
+    // for it.
+    if extensions.iter().any(|m| m.selects_targets) {
+        cx.set_targets(targets_from_route(&resolved.route));
+        return serve_selected(
+            ctx,
+            parts,
+            body,
+            extensions,
+            cx,
+            &resolved.route,
+            (listener, route),
+        )
+        .await;
     }
 
     // No filter short-circuited, so this route must proxy — it needs
@@ -290,13 +311,39 @@ async fn serve_request_inner(
     .await
 }
 
+/// The request hooks' verdict as an early response, `None` when the
+/// request continues. An extension answering directly (e.g. a
+/// redirect) is the route working as configured.
+fn phase_response(
+    phase: RequestPhase,
+    members: &mut [Member],
+    cx: &mut Cx,
+    listener: Option<&str>,
+    route: Option<&str>,
+) -> Option<(Response<ResponseBody>, RequestOutcome)> {
+    let (resp, reason) = match phase {
+        RequestPhase::Continue => return None,
+        RequestPhase::Respond(resp) => (local_response(resp), Reason::Ok),
+        RequestPhase::Failed => (
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Reason::Internal,
+        ),
+    };
+    Some(short_circuit(
+        members,
+        cx,
+        resp,
+        RequestOutcome::short_circuit(listener, route, reason),
+    ))
+}
+
 /// Answer without ever reaching an upstream response, firing the
 /// terminal hook on members that were already built. A member that
 /// reserved something on the request — a limiter's budget — settles
 /// it here exactly as it would on a served response.
 fn short_circuit(
     members: &mut [Member],
-    cx: &mut Cx<'_>,
+    cx: &mut Cx,
     resp: Response<ResponseBody>,
     outcome: RequestOutcome,
 ) -> (Response<ResponseBody>, RequestOutcome) {
@@ -312,7 +359,7 @@ async fn dispatch(
     parts: http::request::Parts,
     body: Incoming,
     mut members: Vec<Member>,
-    mut cx: Cx<'_>,
+    mut cx: Cx,
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
@@ -325,8 +372,18 @@ async fn dispatch(
         return serve_streamed(ctx, parts, body, members, cx, backend, (listener, route)).await;
     }
     let upstream_body = if mode == BodyMode::Buffer {
-        match gate::run(&mut members, &parts, body, &mut cx).await {
+        match gate::run(
+            &mut members,
+            &parts,
+            body,
+            &mut cx,
+            gate::DrainMode::ForwardBuffered,
+        )
+        .await
+        {
             gate::GateOutcome::Forward(forwarded) => forwarded,
+            // Not produced by `ForwardBuffered`.
+            gate::GateOutcome::Drained => unreachable!("buffered drain always forwards"),
             gate::GateOutcome::Halt(halt) => {
                 let (resp, outcome) = halt_response(halt, listener, route);
                 return short_circuit(&mut members, &mut cx, resp, outcome);
@@ -369,7 +426,7 @@ async fn serve_streamed(
     parts: http::request::Parts,
     body: Incoming,
     mut members: Vec<Member>,
-    mut cx: Cx<'_>,
+    mut cx: Cx,
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
@@ -410,13 +467,181 @@ async fn serve_streamed(
     finish_response(members, cx, upstream, outcome)
 }
 
+/// Selection path: the body settles first, the rule's selector picks
+/// the destination, and the request dials whatever it picked. The
+/// weighted backend pick is never consulted here.
+async fn serve_selected(
+    ctx: &ProxyCtx,
+    mut parts: http::request::Parts,
+    body: Incoming,
+    mut members: Vec<Member>,
+    mut cx: Cx,
+    route: &Arc<ActiveHttpRoute>,
+    (listener, route_name): (Option<&str>, Option<&str>),
+) -> (Response<ResponseBody>, RequestOutcome) {
+    let held_body = match settle_body(&mut members, &parts, body, &mut cx).await {
+        Ok(held) => held,
+        Err(halt) => {
+            let (resp, outcome) = halt_response(halt, listener, route_name);
+            return short_circuit(&mut members, &mut cx, resp, outcome);
+        }
+    };
+
+    let held = match &held_body {
+        HeldBody::Buffered(buf) => Held::Buffered(buf),
+        HeldBody::Untouched(_) => Held::Untouched,
+        HeldBody::Nothing => Held::Nothing,
+    };
+    let selector = members
+        .iter_mut()
+        .find(|m| m.selects_targets)
+        .expect("caller checked a selector exists");
+    let selection = match selector.ext.select(held, &mut cx).await {
+        Ok(Selected::Target(selection)) => selection,
+        // The selector answering directly (a shed, an overload) is
+        // the route working as configured.
+        Ok(Selected::Respond(resp)) => {
+            return short_circuit(
+                &mut members,
+                &mut cx,
+                local_response(resp),
+                RequestOutcome::short_circuit(listener, route_name, Reason::Ok),
+            );
+        }
+        // No fallback to the load balancer: a selector that cannot
+        // decide is a failed request, not a differently routed one.
+        Err(e) => {
+            tracing::warn!(error = %e, "selector failed");
+            return short_circuit(
+                &mut members,
+                &mut cx,
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
+            );
+        }
+    };
+
+    let Some((backend, endpoint, info)) = validate_target(&selection.target, route, &ctx.lb) else {
+        return short_circuit(
+            &mut members,
+            &mut cx,
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
+        );
+    };
+    let _active = info.acquire();
+    let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
+
+    let upstream_body = match apply_body_source(selection.body, &mut parts, held_body) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(error = %e, "selector body source cannot be honored");
+            return short_circuit(
+                &mut members,
+                &mut cx,
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
+            );
+        }
+    };
+    let req = Request::from_parts(parts, upstream_body);
+
+    let (upstream, reason, dial_ms) =
+        forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
+    let outcome = RequestOutcome {
+        listener: listener.map(str::to_owned),
+        route: route_name.map(str::to_owned),
+        reason,
+        endpoint: Some(endpoint_authority),
+        dial_ms,
+    };
+    finish_response(members, cx, upstream, outcome)
+}
+
+/// Settle the request body ahead of selection. Buffer retains it for
+/// the selector; Stream delivered it unretained (the selector
+/// supplies the forwarded body); None never reads it, so the client's
+/// stream stays whole.
+async fn settle_body(
+    members: &mut [Member],
+    parts: &http::request::Parts,
+    body: Incoming,
+    cx: &mut Cx,
+) -> Result<HeldBody, gate::Halt> {
+    let mode = members
+        .iter()
+        .map(|m| m.request_body)
+        .max()
+        .unwrap_or_default();
+    let drain_mode = match mode {
+        BodyMode::None => return Ok(HeldBody::Untouched(body)),
+        BodyMode::Buffer => gate::DrainMode::RetainForSelection,
+        BodyMode::Stream => gate::DrainMode::DeliverOnly,
+    };
+    match gate::run(members, parts, body, cx, drain_mode).await {
+        gate::GateOutcome::Drained => Ok(match mode {
+            BodyMode::Buffer => HeldBody::Buffered(cx.take_request_buffer().unwrap_or_default()),
+            _ => HeldBody::Nothing,
+        }),
+        gate::GateOutcome::Forward(_) => unreachable!("selection drains never forward"),
+        gate::GateOutcome::Halt(halt) => Err(halt),
+    }
+}
+
+/// The rule's refs as the selector sees them: name, weight, and the
+/// backend each resolved to.
+fn targets_from_route(route: &Arc<ActiveHttpRoute>) -> Targets {
+    Targets::new(
+        route
+            .backends
+            .iter()
+            .map(|br| TargetBackend::new(br.key.0.clone(), br.weight, br.backend.clone()))
+            .collect(),
+    )
+}
+
+/// A selection is valid only within the rule's backendRefs, and only
+/// at an address the named backend actually lists. Everything else
+/// fails the request — with better information than the picker, we
+/// would still rather fail than route somewhere the route never
+/// allowed.
+fn validate_target(
+    target: &Target,
+    route: &Arc<ActiveHttpRoute>,
+    lb: &crate::lb::LoadBalancer,
+) -> Option<(Arc<ActiveBackend>, Endpoint, Arc<EndpointInfo>)> {
+    match target {
+        Target::Endpoint { backend, addr } => {
+            let Some(br) = route.backends.iter().find(|br| br.key.0 == *backend) else {
+                tracing::warn!(%backend, "selector named a backend outside the rule's refs");
+                return None;
+            };
+            let Some(active) = &br.backend else {
+                tracing::warn!(%backend, "selector named a ref whose backend is not registered");
+                return None;
+            };
+            let Some((endpoint, info)) = lb.endpoint_by_addr(active, *addr) else {
+                tracing::warn!(%backend, %addr, "selector named an address the backend does not list");
+                return None;
+            };
+            Some((Arc::clone(active), endpoint, info))
+        }
+        // Nothing dialable exists in state yet; a variant that
+        // silently misroutes would be worse than one that fails.
+        Target::Backend { name } => {
+            tracing::warn!(%name, "selector targeted a dialable backend, which is not supported");
+            None
+        }
+    }
+}
+
 /// Response hooks run in **reverse** order per Area 03
 /// ("response-side runs reverse-of-request"). Hop-by-hop stripping
 /// runs after, so an extension can't accidentally keep a hop-by-hop
 /// header alive.
 fn finish_response(
     mut members: Vec<Member>,
-    mut cx: Cx<'_>,
+    mut cx: Cx,
     upstream: Response<ResponseBody>,
     outcome: RequestOutcome,
 ) -> (Response<ResponseBody>, RequestOutcome) {
@@ -429,7 +654,7 @@ fn finish_response(
     // Members stay alive past this function only when a route has
     // them: the response phase owns what the request phase borrowed.
     let body = if tap::wants_response_phase(&members) {
-        tap::tap(body, members, cx.into_response_phase(), parts.status)
+        tap::tap(body, members, cx, parts.status)
     } else {
         body
     };
@@ -484,7 +709,7 @@ enum RequestPhase {
 async fn run_request_hooks(
     members: &mut [Member],
     parts: &mut http::request::Parts,
-    cx: &mut Cx<'_>,
+    cx: &mut Cx,
 ) -> RequestPhase {
     for member in members.iter_mut() {
         match member.ext.on_request_start(parts, cx).await {
@@ -515,6 +740,10 @@ fn local_response(resp: LocalResponse) -> Response<ResponseBody> {
 
 struct ResolvedRoute {
     backend: BackendChoice,
+    /// The route itself, for rules whose members select: the full
+    /// backendRef set is the selection allowlist, and the weighted
+    /// pick above only kept its winner.
+    route: Arc<ActiveHttpRoute>,
     filters: Vec<HttpFilterConfig>,
     route_name: String,
     /// Name of the listener the route hangs off — the `listener`
@@ -616,6 +845,7 @@ fn resolve_http_route(
 
     Ok(ResolvedRoute {
         backend,
+        route: Arc::clone(chosen),
         filters: chosen.filters.clone(),
         route_name: chosen.key.name.clone(),
         listener_name: chosen.key.listener.name.clone(),
@@ -1728,6 +1958,117 @@ mod tests {
     }
 
     // --- pick_backend_ref ---
+
+    fn selection_route(refs: Vec<ActiveBackendRef>) -> Arc<ActiveHttpRoute> {
+        Arc::new(ActiveHttpRoute {
+            key: gateway_state::RouteKey {
+                listener: gateway_state::ListenerKey {
+                    bind: BindKey("b".into()),
+                    name: "l".into(),
+                },
+                name: "r".into(),
+            },
+            matches: vec![],
+            filters: vec![],
+            backends: refs,
+        })
+    }
+
+    fn ref_with_endpoint(name: &str, port: u16) -> ActiveBackendRef {
+        let key = gateway_state::BackendKey::new(name);
+        ActiveBackendRef {
+            key: key.clone(),
+            backend: Some(Arc::new(ActiveBackend {
+                key,
+                endpoints: vec![Endpoint {
+                    name: "e0".into(),
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port,
+                }],
+                protocol: BackendProtocol::Http1,
+            })),
+            weight: 1,
+        }
+    }
+
+    fn test_lb() -> crate::lb::LoadBalancer {
+        crate::lb::LoadBalancer::with_picker(
+            Arc::new(crate::lb::FirstCandidate),
+            crate::lb::EndpointStateConfig {
+                ewma_alpha: 0.5,
+                failure_threshold: 1,
+                eviction_duration: std::time::Duration::from_secs(30),
+            },
+        )
+    }
+
+    #[test]
+    fn targets_mirror_the_routes_refs_including_unresolved_ones() {
+        let route = selection_route(vec![
+            ref_with_endpoint("be-a", 8080),
+            backend_ref("ghost", false, 3),
+        ]);
+        let targets = targets_from_route(&route);
+
+        let named: Vec<&str> = targets.backends().iter().map(TargetBackend::name).collect();
+        assert_eq!(named, vec!["be-a", "ghost"]);
+        assert_eq!(targets.backend("be-a").unwrap().endpoints().len(), 1);
+        assert_eq!(targets.backend("be-a").unwrap().weight(), 1);
+        // An unresolved ref is visible but offers nothing to pick.
+        assert!(targets.backend("ghost").unwrap().endpoints().is_empty());
+        assert!(targets.backend("absent").is_none());
+    }
+
+    #[test]
+    fn targets_outside_the_refs_are_rejected() {
+        let route = selection_route(vec![ref_with_endpoint("be-a", 8080)]);
+        let lb = test_lb();
+        let addr = "127.0.0.1:8080".parse().unwrap();
+
+        // In the refs, at a listed address: accepted.
+        let target = Target::Endpoint {
+            backend: "be-a".into(),
+            addr,
+        };
+        assert!(validate_target(&target, &route, &lb).is_some());
+
+        // A backend the route never named.
+        let target = Target::Endpoint {
+            backend: "elsewhere".into(),
+            addr,
+        };
+        assert!(validate_target(&target, &route, &lb).is_none());
+
+        // The right backend, an address it does not list.
+        let target = Target::Endpoint {
+            backend: "be-a".into(),
+            addr: "127.0.0.1:9999".parse().unwrap(),
+        };
+        assert!(validate_target(&target, &route, &lb).is_none());
+
+        // A ref whose backend never registered.
+        let route = selection_route(vec![backend_ref("ghost", false, 1)]);
+        let target = Target::Endpoint {
+            backend: "ghost".into(),
+            addr,
+        };
+        assert!(validate_target(&target, &route, &lb).is_none());
+
+        // Dialable backends do not exist yet.
+        let route = selection_route(vec![ref_with_endpoint("be-a", 8080)]);
+        let target = Target::Backend {
+            name: "be-a".into(),
+        };
+        assert!(validate_target(&target, &route, &lb).is_none());
+    }
+
+    #[test]
+    fn held_mints_original_only_when_something_remains() {
+        use crate::extension::Held;
+        assert!(Held::Buffered(b"body").forward().is_some());
+        assert!(Held::Untouched.forward().is_some());
+        assert!(Held::Nothing.forward().is_none());
+    }
 
     fn backend_ref(name: &str, resolved: bool, weight: u32) -> ActiveBackendRef {
         let key = gateway_state::BackendKey::new(name);

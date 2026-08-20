@@ -4,7 +4,7 @@
 //! `tcp_forward.rs`.
 
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -17,8 +17,8 @@ use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, 
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
-    Action, BodyMode, Cx, Error as ExtensionError, Extension, ExtensionBuilder, LocalResponse,
-    Registry, ResponseEnd, async_trait,
+    Action, BodyMode, BodySource, Cx, Error as ExtensionError, Extension, ExtensionBuilder, Held,
+    LocalResponse, Registry, ResponseEnd, Selected, Selection, Target, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
@@ -1268,12 +1268,12 @@ impl Extension for Stamp {
     async fn on_request_start(
         &mut self,
         _head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         Ok(Action::Continue)
     }
 
-    fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx<'_>) {
+    fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
         head.headers
             .insert("x-stamped", "by-extension".parse().unwrap());
     }
@@ -1405,7 +1405,7 @@ impl Extension for BodyProbe {
     async fn on_request_start(
         &mut self,
         _head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         Ok(Action::Continue)
     }
@@ -1414,7 +1414,7 @@ impl Extension for BodyProbe {
         &mut self,
         chunk: &[u8],
         end_of_stream: bool,
-        cx: &mut Cx<'_>,
+        cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         let mut seen = self.seen.lock().unwrap();
         seen.push(SeenChunk {
@@ -1448,7 +1448,7 @@ impl Extension for NoBody {
     async fn on_request_start(
         &mut self,
         _head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         Ok(Action::Continue)
     }
@@ -1457,7 +1457,7 @@ impl Extension for NoBody {
         &mut self,
         _chunk: &[u8],
         _end_of_stream: bool,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         panic!("body hook ran for a member that declared no body access");
     }
@@ -1786,7 +1786,7 @@ impl Extension for ResponseProbe {
     async fn on_request_start(
         &mut self,
         _head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         if self.short_circuit {
             return Ok(Action::Respond(LocalResponse {
@@ -1798,7 +1798,7 @@ impl Extension for ResponseProbe {
         Ok(Action::Continue)
     }
 
-    fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx<'_>) {
+    fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx) {
         self.seen
             .lock()
             .unwrap()
@@ -1806,7 +1806,7 @@ impl Extension for ResponseProbe {
             .push((chunk.len(), end_of_stream));
     }
 
-    fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx<'_>) {
+    fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
         self.seen
             .lock()
             .unwrap()
@@ -1948,18 +1948,18 @@ impl Extension for RequestOnly {
     async fn on_request_start(
         &mut self,
         head: &mut http::request::Parts,
-        _cx: &mut Cx<'_>,
+        _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
         head.headers
             .insert("x-touched", "request-only".parse().unwrap());
         Ok(Action::Continue)
     }
 
-    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx<'_>) {
+    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx) {
         panic!("response tap ran for a member that declared no response access");
     }
 
-    fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx<'_>) {
+    fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx) {
         panic!("terminal ran for a member that never asked for it");
     }
 }
@@ -1992,6 +1992,430 @@ async fn a_request_only_member_never_sees_the_response() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, Bytes::from_static(b"GET /ok"));
+
+    drop(stop);
+    let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+}
+
+// =================== selection ===================
+
+/// Echo that reports which upstream served: `x-port: <its port>`.
+async fn spawn_port_echo() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_srv = Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let hits = Arc::clone(&hits_srv);
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(http_body_util::Collected::to_bytes)
+                            .unwrap_or_default();
+                        let resp = http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("x-port", port.to_string())
+                            .body(Full::new(body))
+                            .unwrap();
+                        Ok::<_, Infallible>(resp)
+                    }
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    (port, hits)
+}
+
+/// What the picker's `Held` argument showed at selection time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldSeen {
+    NotCalled,
+    Buffered(usize),
+    Empty,
+}
+
+/// What the test picker does once the body has settled.
+enum PickPlan {
+    /// Pick this endpoint and forward this body source.
+    Target(SocketAddr, PickBody),
+    Respond,
+    Fail,
+}
+
+enum PickBody {
+    Forward,
+    Replace(&'static [u8]),
+    Supply(&'static [u8]),
+}
+
+struct PickerBuilder {
+    mode: BodyMode,
+    plan: Arc<PickPlan>,
+    backend: &'static str,
+    buffer_at_select: Arc<StdMutex<HeldSeen>>,
+}
+
+struct Picker {
+    plan: Arc<PickPlan>,
+    backend: &'static str,
+    buffer_at_select: Arc<StdMutex<HeldSeen>>,
+}
+
+impl ExtensionBuilder for PickerBuilder {
+    fn request_body(&self) -> BodyMode {
+        self.mode
+    }
+
+    fn selects_targets(&self) -> bool {
+        true
+    }
+
+    fn build(&self) -> Box<dyn Extension> {
+        Box::new(Picker {
+            plan: Arc::clone(&self.plan),
+            backend: self.backend,
+            buffer_at_select: Arc::clone(&self.buffer_at_select),
+        })
+    }
+}
+
+#[async_trait]
+impl Extension for Picker {
+    async fn on_request_start(
+        &mut self,
+        _head: &mut http::request::Parts,
+        _cx: &mut Cx,
+    ) -> Result<Action, ExtensionError> {
+        Ok(Action::Continue)
+    }
+
+    async fn select(&mut self, held: Held<'_>, _cx: &mut Cx) -> Result<Selected, ExtensionError> {
+        *self.buffer_at_select.lock().unwrap() = match &held {
+            Held::Buffered(bytes) => HeldSeen::Buffered(bytes.len()),
+            Held::Untouched | Held::Nothing => HeldSeen::Empty,
+        };
+        match &*self.plan {
+            PickPlan::Target(addr, body) => {
+                let body = match body {
+                    PickBody::Forward => held.forward().ok_or("nothing held to forward")?,
+                    PickBody::Replace(bytes) => BodySource::Replace(Bytes::from_static(bytes)),
+                    PickBody::Supply(bytes) => {
+                        let frames: Vec<Result<http_body::Frame<Bytes>, ExtensionError>> =
+                            vec![Ok(http_body::Frame::data(Bytes::from_static(bytes)))];
+                        BodySource::Stream(
+                            http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed(),
+                            Some(bytes.len() as u64),
+                        )
+                    }
+                };
+                Ok(Selected::Target(Selection {
+                    target: Target::Endpoint {
+                        backend: self.backend.to_owned(),
+                        addr: *addr,
+                    },
+                    body,
+                }))
+            }
+            PickPlan::Respond => Ok(Selected::Respond(LocalResponse {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: http::HeaderMap::new(),
+                body: Bytes::from_static(b"shed"),
+            })),
+            PickPlan::Fail => Err("picker backend unreachable".into()),
+        }
+    }
+}
+
+/// Two-backend route with a picker attached by ref.
+fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
+    let mut route = http_route("picked", "/", "be-a");
+    route.backend_refs.push(BackendRef {
+        name: "be-b".into(),
+        weight: 1,
+    });
+    route.filters.push(HttpFilter::ExtensionRef {
+        name: "picker".into(),
+    });
+    GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![route])],
+        }],
+        backends: vec![static_backend("be-a", be_a), static_backend("be-b", be_b)],
+        secrets: vec![],
+    }
+}
+
+struct PickedRoute {
+    bind_port: u16,
+    buffer_at_select: Arc<StdMutex<HeldSeen>>,
+    _gw: tokio::task::JoinHandle<()>,
+    _stop: drain::Signal,
+}
+
+async fn spawn_picked_route(be_a: u16, be_b: u16, mode: BodyMode, plan: PickPlan) -> PickedRoute {
+    let bind_port = free_port().await;
+    let cfg = selection_config(bind_port, be_a, be_b);
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let buffer_at_select = Arc::new(StdMutex::new(HeldSeen::NotCalled));
+    let mut registry = Registry::new();
+    registry
+        .register(
+            "picker",
+            Arc::new(PickerBuilder {
+                mode,
+                plan: Arc::new(plan),
+                backend: "be-b",
+                buffer_at_select: Arc::clone(&buffer_at_select),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move {
+        gw.run(watch).await.unwrap();
+    });
+    wait_for_listening(bind_port).await;
+    PickedRoute {
+        bind_port,
+        buffer_at_select,
+        _gw: gw_handle,
+        _stop: stop,
+    }
+}
+
+fn ep(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+#[tokio::test]
+async fn the_picker_beats_the_weighted_pick() {
+    let (be_a, hits_a) = spawn_port_echo().await;
+    let (be_b, hits_b) = spawn_port_echo().await;
+    // Headers-only picker: always be-b. Weights alone would split.
+    let picked = spawn_picked_route(
+        be_a,
+        be_b,
+        BodyMode::None,
+        PickPlan::Target(ep(be_b), PickBody::Forward),
+    )
+    .await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    for _ in 0..16 {
+        let resp = client
+            .get(
+                format!("http://127.0.0.1:{}/", picked.bind_port)
+                    .parse()
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("x-port").unwrap(), &be_b.to_string());
+    }
+    assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(hits_b.load(std::sync::atomic::Ordering::SeqCst), 16);
+    // Headers-only: the picker held nothing when selection ran.
+    assert_eq!(*picked.buffer_at_select.lock().unwrap(), HeldSeen::Empty);
+}
+
+#[tokio::test]
+async fn a_buffering_picker_can_replace_the_body() {
+    let upstream = spawn_framing_echo().await;
+    let picked = spawn_picked_route(
+        upstream,
+        upstream,
+        BodyMode::Buffer,
+        PickPlan::Target(ep(upstream), PickBody::Replace(b"rewritten payload")),
+    )
+    .await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{}/", picked.bind_port))
+        .body(Full::new(Bytes::from_static(b"original")))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The replacement arrived, framed by its own length — not the
+    // client's stale 8.
+    assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "17");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"rewritten payload"));
+    // The whole original reached the picker through `Held`.
+    assert_eq!(
+        *picked.buffer_at_select.lock().unwrap(),
+        HeldSeen::Buffered(8)
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_picker_supplies_the_forwarded_body() {
+    let upstream = spawn_framing_echo().await;
+    let picked = spawn_picked_route(
+        upstream,
+        upstream,
+        BodyMode::Stream,
+        PickPlan::Target(ep(upstream), PickBody::Supply(b"from the picker")),
+    )
+    .await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://127.0.0.1:{}/", picked.bind_port))
+        .body(Full::new(Bytes::from_static(b"consumed by the picker")))
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-recv-content-length").unwrap(), "15");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, Bytes::from_static(b"from the picker"));
+    // Streaming rule: nothing was retained for the picker.
+    assert_eq!(*picked.buffer_at_select.lock().unwrap(), HeldSeen::Empty);
+}
+
+#[tokio::test]
+async fn a_picker_that_responds_reaches_the_client() {
+    let (be, hits) = spawn_port_echo().await;
+    let picked = spawn_picked_route(be, be, BodyMode::None, PickPlan::Respond).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(
+            format!("http://127.0.0.1:{}/", picked.bind_port)
+                .parse()
+                .unwrap(),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_failing_picker_fails_the_request_without_falling_back() {
+    let (be, hits) = spawn_port_echo().await;
+    let picked = spawn_picked_route(be, be, BodyMode::None, PickPlan::Fail).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(
+            format!("http://127.0.0.1:{}/", picked.bind_port)
+                .parse()
+                .unwrap(),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // The load balancer did not quietly route it anywhere.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_target_outside_the_rules_refs_fails_the_request() {
+    let (be, hits) = spawn_port_echo().await;
+    let (outside, outside_hits) = spawn_port_echo().await;
+    // The picker names an address the route's backends do not list.
+    let picked = spawn_picked_route(
+        be,
+        be,
+        BodyMode::None,
+        PickPlan::Target(ep(outside), PickBody::Forward),
+    )
+    .await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(
+            format!("http://127.0.0.1:{}/", picked.bind_port)
+                .parse()
+                .unwrap(),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(outside_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn two_selectors_on_one_rule_fail_the_request() {
+    let (be, hits) = spawn_port_echo().await;
+    let bind_port = free_port().await;
+
+    let mut route = http_route("doubled", "/", "be-a");
+    route.filters.push(HttpFilter::ExtensionRef {
+        name: "picker-one".into(),
+    });
+    route.filters.push(HttpFilter::ExtensionRef {
+        name: "picker-two".into(),
+    });
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![route])],
+        }],
+        backends: vec![static_backend("be-a", be)],
+        secrets: vec![],
+    };
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let mut registry = Registry::new();
+    for name in ["picker-one", "picker-two"] {
+        registry
+            .register(
+                name,
+                Arc::new(PickerBuilder {
+                    mode: BodyMode::None,
+                    plan: Arc::new(PickPlan::Target(ep(be), PickBody::Forward)),
+                    backend: "be-a",
+                    buffer_at_select: Arc::new(StdMutex::new(HeldSeen::NotCalled)),
+                }),
+            )
+            .unwrap();
+    }
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     drop(stop);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;

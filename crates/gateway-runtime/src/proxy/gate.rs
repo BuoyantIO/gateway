@@ -32,10 +32,27 @@ pub(super) const REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// the client read instead of accumulating frames here.
 pub(super) const BODY_PIPE_CAPACITY: usize = 4;
 
-/// How the buffer tier ended.
+/// What the drain does with the bytes it reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DrainMode {
+    /// Accumulate and forward what was drained — the buffer tier on
+    /// rules without a selector.
+    ForwardBuffered,
+    /// Accumulate and park in [`Cx::request_buffer`]; the selection
+    /// phase decides what to forward.
+    RetainForSelection,
+    /// Deliver chunks to the hooks and retain nothing — a streaming
+    /// rule whose selector supplies the forwarded body itself.
+    DeliverOnly,
+}
+
+/// How a drain ended.
 pub(super) enum GateOutcome {
     /// Body fully drained; forward this upstream.
+    /// (`DrainMode::ForwardBuffered` only.)
     Forward(UpstreamBody),
+    /// Body fully drained and delivered; selection decides next.
+    Drained,
     Halt(Halt),
 }
 
@@ -71,20 +88,32 @@ pub(super) async fn run<B>(
     members: &mut [Member],
     parts: &http::request::Parts,
     mut body: B,
-    cx: &mut Cx<'_>,
+    cx: &mut Cx,
+    mode: DrainMode,
 ) -> GateOutcome
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: Into<BoxError>,
 {
+    // Retaining modes are memory-bounded; deliver-only retains
+    // nothing and gets the abuse bound instead.
+    let cap = match mode {
+        DrainMode::ForwardBuffered | DrainMode::RetainForSelection => REQUEST_BODY_MAX_BYTES,
+        DrainMode::DeliverOnly => STREAM_BODY_MAX_BYTES,
+    };
+
     // A declared length past the cap needs no reading to reject.
-    if content_length(parts).is_some_and(|len| len > REQUEST_BODY_MAX_BYTES) {
+    if content_length(parts).is_some_and(|len| len > cap) {
         return GateOutcome::Halt(Halt::TooLarge);
     }
 
-    // `Some` from the first hook call on, empty body included — the
-    // accessor's contract is "Some exactly when the drain ran".
-    cx.append_request_buffer(&[]);
+    let retain = mode != DrainMode::DeliverOnly;
+    if retain {
+        // `Some` from the first hook call on, empty body included —
+        // the accessor's contract is "Some exactly when a buffering
+        // drain ran".
+        cx.append_request_buffer(&[]);
+    }
 
     let mut total: u64 = 0;
     loop {
@@ -97,7 +126,7 @@ where
             // here): the terminal call carries an empty chunk.
             None => {
                 return match deliver(members, &[], true, cx).await {
-                    Delivery::Continue => forward_buffered(cx),
+                    Delivery::Continue => drained(mode, cx),
                     Delivery::Respond(resp) => GateOutcome::Halt(Halt::Respond(resp)),
                     Delivery::Failed => GateOutcome::Halt(Halt::Failed),
                 };
@@ -114,10 +143,12 @@ where
             continue;
         };
         total += data.len() as u64;
-        if total > REQUEST_BODY_MAX_BYTES {
+        if total > cap {
             return GateOutcome::Halt(Halt::TooLarge);
         }
-        cx.append_request_buffer(&data);
+        if retain {
+            cx.append_request_buffer(&data);
+        }
         // A content-length body ends here, right after its last data
         // frame; its terminal `None` is never polled. Chunked bodies
         // stay `false` and end at the `None` arm above — between the
@@ -129,8 +160,17 @@ where
             Delivery::Failed => return GateOutcome::Halt(Halt::Failed),
         }
         if end_of_stream {
-            return forward_buffered(cx);
+            return drained(mode, cx);
         }
+    }
+}
+
+/// A drain that ran to the end: materialize the forwarded body, or
+/// hand control back for selection with the buffer parked in `cx`.
+fn drained(mode: DrainMode, cx: &mut Cx) -> GateOutcome {
+    match mode {
+        DrainMode::ForwardBuffered => forward_buffered(cx),
+        DrainMode::RetainForSelection | DrainMode::DeliverOnly => GateOutcome::Drained,
     }
 }
 
@@ -142,7 +182,7 @@ pub(super) async fn pump<B>(
     members: &mut [Member],
     mut body: B,
     tx: mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
-    cx: &mut Cx<'_>,
+    cx: &mut Cx,
 ) -> PumpOutcome
 where
     B: Body<Data = Bytes> + Unpin,
@@ -213,7 +253,7 @@ async fn deliver(
     members: &mut [Member],
     chunk: &[u8],
     end_of_stream: bool,
-    cx: &mut Cx<'_>,
+    cx: &mut Cx,
 ) -> Delivery {
     for member in members
         .iter_mut()
@@ -245,7 +285,7 @@ async fn abort(
 
 /// The drained body, re-materialized for the upstream. `Full`'s exact
 /// size hint gives hyper the content length.
-fn forward_buffered(cx: &mut Cx<'_>) -> GateOutcome {
+fn forward_buffered(cx: &mut Cx) -> GateOutcome {
     let buffered = cx.take_request_buffer().unwrap_or_default();
     GateOutcome::Forward(UpstreamBody::Full(Full::new(buffered.freeze())))
 }
@@ -286,7 +326,7 @@ mod tests {
         async fn on_request_start(
             &mut self,
             _head: &mut http::request::Parts,
-            _cx: &mut Cx<'_>,
+            _cx: &mut Cx,
         ) -> Result<Action, Error> {
             Ok(Action::Continue)
         }
@@ -295,7 +335,7 @@ mod tests {
             &mut self,
             chunk: &[u8],
             end_of_stream: bool,
-            cx: &mut Cx<'_>,
+            cx: &mut Cx,
         ) -> Result<Action, Error> {
             let mut rec = self.0.lock().unwrap();
             rec.calls.push((chunk.to_vec(), end_of_stream));
@@ -357,7 +397,14 @@ mod tests {
         let (m, rec) = member(BodyMode::Buffer, None);
         let mut members = [m];
         let mut cx = Cx::new();
-        let out = run(&mut members, &parts(), chunked(&[]), &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts(),
+            chunked(&[]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
         assert!(matches!(out, GateOutcome::Forward(_)));
 
         let rec = rec.lock().unwrap();
@@ -371,7 +418,14 @@ mod tests {
         let (m, rec) = member(BodyMode::Buffer, None);
         let mut members = [m];
         let mut cx = Cx::new();
-        let out = run(&mut members, &parts(), chunked(&[b"hel", b"lo"]), &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts(),
+            chunked(&[b"hel", b"lo"]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
 
         let GateOutcome::Forward(UpstreamBody::Full(full)) = out else {
             panic!("expected a buffered forward");
@@ -401,7 +455,14 @@ mod tests {
         let mut members = [m];
         let mut cx = Cx::new();
         let body = Full::new(Bytes::from_static(b"payload"));
-        let out = run(&mut members, &parts_with_len(7), body, &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts_with_len(7),
+            body,
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
         assert!(matches!(out, GateOutcome::Forward(_)));
 
         let rec = rec.lock().unwrap();
@@ -419,6 +480,7 @@ mod tests {
             &parts_with_len(REQUEST_BODY_MAX_BYTES + 1),
             chunked(&[b"never read"]),
             &mut cx,
+            DrainMode::ForwardBuffered,
         )
         .await;
         assert!(matches!(out, GateOutcome::Halt(Halt::TooLarge)));
@@ -429,7 +491,14 @@ mod tests {
         let mut members = [m];
         let mut cx = Cx::new();
         let big = vec![0u8; usize::try_from(REQUEST_BODY_MAX_BYTES).unwrap() + 1];
-        let out = run(&mut members, &parts(), chunked(&[&big]), &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts(),
+            chunked(&[&big]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
         assert!(matches!(out, GateOutcome::Halt(Halt::TooLarge)));
     }
 
@@ -439,7 +508,14 @@ mod tests {
         let mut members = [m];
         let mut cx = Cx::new();
         let body = StreamBody::new(stream::pending::<Result<Frame<Bytes>, BoxError>>());
-        let out = run(&mut members, &parts(), body, &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts(),
+            body,
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
         assert!(matches!(out, GateOutcome::Halt(Halt::TimedOut)));
     }
 
@@ -448,7 +524,14 @@ mod tests {
         let (m, rec) = member(BodyMode::Buffer, Some(0));
         let mut members = [m];
         let mut cx = Cx::new();
-        let out = run(&mut members, &parts(), chunked(&[b"a", b"b"]), &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts(),
+            chunked(&[b"a", b"b"]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
         let GateOutcome::Halt(Halt::Respond(resp)) = out else {
             panic!("expected the extension's response");
         };
@@ -463,7 +546,14 @@ mod tests {
         let (none, rec_n) = member(BodyMode::None, None);
         let mut members = [buffered, streaming, none];
         let mut cx = Cx::new();
-        let out = run(&mut members, &parts(), chunked(&[b"x"]), &mut cx).await;
+        let out = run(
+            &mut members,
+            &parts(),
+            chunked(&[b"x"]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
         assert!(matches!(out, GateOutcome::Forward(_)));
         assert_eq!(rec_b.lock().unwrap().calls.len(), 2);
         assert_eq!(rec_s.lock().unwrap().calls.len(), 2);
