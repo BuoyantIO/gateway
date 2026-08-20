@@ -1,0 +1,195 @@
+<svg viewBox="0 0 1160 1420" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif">
+  <!-- Section names match request-lifecycle.md. -->
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#52514e"/>
+    </marker>
+    <marker id="arr-v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4a3aa7"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#d03b3b"/>
+    </marker>
+  </defs>
+
+  <rect width="1160" height="1420" fill="#fcfcfb"/>
+
+  <text x="40" y="44" font-size="20" font-weight="650" fill="#0b0b0b">Request lifecycle</text>
+
+  <!-- lanes -->
+  <rect x="150" y="90" width="560" height="1200" rx="10" fill="#52514e" fill-opacity="0.035"/>
+  <rect x="770" y="90" width="350" height="1200" rx="10" fill="#4a3aa7" fill-opacity="0.05"/>
+  <text x="430" y="114" font-size="13" font-weight="600" fill="#52514e" text-anchor="middle">host</text>
+  <text x="945" y="114" font-size="13" font-weight="600" fill="#4a3aa7" text-anchor="middle">extension code</text>
+
+  <!-- endings gutter -->
+  <line x1="90" y1="150" x2="90" y2="1310" stroke="#d03b3b" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#arr-red)"/>
+
+  <!-- host spine -->
+  <text x="430" y="146" font-size="12.5" fill="#52514e" text-anchor="middle">client</text>
+
+  <g font-size="14" fill="#0b0b0b">
+    <rect x="290" y="156" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="177" text-anchor="middle" font-weight="600">Connection</text>
+    <text x="430" y="195" text-anchor="middle" font-size="11" fill="#52514e">TLS if configured, H1 or H2 by preface</text>
+
+    <rect x="290" y="230" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="251" text-anchor="middle" font-weight="600">Route resolution</text>
+    <text x="430" y="269" text-anchor="middle" font-size="11" fill="#52514e">listener and route match, weighted backend pick</text>
+
+    <rect x="290" y="304" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="325" text-anchor="middle" font-weight="600">Extension instances</text>
+    <text x="430" y="343" text-anchor="middle" font-size="11" fill="#52514e">one per filter, declarations copied</text>
+
+    <rect x="290" y="378" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="399" text-anchor="middle" font-weight="600">Request pass</text>
+    <text x="430" y="417" text-anchor="middle" font-size="11" fill="#52514e">headers mutable, any instance may respond</text>
+
+    <rect x="270" y="452" width="320" height="54" rx="8" fill="#ffffff" stroke="#0b0b0b" stroke-width="2"/>
+    <text x="430" y="475" text-anchor="middle" font-weight="650">Body decision</text>
+    <text x="430" y="493" text-anchor="middle" font-size="11" fill="#52514e">strictest declared mode, selector or not</text>
+  </g>
+
+  <!-- mode chips -->
+  <g font-size="11.5">
+    <rect x="180" y="530" width="115" height="66" rx="6" fill="#2a78d6" fill-opacity="0.08" stroke="#2a78d6" stroke-width="1.4"/>
+    <text x="188" y="549" font-weight="650" fill="#0b0b0b">None</text>
+    <text x="188" y="566" fill="#52514e" font-size="10.5">passthrough,</text>
+    <text x="188" y="580" fill="#52514e" font-size="10.5">no frame read</text>
+
+    <rect x="305" y="530" width="115" height="66" rx="6" fill="#eb6834" fill-opacity="0.08" stroke="#eb6834" stroke-width="1.4"/>
+    <text x="313" y="549" font-weight="650" fill="#0b0b0b">Buffer</text>
+    <text x="313" y="566" fill="#52514e" font-size="10.5">drained and held,</text>
+    <text x="313" y="580" fill="#52514e" font-size="10.5">then dispatch</text>
+
+    <rect x="430" y="530" width="115" height="66" rx="6" fill="#1baf7a" fill-opacity="0.08" stroke="#1baf7a" stroke-width="1.4"/>
+    <text x="438" y="549" font-weight="650" fill="#0b0b0b">Stream</text>
+    <text x="438" y="566" fill="#52514e" font-size="10.5">dispatch first,</text>
+    <text x="438" y="580" fill="#52514e" font-size="10.5">frames forwarded</text>
+
+    <rect x="555" y="530" width="125" height="66" rx="6" fill="#eda100" fill-opacity="0.09" stroke="#eda100" stroke-width="1.4"/>
+    <text x="563" y="549" font-weight="650" fill="#0b0b0b">selector</text>
+    <text x="563" y="566" fill="#52514e" font-size="10.5">body handled first,</text>
+    <text x="563" y="580" fill="#52514e" font-size="10.5">dispatch waits</text>
+  </g>
+
+  <g stroke="#a8a7a1" stroke-width="1.3" fill="none">
+    <path d="M 430 506 L 430 516 L 237 516 L 237 526" marker-end="url(#arr)"/>
+    <path d="M 430 506 L 430 516 L 362 516 L 362 526" marker-end="url(#arr)"/>
+    <path d="M 430 506 L 430 516 L 487 516 L 487 526" marker-end="url(#arr)"/>
+    <path d="M 430 506 L 430 516 L 617 516 L 617 526" marker-end="url(#arr)"/>
+  </g>
+
+  <g font-size="14" fill="#0b0b0b">
+    <rect x="290" y="626" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="647" text-anchor="middle" font-weight="600">Body pass</text>
+    <text x="430" y="665" text-anchor="middle" font-size="11" fill="#52514e">per chunk, size cap and idle bound</text>
+
+    <rect x="290" y="712" width="280" height="50" rx="6" fill="#ffffff" stroke="#eda100" stroke-width="1.8"/>
+    <text x="430" y="733" text-anchor="middle" font-weight="600">Selection</text>
+    <text x="430" y="751" text-anchor="middle" font-size="11" fill="#52514e">selector rules only, validated against the refs</text>
+
+    <rect x="270" y="798" width="320" height="54" rx="8" fill="#ffffff" stroke="#0b0b0b" stroke-width="2"/>
+    <text x="430" y="821" text-anchor="middle" font-weight="650">Framing and dispatch</text>
+    <text x="430" y="839" text-anchor="middle" font-size="11" fill="#52514e">content-length must match the body</text>
+
+    <rect x="290" y="884" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="905" text-anchor="middle" font-weight="600">Upstream answer</text>
+    <text x="430" y="923" text-anchor="middle" font-size="11" fill="#52514e">dial recorded either way</text>
+
+    <rect x="290" y="958" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="979" text-anchor="middle" font-weight="600">Response pass</text>
+    <text x="430" y="997" text-anchor="middle" font-size="11" fill="#52514e">headers not yet sent to the client</text>
+
+    <rect x="290" y="1032" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="1053" text-anchor="middle" font-weight="600">Response streaming</text>
+    <text x="430" y="1071" text-anchor="middle" font-size="11" fill="#52514e">instances move into the body</text>
+
+    <rect x="290" y="1106" width="280" height="50" rx="6" fill="#ffffff" stroke="#52514e" stroke-width="1.5"/>
+    <text x="430" y="1127" text-anchor="middle" font-weight="600">End of request</text>
+    <text x="430" y="1145" text-anchor="middle" font-size="11" fill="#52514e">disconnect fires from Drop</text>
+  </g>
+
+  <g stroke="#52514e" stroke-width="1.5" marker-end="url(#arr)" fill="none">
+    <line x1="430" y1="152" x2="430" y2="152"/>
+    <line x1="430" y1="206" x2="430" y2="226"/>
+    <line x1="430" y1="280" x2="430" y2="300"/>
+    <line x1="430" y1="354" x2="430" y2="374"/>
+    <line x1="430" y1="428" x2="430" y2="448"/>
+    <line x1="430" y1="596" x2="430" y2="622"/>
+    <line x1="430" y1="676" x2="430" y2="708"/>
+    <line x1="430" y1="762" x2="430" y2="794"/>
+    <line x1="430" y1="852" x2="430" y2="880"/>
+    <line x1="430" y1="934" x2="430" y2="954"/>
+    <line x1="430" y1="1008" x2="430" y2="1028"/>
+    <line x1="430" y1="1082" x2="430" y2="1102"/>
+  </g>
+  <g stroke="#a8a7a1" stroke-width="1.3" fill="none">
+    <path d="M 237 596 L 237 611 L 430 611" />
+    <path d="M 362 596 L 362 611" />
+    <path d="M 487 596 L 487 611 L 430 611" />
+    <path d="M 617 596 L 617 611 L 430 611" />
+  </g>
+
+  <!-- hooks -->
+  <g font-size="12" fill="#0b0b0b">
+    <rect x="800" y="378" width="290" height="50" rx="6" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+    <text x="812" y="399" font-weight="650" fill="#4a3aa7">on_request_start</text>
+    <text x="812" y="417" font-size="10.5" fill="#52514e">async, per instance in filter order</text>
+
+    <rect x="800" y="626" width="290" height="50" rx="6" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+    <text x="812" y="647" font-weight="650" fill="#4a3aa7">on_request_body</text>
+    <text x="812" y="665" font-size="10.5" fill="#52514e">async, per chunk, chunks read-only</text>
+
+    <rect x="800" y="712" width="290" height="50" rx="6" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+    <text x="812" y="733" font-weight="650" fill="#4a3aa7">select</text>
+    <text x="812" y="751" font-size="10.5" fill="#52514e">async, once, on the declared selector</text>
+
+    <rect x="800" y="958" width="290" height="50" rx="6" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+    <text x="812" y="979" font-weight="650" fill="#4a3aa7">on_response_start</text>
+    <text x="812" y="997" font-size="10.5" fill="#52514e">sync, reverse filter order</text>
+
+    <rect x="800" y="1032" width="290" height="50" rx="6" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+    <text x="812" y="1053" font-weight="650" fill="#4a3aa7">on_response_body</text>
+    <text x="812" y="1071" font-size="10.5" fill="#52514e">sync, per frame as the client receives it</text>
+
+    <rect x="800" y="1106" width="290" height="50" rx="6" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+    <text x="812" y="1127" font-weight="650" fill="#4a3aa7">on_response_end</text>
+    <text x="812" y="1145" font-size="10.5" fill="#52514e">sync, exactly once, whatever the ending</text>
+  </g>
+
+  <g stroke="#4a3aa7" stroke-width="1.4" fill="none">
+    <line x1="570" y1="403" x2="796" y2="403" marker-end="url(#arr-v)"/>
+    <line x1="570" y1="651" x2="796" y2="651" marker-end="url(#arr-v)"/>
+    <line x1="570" y1="737" x2="796" y2="737" marker-end="url(#arr-v)"/>
+    <line x1="570" y1="983" x2="796" y2="983" marker-end="url(#arr-v)"/>
+    <line x1="570" y1="1057" x2="796" y2="1057" marker-end="url(#arr-v)"/>
+    <line x1="570" y1="1131" x2="796" y2="1131" marker-end="url(#arr-v)"/>
+  </g>
+
+  <!-- endings -->
+  <g stroke="#d03b3b" stroke-width="1.1" stroke-dasharray="4 3" marker-end="url(#arr-red)" fill="none">
+    <line x1="290" y1="255" x2="96" y2="255"/>
+    <line x1="290" y1="329" x2="96" y2="329"/>
+    <line x1="290" y1="403" x2="96" y2="403"/>
+    <line x1="290" y1="651" x2="96" y2="651"/>
+    <line x1="290" y1="737" x2="96" y2="737"/>
+    <line x1="290" y1="823" x2="96" y2="823"/>
+  </g>
+  <g font-size="10.5" fill="#d03b3b">
+    <text x="102" y="249">no route 404, unresolved ref 500</text>
+    <text x="102" y="323">invalid config 500</text>
+    <text x="102" y="397">instance responds, or fails 500</text>
+    <text x="102" y="645">over cap 413, stalled 408</text>
+    <text x="102" y="731">invalid target 500</text>
+    <text x="102" y="817">no endpoint 503, dial failed 502</text>
+  </g>
+
+  <line x1="430" y1="1156" x2="430" y2="1182" stroke="#52514e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="430" y="1202" font-size="12.5" fill="#52514e" text-anchor="middle">client</text>
+
+  <rect x="40" y="1316" width="1080" height="66" rx="8" fill="#ffffff" stroke="#0b0b0b" stroke-width="2"/>
+  <text x="60" y="1344" font-size="14" font-weight="650" fill="#0b0b0b">on_response_end</text>
+  <text x="60" y="1364" font-size="12" fill="#52514e">once per request, whatever the ending: clean finish, short-circuit, or disconnect. one metric reason per request</text>
+</svg>
