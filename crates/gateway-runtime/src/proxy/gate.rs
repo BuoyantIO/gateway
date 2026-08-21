@@ -66,8 +66,10 @@ pub(super) enum PumpOutcome {
 
 /// A body phase that ends the request instead of forwarding it. The
 /// caller maps each variant to its status and metrics reason.
+/// The response is boxed: `Halt` travels as a `Result` error, and a
+/// large `Err` variant fails `clippy::result_large_err`.
 pub(super) enum Halt {
-    Respond(LocalResponse),
+    Respond(Box<LocalResponse>),
     Failed,
     TooLarge,
     TimedOut,
@@ -127,7 +129,7 @@ where
             None => {
                 return match deliver(members, &[], true, cx).await {
                     Delivery::Continue => drained(mode, cx),
-                    Delivery::Respond(resp) => GateOutcome::Halt(Halt::Respond(resp)),
+                    Delivery::Respond(resp) => GateOutcome::Halt(Halt::Respond(Box::new(resp))),
                     Delivery::Failed => GateOutcome::Halt(Halt::Failed),
                 };
             }
@@ -156,7 +158,7 @@ where
         let end_of_stream = body.is_end_stream();
         match deliver(members, &data, end_of_stream, cx).await {
             Delivery::Continue => {}
-            Delivery::Respond(resp) => return GateOutcome::Halt(Halt::Respond(resp)),
+            Delivery::Respond(resp) => return GateOutcome::Halt(Halt::Respond(Box::new(resp))),
             Delivery::Failed => return GateOutcome::Halt(Halt::Failed),
         }
         if end_of_stream {
@@ -199,7 +201,7 @@ where
                     // Dropping `tx` half-closes the upstream body.
                     Delivery::Continue => PumpOutcome::Done,
                     Delivery::Respond(resp) => {
-                        abort(&tx, "extension responded", Halt::Respond(resp)).await
+                        abort(&tx, "extension responded", Halt::Respond(Box::new(resp))).await
                     }
                     Delivery::Failed => abort(&tx, "request body hook failed", Halt::Failed).await,
                 };
@@ -231,7 +233,7 @@ where
         match deliver(members, &data, end_of_stream, cx).await {
             Delivery::Continue => {}
             Delivery::Respond(resp) => {
-                return abort(&tx, "extension responded", Halt::Respond(resp)).await;
+                return abort(&tx, "extension responded", Halt::Respond(Box::new(resp))).await;
             }
             Delivery::Failed => {
                 return abort(&tx, "request body hook failed", Halt::Failed).await;

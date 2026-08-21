@@ -670,7 +670,7 @@ fn halt_response(
     let (resp, reason) = match halt {
         // An extension answering mid-body is the route working as
         // configured.
-        gate::Halt::Respond(resp) => (local_response(resp), Reason::Ok),
+        gate::Halt::Respond(resp) => (local_response(*resp), Reason::Ok),
         gate::Halt::Failed => (
             synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
             Reason::Internal,
