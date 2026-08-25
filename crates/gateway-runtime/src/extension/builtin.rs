@@ -233,14 +233,6 @@ struct ResponseHeaderModifier {
 
 #[async_trait]
 impl Extension for ResponseHeaderModifier {
-    async fn on_request_start(
-        &mut self,
-        _head: &mut http::request::Parts,
-        _cx: &mut Cx,
-    ) -> Result<Action, Error> {
-        Ok(Action::Continue)
-    }
-
     fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
         self.ops.apply(&mut head.headers);
     }
@@ -568,16 +560,9 @@ mod tests {
             }
         }
 
+        // Every hook defaulted: the empty impl is valid.
         #[async_trait::async_trait]
-        impl Extension for Noop {
-            async fn on_request_start(
-                &mut self,
-                _head: &mut http::request::Parts,
-                _cx: &mut Cx,
-            ) -> Result<Action, Error> {
-                Ok(Action::Continue)
-            }
-        }
+        impl Extension for Noop {}
 
         let mut registry = Registry::new();
         registry

@@ -178,7 +178,7 @@ mod tests {
     use futures::stream;
     use http_body_util::{Full, StreamBody};
 
-    use crate::extension::{Action, Error, Extension};
+    use crate::extension::Extension;
 
     /// What one member's response hooks observed.
     #[derive(Default)]
@@ -195,14 +195,6 @@ mod tests {
 
     #[async_trait]
     impl Extension for Probe {
-        async fn on_request_start(
-            &mut self,
-            _head: &mut http::request::Parts,
-            _cx: &mut Cx,
-        ) -> Result<Action, Error> {
-            Ok(Action::Continue)
-        }
-
         fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx) {
             self.seen
                 .lock()

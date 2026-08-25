@@ -325,14 +325,6 @@ mod tests {
 
     #[async_trait]
     impl crate::extension::Extension for Handle {
-        async fn on_request_start(
-            &mut self,
-            _head: &mut http::request::Parts,
-            _cx: &mut Cx,
-        ) -> Result<Action, Error> {
-            Ok(Action::Continue)
-        }
-
         async fn on_request_body(
             &mut self,
             chunk: &[u8],
