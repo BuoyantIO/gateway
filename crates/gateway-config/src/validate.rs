@@ -38,6 +38,10 @@ pub enum RejectionReason {
     HeaderInMultipleOps(String),
     #[error("static backend must have at least one endpoint")]
     StaticBackendNoEndpoints,
+    #[error("dialable backend `host` must not be empty")]
+    DialableBackendNoHost,
+    #[error("dialable backend `port` must not be zero")]
+    DialableBackendZeroPort,
     #[error("TCP listener must have exactly one route, found {0}")]
     TcpListenerRouteCount(usize),
     /// A query-param match has an empty `name`. (Header-match
@@ -324,6 +328,28 @@ fn validate_backend(key: &str, backend: &Backend, out: &mut Vec<Rejection>) {
                 s.endpoints.iter().map(|e| e.name.as_str()),
                 out,
             );
+        }
+        Backend::Dialable(d) => {
+            if d.host.is_empty() {
+                out.push(Rejection {
+                    key: key.to_string(),
+                    reason: RejectionReason::DialableBackendNoHost,
+                });
+            }
+            if d.port == 0 {
+                out.push(Rejection {
+                    key: key.to_string(),
+                    reason: RejectionReason::DialableBackendZeroPort,
+                });
+            }
+            if let Some(prefix) = &d.path_prefix
+                && !prefix.starts_with('/')
+            {
+                out.push(Rejection {
+                    key: key.to_string(),
+                    reason: RejectionReason::PathNotSlash(prefix.clone()),
+                });
+            }
         }
     }
 }
@@ -753,6 +779,60 @@ gatewayConfig:
             errs.iter()
                 .any(|r| matches!(r.reason, RejectionReason::StaticBackendNoEndpoints))
         );
+    }
+
+    #[test]
+    fn dialable_backend_host_and_port_checked() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - { name: be, type: Dialable, host: '', port: 0 }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::DialableBackendNoHost))
+        );
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::DialableBackendZeroPort))
+        );
+    }
+
+    #[test]
+    fn dialable_backend_path_prefix_must_be_absolute() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - { name: be, type: Dialable, host: api.example.com, port: 443, pathPrefix: v1 }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(&r.reason, RejectionReason::PathNotSlash(p) if p == "v1"))
+        );
+    }
+
+    #[test]
+    fn valid_dialable_backend_accepted() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - { name: be, type: Dialable, host: api.example.com, port: 443, pathPrefix: /v1 }
+",
+        );
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]

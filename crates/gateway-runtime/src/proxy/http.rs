@@ -406,7 +406,7 @@ async fn dispatch(
     let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
 
     let (upstream, reason, dial_ms) =
-        forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
+        forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info).await;
     let outcome = RequestOutcome {
         listener: listener.map(str::to_owned),
         route: route.map(str::to_owned),
@@ -446,7 +446,7 @@ async fn serve_streamed(
         parts,
         UpstreamBody::Stream(StreamBody::new(ReceiverStream::new(rx))),
     );
-    let forward_fut = forward(&ctx.http_client, backend.protocol, req, &endpoint, &info);
+    let forward_fut = forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info);
     let pump_fut = gate::pump(&mut members, body, tx, &mut cx);
     let ((upstream, reason, dial_ms), pump) = tokio::join!(forward_fut, pump_fut);
 
@@ -547,7 +547,7 @@ async fn serve_selected(
     let req = Request::from_parts(parts, upstream_body);
 
     let (upstream, reason, dial_ms) =
-        forward(&ctx.http_client, backend.protocol, req, &endpoint, &info).await;
+        forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info).await;
     let outcome = RequestOutcome {
         listener: listener.map(str::to_owned),
         route: route_name.map(str::to_owned),
@@ -626,8 +626,9 @@ fn validate_target(
             };
             Some((Arc::clone(active), endpoint, info))
         }
-        // Nothing dialable exists in state yet; a variant that
-        // silently misroutes would be worse than one that fails.
+        // State can hold a dialable backend, but nothing dials one
+        // yet; a variant that silently misroutes would be worse than
+        // one that fails.
         Target::Backend { name } => {
             tracing::warn!(%name, "selector targeted a dialable backend, which is not supported");
             None
@@ -1301,6 +1302,8 @@ fn synthesize_status(status: StatusCode) -> Response<ResponseBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use gateway_state::{ActiveBackendKind, ActiveEndpointSet};
 
     fn pm(v: &str) -> PathMatch {
         PathMatch::PathPrefix { value: v.into() }
@@ -1980,12 +1983,14 @@ mod tests {
             key: key.clone(),
             backend: Some(Arc::new(ActiveBackend {
                 key,
-                endpoints: vec![Endpoint {
-                    name: "e0".into(),
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                    port,
-                }],
-                protocol: BackendProtocol::Http1,
+                kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
+                    endpoints: vec![Endpoint {
+                        name: "e0".into(),
+                        address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        port,
+                    }],
+                    protocol: BackendProtocol::Http1,
+                }),
             })),
             weight: 1,
         }
@@ -2077,8 +2082,10 @@ mod tests {
             backend: resolved.then(|| {
                 Arc::new(ActiveBackend {
                     key,
-                    endpoints: vec![],
-                    protocol: BackendProtocol::Http1,
+                    kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
+                        endpoints: vec![],
+                        protocol: BackendProtocol::Http1,
+                    }),
                 })
             }),
             weight,

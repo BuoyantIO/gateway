@@ -72,12 +72,61 @@ pub struct ActiveBackendRef {
     pub weight: u32,
 }
 
+/// A registered backend. The key is common to both kinds; what it
+/// takes to reach the backend is in [`ActiveBackendKind`].
 #[derive(Debug, Clone)]
 pub struct ActiveBackend {
     pub key: BackendKey,
+    pub kind: ActiveBackendKind,
+}
+
+impl ActiveBackend {
+    /// The endpoints to balance over. Empty for a dialable backend,
+    /// which names a host instead of a set of addresses: callers
+    /// that can only route to an endpoint (the balanced pick, the
+    /// by-address lookup, the target listing an extension sees) get
+    /// nothing to choose from, which is the same answer they already
+    /// give for an endpoint set with no ready members.
+    pub fn endpoints(&self) -> &[Endpoint] {
+        match &self.kind {
+            ActiveBackendKind::Endpoints(e) => &e.endpoints,
+            ActiveBackendKind::Dialable(_) => &[],
+        }
+    }
+
+    /// Application protocol the gateway speaks to this backend. A
+    /// dialable backend carries no protocol setting yet, so it takes
+    /// the same `Http1` default an endpoint set does.
+    pub fn protocol(&self) -> BackendProtocol {
+        match &self.kind {
+            ActiveBackendKind::Endpoints(e) => e.protocol,
+            ActiveBackendKind::Dialable(_) => BackendProtocol::default(),
+        }
+    }
+}
+
+/// What the request path has to do to reach a backend: pick one of a
+/// set of resolved endpoints, or dial a host.
+#[derive(Debug, Clone)]
+pub enum ActiveBackendKind {
+    Endpoints(ActiveEndpointSet),
+    Dialable(ActiveDialable),
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveEndpointSet {
     pub endpoints: Vec<Endpoint>,
     /// Application protocol the gateway speaks to this backend
     /// (`Http1` default, `Http2` = h2c origination). Independent of
     /// the client-side protocol served downstream.
     pub protocol: BackendProtocol,
+}
+
+/// A host the gateway resolves and dials itself. TLS origination and
+/// credentials attach here once they exist.
+#[derive(Debug, Clone)]
+pub struct ActiveDialable {
+    pub host: String,
+    pub port: u16,
+    pub path_prefix: Option<String>,
 }
