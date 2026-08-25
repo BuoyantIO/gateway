@@ -27,21 +27,25 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Built once per configured extension
 pub trait ExtensionBuilder: Send + Sync {
-    fn request_body(&self) -> BodyMode {
-        BodyMode::None
-    }
-
-    fn response_mode(&self) -> ResponseMode {
-        ResponseMode::None
-    }
-
-    /// Whether instances may return [`Action::Select`]. At most one
-    /// builder per rule declares this.
-    fn selects_targets(&self) -> bool {
-        false
+    /// What this builder's instances want from the host. The
+    /// declarations live here so the host can choose machinery
+    /// before any instance runs.
+    fn declares(&self) -> Declarations {
+        Declarations::default()
     }
 
     fn build(&self) -> Box<dyn Extension>;
+}
+
+/// What a builder declares about its instances, as one value; copied
+/// into the [`Member`] at instantiation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Declarations {
+    pub request_body: BodyMode,
+    pub response: ResponseMode,
+    /// Whether instances may be asked to [`Extension::select`]. At
+    /// most one builder per rule declares this.
+    pub selects_targets: bool,
 }
 
 /// One instance per request, alive until the response ends.
@@ -207,14 +211,10 @@ pub struct LocalResponse {
 }
 
 /// An instantiated member of a route's filter list: the per-request
-/// extension instance plus its builder's declarations, copied at
-/// build time. The declarations live on the builder so the host can
-/// choose machinery before instances run; the copy is what makes
-/// them readable afterwards.
+/// extension instance plus a copy of its builder's [`Declarations`],
+/// taken at build time — the builder is not consulted again.
 pub struct Member {
-    pub request_body: BodyMode,
-    pub response: ResponseMode,
-    pub selects_targets: bool,
+    pub decl: Declarations,
     pub ext: Box<dyn Extension>,
 }
 
@@ -222,9 +222,7 @@ impl Member {
     /// Build one instance and record what its builder declared.
     pub fn from_builder(builder: &dyn ExtensionBuilder) -> Self {
         Self {
-            request_body: builder.request_body(),
-            response: builder.response_mode(),
-            selects_targets: builder.selects_targets(),
+            decl: builder.declares(),
             ext: builder.build(),
         }
     }

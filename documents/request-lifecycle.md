@@ -83,7 +83,7 @@ drawn winner. Selector rules validate against the whole list.
 
 Each filter on the resolved route becomes one extension instance for
 this request (in code: `Member`), holding the instance and a copy of
-its builder's declarations (`request_body`, `response`,
+its builder's `Declarations` (`request_body`, `response`,
 `selects_targets`). The copy is taken at
 instantiation because the declarations drive everything downstream —
 the body tier, response wrapping, `on_response_end` delivery — and the builder

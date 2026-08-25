@@ -17,8 +17,9 @@ use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, 
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
-    Action, BodyMode, BodySource, Cx, Error as ExtensionError, Extension, ExtensionBuilder, Held,
-    LocalResponse, Registry, ResponseEnd, ResponseMode, Selected, Selection, Target, async_trait,
+    Action, BodyMode, BodySource, Cx, Declarations, Error as ExtensionError, Extension,
+    ExtensionBuilder, Held, LocalResponse, Registry, ResponseEnd, ResponseMode, Selected,
+    Selection, Target, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
@@ -1380,8 +1381,11 @@ struct BodyProbe {
 }
 
 impl ExtensionBuilder for BodyProbeBuilder {
-    fn request_body(&self) -> BodyMode {
-        self.mode
+    fn declares(&self) -> Declarations {
+        Declarations {
+            request_body: self.mode,
+            ..Default::default()
+        }
     }
 
     fn build(&self) -> Box<dyn Extension> {
@@ -1741,8 +1745,11 @@ struct ResponseProbe {
 }
 
 impl ExtensionBuilder for ResponseProbeBuilder {
-    fn response_mode(&self) -> ResponseMode {
-        self.mode
+    fn declares(&self) -> Declarations {
+        Declarations {
+            response: self.mode,
+            ..Default::default()
+        }
     }
 
     fn build(&self) -> Box<dyn Extension> {
@@ -2048,12 +2055,12 @@ struct Picker {
 }
 
 impl ExtensionBuilder for PickerBuilder {
-    fn request_body(&self) -> BodyMode {
-        self.mode
-    }
-
-    fn selects_targets(&self) -> bool {
-        true
+    fn declares(&self) -> Declarations {
+        Declarations {
+            request_body: self.mode,
+            selects_targets: true,
+            ..Default::default()
+        }
     }
 
     fn build(&self) -> Box<dyn Extension> {

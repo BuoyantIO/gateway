@@ -21,7 +21,9 @@ use crate::proxy::http::ResponseBody;
 /// handed back untouched: no wrapper, no box, no extra poll on each
 /// frame.
 pub(super) fn wants_response_phase(members: &[Member]) -> bool {
-    members.iter().any(|m| m.response != ResponseMode::None)
+    members
+        .iter()
+        .any(|m| m.decl.response != ResponseMode::None)
 }
 
 /// Wrap `body` so the members see it stream past and hear about its
@@ -57,7 +59,7 @@ pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx, status: 
     for member in members
         .iter_mut()
         .rev()
-        .filter(|m| m.response != ResponseMode::None)
+        .filter(|m| m.decl.response != ResponseMode::None)
     {
         member.ext.on_response_end(&end, cx);
     }
@@ -91,7 +93,7 @@ impl TappedBody {
             .members
             .iter_mut()
             .rev()
-            .filter(|m| m.response != ResponseMode::None)
+            .filter(|m| m.decl.response != ResponseMode::None)
         {
             member.ext.on_response_end(&end, &mut self.cx);
         }
@@ -102,7 +104,7 @@ impl TappedBody {
             .members
             .iter_mut()
             .rev()
-            .filter(|m| m.response == ResponseMode::Tap)
+            .filter(|m| m.decl.response == ResponseMode::Tap)
         {
             member
                 .ext
@@ -221,9 +223,10 @@ mod tests {
     ) -> (Member, Arc<Mutex<Seen>>) {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let member = Member {
-            request_body: crate::extension::BodyMode::None,
-            response: mode,
-            selects_targets: false,
+            decl: crate::extension::Declarations {
+                response: mode,
+                ..Default::default()
+            },
             ext: Box::new(Probe {
                 label,
                 seen: Arc::clone(&seen),
