@@ -61,9 +61,11 @@ pub trait Extension: Send {
     /// failure mode.
     async fn on_request_start(
         &mut self,
-        head: &mut http::request::Parts,
-        cx: &mut Cx,
-    ) -> Result<Action, Error>;
+        _head: &mut http::request::Parts,
+        _cx: &mut Cx,
+    ) -> Result<Action, Error> {
+        Ok(Action::Continue)
+    }
 
     /// One request-body chunk, in arrival order. Fires only for
     /// builders that declared [`BodyMode::Stream`] or

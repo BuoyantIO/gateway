@@ -1265,14 +1265,6 @@ impl ExtensionBuilder for StampBuilder {
 
 #[async_trait]
 impl Extension for Stamp {
-    async fn on_request_start(
-        &mut self,
-        _head: &mut http::request::Parts,
-        _cx: &mut Cx,
-    ) -> Result<Action, ExtensionError> {
-        Ok(Action::Continue)
-    }
-
     fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
         head.headers
             .insert("x-stamped", "by-extension".parse().unwrap());
@@ -1402,14 +1394,6 @@ impl ExtensionBuilder for BodyProbeBuilder {
 
 #[async_trait]
 impl Extension for BodyProbe {
-    async fn on_request_start(
-        &mut self,
-        _head: &mut http::request::Parts,
-        _cx: &mut Cx,
-    ) -> Result<Action, ExtensionError> {
-        Ok(Action::Continue)
-    }
-
     async fn on_request_body(
         &mut self,
         chunk: &[u8],
@@ -1445,14 +1429,6 @@ impl ExtensionBuilder for NoBodyBuilder {
 
 #[async_trait]
 impl Extension for NoBody {
-    async fn on_request_start(
-        &mut self,
-        _head: &mut http::request::Parts,
-        _cx: &mut Cx,
-    ) -> Result<Action, ExtensionError> {
-        Ok(Action::Continue)
-    }
-
     async fn on_request_body(
         &mut self,
         _chunk: &[u8],
@@ -2095,14 +2071,6 @@ impl ExtensionBuilder for PickerBuilder {
 
 #[async_trait]
 impl Extension for Picker {
-    async fn on_request_start(
-        &mut self,
-        _head: &mut http::request::Parts,
-        _cx: &mut Cx,
-    ) -> Result<Action, ExtensionError> {
-        Ok(Action::Continue)
-    }
-
     async fn select(&mut self, held: Held<'_>, _cx: &mut Cx) -> Result<Selected, ExtensionError> {
         *self.buffer_at_select.lock().unwrap() = match &held {
             Held::Buffered(bytes) => HeldSeen::Buffered(bytes.len()),
