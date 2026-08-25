@@ -73,14 +73,14 @@ pub trait Extension: Send {
     /// what the host does with the bytes, never what the hook sees.
     /// The final call always has `end_of_stream: true`, with an empty
     /// chunk when the body ended on a frame boundary. The chunk is
-    /// borrowed and read-only: copy what you keep.
+    /// immutable and cheap to clone: keep a clone of what you need.
     ///
     /// # Errors
     /// An error fails the request per the extension's configured
     /// failure mode.
     async fn on_request_body(
         &mut self,
-        _chunk: &[u8],
+        _chunk: Bytes,
         _end_of_stream: bool,
         _cx: &mut Cx,
     ) -> Result<Action, Error> {
@@ -91,7 +91,7 @@ pub trait Extension: Send {
 
     /// One response-body chunk. Read-only tap; fires only for
     /// builders that declared a response [`BodyMode::Stream`].
-    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx) {}
+    fn on_response_body(&mut self, _chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {}
 
     /// Runs exactly once per request, whatever the ending: a clean
     /// finish, a mid-stream failure, a client disconnect, or a

@@ -127,7 +127,7 @@ where
             // end-of-stream on a data frame (chunked bodies end
             // here): the terminal call carries an empty chunk.
             None => {
-                return match deliver(members, &[], true, cx).await {
+                return match deliver(members, &Bytes::new(), true, cx).await {
                     Delivery::Continue => drained(mode, cx),
                     Delivery::Respond(resp) => GateOutcome::Halt(Halt::Respond(Box::new(resp))),
                     Delivery::Failed => GateOutcome::Halt(Halt::Failed),
@@ -197,7 +197,7 @@ where
         };
         let frame = match polled {
             None => {
-                return match deliver(members, &[], true, cx).await {
+                return match deliver(members, &Bytes::new(), true, cx).await {
                     // Dropping `tx` half-closes the upstream body.
                     Delivery::Continue => PumpOutcome::Done,
                     Delivery::Respond(resp) => {
@@ -253,7 +253,7 @@ where
 /// One chunk through every body-mode member, in list order.
 async fn deliver(
     members: &mut [Member],
-    chunk: &[u8],
+    chunk: &Bytes,
     end_of_stream: bool,
     cx: &mut Cx,
 ) -> Delivery {
@@ -261,7 +261,11 @@ async fn deliver(
         .iter_mut()
         .filter(|m| m.request_body != BodyMode::None)
     {
-        match member.ext.on_request_body(chunk, end_of_stream, cx).await {
+        match member
+            .ext
+            .on_request_body(chunk.clone(), end_of_stream, cx)
+            .await
+        {
             Ok(Action::Continue) => {}
             Ok(Action::Respond(resp)) => return Delivery::Respond(resp),
             Err(e) => {
@@ -327,7 +331,7 @@ mod tests {
     impl crate::extension::Extension for Handle {
         async fn on_request_body(
             &mut self,
-            chunk: &[u8],
+            chunk: Bytes,
             end_of_stream: bool,
             cx: &mut Cx,
         ) -> Result<Action, Error> {
