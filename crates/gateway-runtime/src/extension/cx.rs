@@ -12,7 +12,6 @@ use gateway_state::ActiveBackend;
 pub struct Cx {
     targets: Targets,
     request_buffer: Option<BytesMut>,
-    response_buffer: Option<BytesMut>,
     matched_path_prefix: Option<Arc<str>>,
     request_host: Option<Arc<str>>,
 }
@@ -24,7 +23,6 @@ impl Cx {
                 backends: Vec::new(),
             },
             request_buffer: None,
-            response_buffer: None,
             matched_path_prefix: None,
             request_host: None,
         }
@@ -55,12 +53,6 @@ impl Cx {
     /// `None`.
     pub fn request_buffer(&self) -> Option<&[u8]> {
         self.request_buffer.as_deref()
-    }
-
-    /// The response body accumulated so far. Same rules as
-    /// [`Cx::request_buffer`], response direction.
-    pub fn response_buffer(&self) -> Option<&[u8]> {
-        self.response_buffer.as_deref()
     }
 
     /// Append a chunk to the request accumulation, creating it on

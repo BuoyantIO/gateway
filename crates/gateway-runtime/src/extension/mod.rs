@@ -31,17 +31,8 @@ pub trait ExtensionBuilder: Send + Sync {
         BodyMode::None
     }
 
-    fn response_body(&self) -> BodyMode {
-        BodyMode::None
-    }
-
-    /// Whether instances want [`Extension::on_response_end`]. Nothing
-    /// else implies it: a member can want the terminal without
-    /// wanting response chunks — a limiter settling a reservation
-    /// reads no bytes — and the host wraps the response only for
-    /// routes that declared one or the other.
-    fn observes_response_end(&self) -> bool {
-        false
+    fn response_mode(&self) -> ResponseMode {
+        ResponseMode::None
     }
 
     /// Whether instances may return [`Action::Select`]. At most one
@@ -90,15 +81,14 @@ pub trait Extension: Send {
     fn on_response_start(&mut self, _head: &mut http::response::Parts, _cx: &mut Cx) {}
 
     /// One response-body chunk. Read-only tap; fires only for
-    /// builders that declared a response [`BodyMode::Stream`].
+    /// builders that declared [`ResponseMode::Tap`].
     fn on_response_body(&mut self, _chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {}
 
     /// Runs exactly once per request, whatever the ending: a clean
     /// finish, a mid-stream failure, a client disconnect, or a
     /// request answered before it reached an upstream. Fires only for
-    /// builders that declared
-    /// [`ExtensionBuilder::observes_response_end`] or a response
-    /// [`BodyMode`].
+    /// builders that declared [`ResponseMode::End`] or
+    /// [`ResponseMode::Tap`].
     fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx) {}
 
     /// Pick where the request goes. Called exactly once, on the
@@ -159,8 +149,8 @@ impl Held<'_> {
 /// the host discarded does not compile.
 pub struct Kept(());
 
-/// Body access an extension declares, per direction. The rule's
-/// effective mode is the strictest across its members
+/// Request-body access an extension declares. The rule's effective
+/// mode is the strictest across its members
 /// (`Buffer` > `Stream` > `None`) and selects the host machinery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub enum BodyMode {
@@ -179,6 +169,22 @@ pub enum BodyMode {
     /// [`Cx::request_buffer`]. Bounded by a size cap and an idle
     /// timeout.
     Buffer,
+}
+
+/// Response access an extension declares. Ordered: `Tap` includes
+/// the terminal, and the host wraps the response only for routes
+/// with a member above `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
+pub enum ResponseMode {
+    /// No response phase; the route's response is not wrapped.
+    #[default]
+    None,
+    /// [`Extension::on_response_end`] only — a member can settle at
+    /// the terminal without reading a byte, like a limiter closing
+    /// its reservation.
+    End,
+    /// [`Extension::on_response_body`] per chunk, plus the terminal.
+    Tap,
 }
 
 /// What a request-side hook decided.
@@ -207,8 +213,7 @@ pub struct LocalResponse {
 /// them readable afterwards.
 pub struct Member {
     pub request_body: BodyMode,
-    pub response_body: BodyMode,
-    pub observes_response_end: bool,
+    pub response: ResponseMode,
     pub selects_targets: bool,
     pub ext: Box<dyn Extension>,
 }
@@ -218,8 +223,7 @@ impl Member {
     pub fn from_builder(builder: &dyn ExtensionBuilder) -> Self {
         Self {
             request_body: builder.request_body(),
-            response_body: builder.response_body(),
-            observes_response_end: builder.observes_response_end(),
+            response: builder.response_mode(),
             selects_targets: builder.selects_targets(),
             ext: builder.build(),
         }

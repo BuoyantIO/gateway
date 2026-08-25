@@ -18,7 +18,7 @@ use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
     Action, BodyMode, BodySource, Cx, Error as ExtensionError, Extension, ExtensionBuilder, Held,
-    LocalResponse, Registry, ResponseEnd, Selected, Selection, Target, async_trait,
+    LocalResponse, Registry, ResponseEnd, ResponseMode, Selected, Selection, Target, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
@@ -1728,7 +1728,7 @@ struct ResponseSeen {
 }
 
 struct ResponseProbeBuilder {
-    mode: BodyMode,
+    mode: ResponseMode,
     /// Answer the request instead of proxying it, so the terminal
     /// hook has to fire without an upstream response.
     short_circuit: bool,
@@ -1741,12 +1741,8 @@ struct ResponseProbe {
 }
 
 impl ExtensionBuilder for ResponseProbeBuilder {
-    fn response_body(&self) -> BodyMode {
+    fn response_mode(&self) -> ResponseMode {
         self.mode
-    }
-
-    fn observes_response_end(&self) -> bool {
-        true
     }
 
     fn build(&self) -> Box<dyn Extension> {
@@ -1798,7 +1794,7 @@ struct TappedRoute {
     _stop: drain::Signal,
 }
 
-async fn spawn_tapped_route(upstream_port: u16, mode: BodyMode) -> TappedRoute {
+async fn spawn_tapped_route(upstream_port: u16, mode: ResponseMode) -> TappedRoute {
     let bind_port = free_port().await;
     let cfg = extension_ref_config(bind_port, upstream_port, "resp-probe");
     let store = Store::new();
@@ -1834,7 +1830,7 @@ async fn spawn_tapped_route(upstream_port: u16, mode: BodyMode) -> TappedRoute {
 #[tokio::test]
 async fn a_response_tap_sees_the_body_and_the_client_still_gets_it() {
     let upstream = spawn_http_echo().await;
-    let tapped = spawn_tapped_route(upstream, BodyMode::Stream).await;
+    let tapped = spawn_tapped_route(upstream, ResponseMode::Tap).await;
 
     let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let resp = client
@@ -1874,7 +1870,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
         .register(
             "resp-probe",
             Arc::new(ResponseProbeBuilder {
-                mode: BodyMode::Stream,
+                mode: ResponseMode::Tap,
                 short_circuit: true,
                 seen: Arc::clone(&seen),
             }),

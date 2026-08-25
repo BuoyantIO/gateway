@@ -12,7 +12,7 @@ use http::StatusCode;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 
-use crate::extension::{BodyMode, Cx, Member, ResponseEnd};
+use crate::extension::{Cx, Member, ResponseEnd, ResponseMode};
 use crate::proxy::body::BoxError;
 use crate::proxy::http::ResponseBody;
 
@@ -21,9 +21,7 @@ use crate::proxy::http::ResponseBody;
 /// handed back untouched: no wrapper, no box, no extra poll on each
 /// frame.
 pub(super) fn wants_response_phase(members: &[Member]) -> bool {
-    members
-        .iter()
-        .any(|m| m.response_body != BodyMode::None || m.observes_response_end)
+    members.iter().any(|m| m.response != ResponseMode::None)
 }
 
 /// Wrap `body` so the members see it stream past and hear about its
@@ -56,7 +54,11 @@ pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx, status: 
         body_bytes: 0,
         complete: false,
     };
-    for member in members.iter_mut().rev().filter(|m| m.observes_response_end) {
+    for member in members
+        .iter_mut()
+        .rev()
+        .filter(|m| m.response != ResponseMode::None)
+    {
         member.ext.on_response_end(&end, cx);
     }
 }
@@ -89,7 +91,7 @@ impl TappedBody {
             .members
             .iter_mut()
             .rev()
-            .filter(|m| m.observes_response_end)
+            .filter(|m| m.response != ResponseMode::None)
         {
             member.ext.on_response_end(&end, &mut self.cx);
         }
@@ -100,7 +102,7 @@ impl TappedBody {
             .members
             .iter_mut()
             .rev()
-            .filter(|m| m.response_body != BodyMode::None)
+            .filter(|m| m.response == ResponseMode::Tap)
         {
             member
                 .ext
@@ -214,16 +216,13 @@ mod tests {
 
     fn member(
         label: &'static str,
-        mode: BodyMode,
+        mode: ResponseMode,
         order: &Arc<Mutex<Vec<&'static str>>>,
     ) -> (Member, Arc<Mutex<Seen>>) {
         let seen = Arc::new(Mutex::new(Seen::default()));
         let member = Member {
-            request_body: BodyMode::None,
-            response_body: mode,
-            // Every probe watches the terminal; the mode is what
-            // varies between cases.
-            observes_response_end: true,
+            request_body: crate::extension::BodyMode::None,
+            response: mode,
             selects_targets: false,
             ext: Box::new(Probe {
                 label,
@@ -258,8 +257,8 @@ mod tests {
     #[tokio::test]
     async fn chunks_reach_members_in_reverse_order_and_pass_through_intact() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (first, seen_first) = member("first", BodyMode::Stream, &order);
-        let (second, seen_second) = member("second", BodyMode::Stream, &order);
+        let (first, seen_first) = member("first", ResponseMode::Tap, &order);
+        let (second, seen_second) = member("second", ResponseMode::Tap, &order);
 
         let body = tap(
             chunked(&[b"one", b"two"]),
@@ -291,7 +290,7 @@ mod tests {
         // Ends via `is_end_stream` after its last frame; the terminal
         // `None` never arrives, so the latch is what prevents a miss.
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", BodyMode::Stream, &order);
+        let (m, seen) = member("m", ResponseMode::Tap, &order);
         let body = tap(sized(b"payload"), vec![m], Cx::new(), StatusCode::OK);
         assert_eq!(drain(body).await, Bytes::from_static(b"payload"));
 
@@ -303,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn a_chunked_response_fires_the_terminal_exactly_once() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", BodyMode::Stream, &order);
+        let (m, seen) = member("m", ResponseMode::Tap, &order);
         let body = tap(chunked(&[b"ab"]), vec![m], Cx::new(), StatusCode::CREATED);
         drain(body).await;
 
@@ -314,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_mid_stream_fires_the_terminal_as_incomplete() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", BodyMode::Stream, &order);
+        let (m, seen) = member("m", ResponseMode::Tap, &order);
         let mut body = tap(
             chunked(&[b"first", b"second"]),
             vec![m],
@@ -334,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn a_member_without_response_access_sees_no_chunks_but_still_ends() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", BodyMode::None, &order);
+        let (m, seen) = member("m", ResponseMode::End, &order);
         let body = tap(chunked(&[b"data"]), vec![m], Cx::new(), StatusCode::OK);
         drain(body).await;
 
@@ -351,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn a_tapped_response_streams_rather_than_buffering() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", BodyMode::Stream, &order);
+        let (m, seen) = member("m", ResponseMode::Tap, &order);
 
         // Two frames, then a pending tail that never completes.
         let head = stream::iter(vec![
@@ -387,25 +386,21 @@ mod tests {
         // and want nothing on the way back. Wrapping them would cost
         // a box and a poll per frame to drive no-op hooks.
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (request_only, _) = member("m", BodyMode::None, &order);
-        let mut request_only = request_only;
-        request_only.observes_response_end = false;
+        let (request_only, _) = member("m", ResponseMode::None, &order);
         assert!(!wants_response_phase(std::slice::from_ref(&request_only)));
 
-        // Either declaration alone is enough to earn the wrapper.
-        let (tapping, _) = member("t", BodyMode::Stream, &order);
-        let mut tapping = tapping;
-        tapping.observes_response_end = false;
+        // Either interest above `None` earns the wrapper.
+        let (tapping, _) = member("t", ResponseMode::Tap, &order);
         assert!(wants_response_phase(std::slice::from_ref(&tapping)));
 
-        let (settling, _) = member("s", BodyMode::None, &order);
+        let (settling, _) = member("s", ResponseMode::End, &order);
         assert!(wants_response_phase(std::slice::from_ref(&settling)));
     }
 
     #[test]
     fn short_circuited_requests_still_reach_the_terminal() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", BodyMode::None, &order);
+        let (m, seen) = member("m", ResponseMode::End, &order);
         let mut members = vec![m];
         let mut cx = Cx::new();
         end_without_response(&mut members, &mut cx, StatusCode::PAYLOAD_TOO_LARGE);
