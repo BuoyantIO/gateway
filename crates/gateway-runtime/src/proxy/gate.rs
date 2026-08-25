@@ -360,8 +360,7 @@ mod tests {
         }));
         let member = Member {
             request_body: mode,
-            response_body: BodyMode::None,
-            observes_response_end: false,
+            response: crate::extension::ResponseMode::None,
             selects_targets: false,
             ext: Box::new(Handle(std::sync::Arc::clone(&rec))),
         };

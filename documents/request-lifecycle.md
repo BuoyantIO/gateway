@@ -83,8 +83,8 @@ drawn winner. Selector rules validate against the whole list.
 
 Each filter on the resolved route becomes one extension instance for
 this request (in code: `Member`), holding the instance and a copy of
-its builder's declarations (`request_body`, `response_body`,
-`observes_response_end`, `selects_targets`). The copy is taken at
+its builder's declarations (`request_body`, `response`,
+`selects_targets`). The copy is taken at
 instantiation because the declarations drive everything downstream —
 the body tier, response wrapping, `on_response_end` delivery — and the builder
 is not consulted again.
@@ -93,9 +93,8 @@ Core filters construct from their inline config. An `ExtensionRef`
 filter resolves by name against the `Registry`.
 
 Instantiation can fail: a ref naming a plugin the registry does not
-hold, a builder declaring response `BodyMode::Buffer` (unsupported —
-holding a response back defeats streaming it), or two instances on
-one route declaring `selects_targets`. These are configuration
+hold, or two instances on one route declaring `selects_targets`.
+These are configuration
 invariants, and their proper enforcement is at config apply, before a
 route can receive traffic. The request path keeps a defensive check:
 a route violating them serves nothing (500, reason `internal`, log
@@ -333,7 +332,7 @@ Nothing is shared — the request phase borrowed the instances, the
 response phase owns them.
 
 `on_response_body` fires per frame, inside the poll, on instances that
-declared a response `BodyMode::Stream`. It is a sync, read-only tap:
+declared `ResponseMode::Tap`. It is a sync, read-only tap:
 it cannot delay, buffer or alter the stream, and the client receives
 every frame exactly as the upstream sent it. The final call carries
 `end_of_stream: true` under the same single-latch guarantee as the
@@ -341,16 +340,16 @@ request side. For an LLM response, the first tap call is the
 time-to-first-token moment — response headers arrive before inference
 starts, the first body frame after.
 
-Wrapping is conditional: a route whose instances declared neither a
-response body mode nor `observes_response_end` returns the upstream
-body untouched — no wrapper, no per-frame overhead. Response
-`BodyMode::Buffer` does not exist as machinery; it is rejected at
-instantiation.
+Wrapping is conditional: a route whose instances all declared
+`ResponseMode::None` returns the upstream body untouched — no
+wrapper, no per-frame overhead. Response buffering is not
+representable: `ResponseMode` has no `Buffer`, because holding a
+response back defeats streaming it.
 
 ## End of request
 
 Every request ends exactly once, and instances that declared
-`observes_response_end` are told how: `on_response_end` receives
+`ResponseMode::End` or `Tap` are told how: `on_response_end` receives
 `ResponseEnd` — the status the client got, the response body bytes
 delivered, and `complete`, true only if the response body ran to its
 end.
@@ -371,11 +370,12 @@ The exception: endings before instantiation (no route matched, or
 instantiation itself failed) fire nothing — no instance exists to
 hear it.
 
-Delivery is declared (`observes_response_end`) because no other
-declaration implies the need: a rate limiter settles its reservation
-at the end while reading no body. Making delivery universal would
-wrap every response on every filtered route to call empty hooks; the
-declaration keeps the wrapper on routes that use it.
+Delivery is declared (`ResponseMode::End` exists apart from `Tap`)
+because reading no body does not imply wanting no terminal: a rate
+limiter settles its reservation at the end while reading no bytes.
+Making delivery universal would wrap every response on every filtered
+route to call empty hooks; the declaration keeps the wrapper on
+routes that use it.
 
 The endings, grouped by phase:
 
@@ -422,7 +422,7 @@ only touch headers.
 | request `Buffer` | one accumulation buffer | none | none | the whole body, ≤ 8 MiB | full body read before dispatch |
 | request `Stream`, no selector | none | none | one, 4 frames deep | ≤ 4 frames | none — dispatch precedes the body |
 | request `Stream` + selector | none | none | none | one chunk at a time | full body delivery before dispatch |
-| response `Stream` or `observes_response_end` | one boxed wrapper | none | none | none — frames pass through | none — taps run inside the poll |
+| response `Tap` or `End` | one boxed wrapper | none | none | none — frames pass through | none — taps run inside the poll |
 
 A `Buffer` route holds each upload in memory and delays dispatch by
 the upload's duration. A selector delays dispatch by the body
