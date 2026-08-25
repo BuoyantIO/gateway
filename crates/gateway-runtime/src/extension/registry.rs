@@ -66,7 +66,7 @@ mod tests {
         registry.register("noop", Arc::new(NoopBuilder)).unwrap();
 
         let builder = registry.get("noop").expect("registered");
-        assert_eq!(builder.request_body(), BodyMode::None);
+        assert_eq!(builder.declares().request_body, BodyMode::None);
         assert!(registry.get("other").is_none());
     }
 

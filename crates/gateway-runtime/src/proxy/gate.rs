@@ -259,7 +259,7 @@ async fn deliver(
 ) -> Delivery {
     for member in members
         .iter_mut()
-        .filter(|m| m.request_body != BodyMode::None)
+        .filter(|m| m.decl.request_body != BodyMode::None)
     {
         match member
             .ext
@@ -359,9 +359,10 @@ mod tests {
             respond_at,
         }));
         let member = Member {
-            request_body: mode,
-            response: crate::extension::ResponseMode::None,
-            selects_targets: false,
+            decl: crate::extension::Declarations {
+                request_body: mode,
+                ..Default::default()
+            },
             ext: Box::new(Handle(std::sync::Arc::clone(&rec))),
         };
         (member, rec)

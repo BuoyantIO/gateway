@@ -243,7 +243,7 @@ async fn serve_request_inner(
 
     // At most one member may select; two is a config error the
     // registry cannot see, so it fails here, loudly.
-    if extensions.iter().filter(|m| m.selects_targets).count() > 1 {
+    if extensions.iter().filter(|m| m.decl.selects_targets).count() > 1 {
         let names: Vec<&str> = resolved
             .filters
             .iter()
@@ -262,7 +262,7 @@ async fn serve_request_inner(
     // pick above is not consulted, and the full ref set becomes the
     // selection allowlist. Built only here — plain routes never pay
     // for it.
-    if extensions.iter().any(|m| m.selects_targets) {
+    if extensions.iter().any(|m| m.decl.selects_targets) {
         cx.set_targets(targets_from_route(&resolved.route));
         return serve_selected(
             ctx,
@@ -365,7 +365,7 @@ async fn dispatch(
 ) -> (Response<ResponseBody>, RequestOutcome) {
     let mode = members
         .iter()
-        .map(|m| m.request_body)
+        .map(|m| m.decl.request_body)
         .max()
         .unwrap_or_default();
     if mode == BodyMode::Stream {
@@ -494,7 +494,7 @@ async fn serve_selected(
     };
     let selector = members
         .iter_mut()
-        .find(|m| m.selects_targets)
+        .find(|m| m.decl.selects_targets)
         .expect("caller checked a selector exists");
     let selection = match selector.ext.select(held, &mut cx).await {
         Ok(Selected::Target(selection)) => selection,
@@ -570,7 +570,7 @@ async fn settle_body(
 ) -> Result<HeldBody, gate::Halt> {
     let mode = members
         .iter()
-        .map(|m| m.request_body)
+        .map(|m| m.decl.request_body)
         .max()
         .unwrap_or_default();
     let drain_mode = match mode {
