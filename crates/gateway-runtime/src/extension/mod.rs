@@ -21,10 +21,9 @@ pub use async_trait::async_trait;
 pub use cx::{Cx, TargetBackend, Targets};
 pub use registry::{Registry, RegistryError};
 
+/// Error an extension hook returns, and the error type of a body an
+/// extension supplies.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
-
-/// Error type of a body an extension supplies.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Built once per configured extension
 pub trait ExtensionBuilder: Send + Sync {
@@ -256,7 +255,7 @@ pub enum BodySource {
     /// pulls back from its own service. The length, when the
     /// extension knows it, is what lets the upstream tell a truncated
     /// request from a complete one; the host holds the body to it.
-    Stream(BoxBody<Bytes, BoxError>, Option<u64>),
+    Stream(BoxBody<Bytes, Error>, Option<u64>),
 }
 
 // Hand-written: a supplied body is not `Debug`, and its contents are
