@@ -95,7 +95,7 @@ impl TappedBody {
         }
     }
 
-    fn deliver(&mut self, chunk: &[u8], end_of_stream: bool) {
+    fn deliver(&mut self, chunk: &Bytes, end_of_stream: bool) {
         for member in self
             .members
             .iter_mut()
@@ -104,7 +104,7 @@ impl TappedBody {
         {
             member
                 .ext
-                .on_response_body(chunk, end_of_stream, &mut self.cx);
+                .on_response_body(chunk.clone(), end_of_stream, &mut self.cx);
         }
     }
 }
@@ -129,8 +129,7 @@ impl Body for TappedBody {
                     // end below. `armed` keeps the two from firing
                     // twice between them.
                     let end_of_stream = this.inner.is_end_stream();
-                    let data = data.clone();
-                    this.deliver(&data, end_of_stream);
+                    this.deliver(data, end_of_stream);
                     if end_of_stream {
                         this.end(true);
                     }
@@ -140,7 +139,7 @@ impl Body for TappedBody {
                 // Ended on a frame boundary: the terminal chunk is
                 // empty, matching the request side's contract.
                 if this.armed {
-                    this.deliver(&[], true);
+                    this.deliver(&Bytes::new(), true);
                     this.end(true);
                 }
             }
@@ -195,7 +194,7 @@ mod tests {
 
     #[async_trait]
     impl Extension for Probe {
-        fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx) {
+        fn on_response_body(&mut self, chunk: Bytes, end_of_stream: bool, _cx: &mut Cx) {
             self.seen
                 .lock()
                 .unwrap()

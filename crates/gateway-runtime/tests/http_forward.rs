@@ -1396,7 +1396,7 @@ impl ExtensionBuilder for BodyProbeBuilder {
 impl Extension for BodyProbe {
     async fn on_request_body(
         &mut self,
-        chunk: &[u8],
+        chunk: Bytes,
         end_of_stream: bool,
         cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
@@ -1431,7 +1431,7 @@ impl ExtensionBuilder for NoBodyBuilder {
 impl Extension for NoBody {
     async fn on_request_body(
         &mut self,
-        _chunk: &[u8],
+        _chunk: Bytes,
         _end_of_stream: bool,
         _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
@@ -1774,7 +1774,7 @@ impl Extension for ResponseProbe {
         Ok(Action::Continue)
     }
 
-    fn on_response_body(&mut self, chunk: &[u8], end_of_stream: bool, _cx: &mut Cx) {
+    fn on_response_body(&mut self, chunk: Bytes, end_of_stream: bool, _cx: &mut Cx) {
         self.seen
             .lock()
             .unwrap()
@@ -1931,7 +1931,7 @@ impl Extension for RequestOnly {
         Ok(Action::Continue)
     }
 
-    fn on_response_body(&mut self, _chunk: &[u8], _end_of_stream: bool, _cx: &mut Cx) {
+    fn on_response_body(&mut self, _chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {
         panic!("response tap ran for a member that declared no response access");
     }
 
