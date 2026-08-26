@@ -1,4 +1,4 @@
-//! Response-side extension hooks. The members outlive the request
+//! Response-side extension hooks. The instances outlive the request
 //! handler — they have to, because the response is still streaming
 //! when it returns — so they move into a body wrapper that taps each
 //! frame on its way to the client and fires the terminal hook once,
@@ -12,33 +12,33 @@ use http::StatusCode;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 
-use crate::extension::{Cx, Member, ResponseEnd, ResponseMode};
+use crate::extension::{Cx, Instance, ResponseEnd, ResponseMode};
 use crate::proxy::body::BoxError;
 use crate::proxy::http::ResponseBody;
 
-/// Whether a route's members need the response phase at all. A route
-/// whose members only touch the request — every core filter — is
+/// Whether a route's instances need the response phase at all. A route
+/// whose instances only touch the request — every core filter — is
 /// handed back untouched: no wrapper, no box, no extra poll on each
 /// frame.
-pub(super) fn wants_response_phase(members: &[Member]) -> bool {
-    members
+pub(super) fn wants_response_phase(instances: &[Instance]) -> bool {
+    instances
         .iter()
         .any(|m| m.decl.response != ResponseMode::None)
 }
 
-/// Wrap `body` so the members see it stream past and hear about its
-/// ending. Consumes the members and the context: the request phase is
+/// Wrap `body` so the instances see it stream past and hear about its
+/// ending. Consumes the instances and the context: the request phase is
 /// over and nothing needs them back.
 pub(super) fn tap(
     body: ResponseBody,
-    members: Vec<Member>,
+    instances: Vec<Instance>,
     cx: Cx,
     status: StatusCode,
     upstream: bool,
 ) -> ResponseBody {
     TappedBody {
         inner: body,
-        members,
+        instances,
         cx,
         status,
         upstream,
@@ -48,29 +48,29 @@ pub(super) fn tap(
     .boxed_unsync()
 }
 
-/// Fire the terminal on members that never reached the response
+/// Fire the terminal on instances that never reached the response
 /// phase — a request answered before an upstream response existed.
 /// The status is whatever was synthesized, so an extension settling
 /// a reservation sees the same shape it would on a served request.
-pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx, status: StatusCode) {
+pub(super) fn end_without_response(instances: &mut [Instance], cx: &mut Cx, status: StatusCode) {
     let end = ResponseEnd {
         status,
         body_bytes: 0,
         complete: false,
         upstream: false,
     };
-    for member in members
+    for instance in instances
         .iter_mut()
         .rev()
         .filter(|m| m.decl.response != ResponseMode::None)
     {
-        member.ext.on_response_end(&end, cx);
+        instance.ext.on_response_end(&end, cx);
     }
 }
 
 struct TappedBody {
     inner: ResponseBody,
-    members: Vec<Member>,
+    instances: Vec<Instance>,
     cx: Cx,
     status: StatusCode,
     /// Whether the status came from an upstream response — false for
@@ -96,24 +96,24 @@ impl TappedBody {
             complete,
             upstream: self.upstream,
         };
-        for member in self
-            .members
+        for instance in self
+            .instances
             .iter_mut()
             .rev()
             .filter(|m| m.decl.response != ResponseMode::None)
         {
-            member.ext.on_response_end(&end, &mut self.cx);
+            instance.ext.on_response_end(&end, &mut self.cx);
         }
     }
 
     fn deliver(&mut self, chunk: &Bytes, end_of_stream: bool) {
-        for member in self
-            .members
+        for instance in self
+            .instances
             .iter_mut()
             .rev()
             .filter(|m| m.decl.response == ResponseMode::Tap)
         {
-            member
+            instance
                 .ext
                 .on_response_body(chunk.clone(), end_of_stream, &mut self.cx);
         }
@@ -190,7 +190,7 @@ mod tests {
 
     use crate::extension::Extension;
 
-    /// What one member's response hooks observed.
+    /// What one instance's response hooks observed.
     #[derive(Default)]
     struct Seen {
         chunks: Vec<(Vec<u8>, bool)>,
@@ -219,13 +219,13 @@ mod tests {
         }
     }
 
-    fn member(
+    fn instance(
         label: &'static str,
         mode: ResponseMode,
         order: &Arc<Mutex<Vec<&'static str>>>,
-    ) -> (Member, Arc<Mutex<Seen>>) {
+    ) -> (Instance, Arc<Mutex<Seen>>) {
         let seen = Arc::new(Mutex::new(Seen::default()));
-        let member = Member {
+        let instance = Instance {
             decl: crate::extension::Declarations {
                 response: mode,
                 ..Default::default()
@@ -236,7 +236,7 @@ mod tests {
                 order: Arc::clone(order),
             }),
         };
-        (member, seen)
+        (instance, seen)
     }
 
     /// Ends at the terminal `None`, like a chunked response.
@@ -263,8 +263,8 @@ mod tests {
     #[tokio::test]
     async fn chunks_reach_members_in_reverse_order_and_pass_through_intact() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (first, seen_first) = member("first", ResponseMode::Tap, &order);
-        let (second, seen_second) = member("second", ResponseMode::Tap, &order);
+        let (first, seen_first) = instance("first", ResponseMode::Tap, &order);
+        let (second, seen_second) = instance("second", ResponseMode::Tap, &order);
 
         let body = tap(
             chunked(&[b"one", b"two"]),
@@ -297,7 +297,7 @@ mod tests {
         // Ends via `is_end_stream` after its last frame; the terminal
         // `None` never arrives, so the latch is what prevents a miss.
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::Tap, &order);
+        let (m, seen) = instance("m", ResponseMode::Tap, &order);
         let body = tap(sized(b"payload"), vec![m], Cx::new(), StatusCode::OK, true);
         assert_eq!(drain(body).await, Bytes::from_static(b"payload"));
 
@@ -317,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn a_chunked_response_fires_the_terminal_exactly_once() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::Tap, &order);
+        let (m, seen) = instance("m", ResponseMode::Tap, &order);
         let body = tap(
             chunked(&[b"ab"]),
             vec![m],
@@ -344,7 +344,7 @@ mod tests {
         // A dial-failure 502 streams through the wrapper like any
         // response; the terminal says no upstream answered.
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::End, &order);
+        let (m, seen) = instance("m", ResponseMode::End, &order);
         let body = tap(
             sized(b"bad gateway"),
             vec![m],
@@ -369,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_mid_stream_fires_the_terminal_as_incomplete() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::Tap, &order);
+        let (m, seen) = instance("m", ResponseMode::Tap, &order);
         let mut body = tap(
             chunked(&[b"first", b"second"]),
             vec![m],
@@ -398,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn a_member_without_response_access_sees_no_chunks_but_still_ends() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::End, &order);
+        let (m, seen) = instance("m", ResponseMode::End, &order);
         let body = tap(
             chunked(&[b"data"]),
             vec![m],
@@ -421,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn a_tapped_response_streams_rather_than_buffering() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::Tap, &order);
+        let (m, seen) = instance("m", ResponseMode::Tap, &order);
 
         // Two frames, then a pending tail that never completes.
         let head = stream::iter(vec![
@@ -458,24 +458,24 @@ mod tests {
         // and want nothing on the way back. Wrapping them would cost
         // a box and a poll per frame to drive no-op hooks.
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (request_only, _) = member("m", ResponseMode::None, &order);
+        let (request_only, _) = instance("m", ResponseMode::None, &order);
         assert!(!wants_response_phase(std::slice::from_ref(&request_only)));
 
         // Either interest above `None` earns the wrapper.
-        let (tapping, _) = member("t", ResponseMode::Tap, &order);
+        let (tapping, _) = instance("t", ResponseMode::Tap, &order);
         assert!(wants_response_phase(std::slice::from_ref(&tapping)));
 
-        let (settling, _) = member("s", ResponseMode::End, &order);
+        let (settling, _) = instance("s", ResponseMode::End, &order);
         assert!(wants_response_phase(std::slice::from_ref(&settling)));
     }
 
     #[test]
     fn short_circuited_requests_still_reach_the_terminal() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (m, seen) = member("m", ResponseMode::End, &order);
-        let mut members = vec![m];
+        let (m, seen) = instance("m", ResponseMode::End, &order);
+        let mut instances = vec![m];
         let mut cx = Cx::new();
-        end_without_response(&mut members, &mut cx, StatusCode::PAYLOAD_TOO_LARGE);
+        end_without_response(&mut instances, &mut cx, StatusCode::PAYLOAD_TOO_LARGE);
 
         let seen = seen.lock().unwrap();
         assert_eq!(

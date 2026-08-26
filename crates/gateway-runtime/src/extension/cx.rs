@@ -29,7 +29,7 @@ impl Cx {
     }
 
     /// The rule's backendRefs. Populated only for requests whose
-    /// members include a selector; empty otherwise.
+    /// instances include a selector; empty otherwise.
     pub fn targets(&self) -> &Targets {
         &self.targets
     }
@@ -41,9 +41,9 @@ impl Cx {
     }
 
     /// The request body accumulated so far. `Some` exactly when a
-    /// member declared `Buffer`: during body hooks it includes the
+    /// instance declared `Buffer`: during body hooks it includes the
     /// current chunk, and it is complete once `end_of_stream` was
-    /// delivered. `None` on rules whose members stream — nothing is
+    /// delivered. `None` on rules whose instances stream — nothing is
     /// retained for them. A borrow, not an owned handle: the buffer
     /// is still growing while hooks run, so an extension that wants
     /// to keep bytes copies them.

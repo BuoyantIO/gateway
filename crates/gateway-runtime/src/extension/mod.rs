@@ -40,7 +40,7 @@ pub trait ExtensionBuilder: Send + Sync {
 }
 
 /// What a builder declares about its instances, as one value; copied
-/// into the [`Member`] at instantiation.
+/// into the [`Instance`] at instantiation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Declarations {
     pub request_body: BodyMode,
@@ -98,10 +98,10 @@ pub trait Extension: Send {
     fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx) {}
 
     /// Pick where the request goes. Called exactly once, on the
-    /// rule's single member whose builder declared
+    /// rule's single extension whose builder declared
     /// [`ExtensionBuilder::selects_targets`], after the request body
-    /// has been fully delivered. Members that did not declare it are
-    /// never asked.
+    /// has been fully delivered. Extensions that did not declare it
+    /// are never asked.
     ///
     /// `held` is what the host kept of the request body;
     /// [`Held::forward`] turns it into the source to forward, `None`
@@ -113,7 +113,7 @@ pub trait Extension: Send {
     /// default load balancer: a selector that cannot decide is a
     /// failed request, not a differently routed one.
     async fn select(&mut self, _held: Held<'_>, _cx: &mut Cx) -> Result<Selected, Error> {
-        Err("member declared selects_targets but does not implement select".into())
+        Err("extension declared selects_targets but does not implement select".into())
     }
 }
 
@@ -151,11 +151,11 @@ impl Held<'_> {
 }
 
 /// Request-body access an extension declares. The rule's effective
-/// mode is the strictest across its members
+/// mode is the strictest across its instances
 /// (`Buffer` > `Stream` > `None`) and selects the host machinery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub enum BodyMode {
-    /// Never sees the body. When every member of a rule declares
+    /// Never sees the body. When every instance of a rule declares
     /// `None`, the gateway forwards the body without reading a frame.
     #[default]
     None,
@@ -174,13 +174,13 @@ pub enum BodyMode {
 
 /// Response access an extension declares. Ordered: `Tap` includes
 /// the terminal, and the host wraps the response only for routes
-/// with a member above `None`.
+/// with an instance above `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub enum ResponseMode {
     /// No response phase; the route's response is not wrapped.
     #[default]
     None,
-    /// [`Extension::on_response_end`] only — a member can settle at
+    /// [`Extension::on_response_end`] only — an instance can settle at
     /// the terminal without reading a byte, like a limiter closing
     /// its reservation.
     End,
@@ -207,15 +207,15 @@ pub struct LocalResponse {
     pub body: Bytes,
 }
 
-/// An instantiated member of a route's filter list: the per-request
-/// extension instance plus a copy of its builder's [`Declarations`],
-/// taken at build time — the builder is not consulted again.
-pub struct Member {
+/// One extension, instantiated for one request: the per-request
+/// instance plus a copy of its builder's [`Declarations`], taken at
+/// build time — the builder is not consulted again.
+pub struct Instance {
     pub decl: Declarations,
     pub ext: Box<dyn Extension>,
 }
 
-impl Member {
+impl Instance {
     /// Build one instance and record what its builder declared.
     pub fn from_builder(builder: &dyn ExtensionBuilder) -> Self {
         Self {
