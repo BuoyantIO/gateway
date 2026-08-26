@@ -23,7 +23,7 @@ use gateway_runtime::extension::{
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -178,6 +178,7 @@ fn http_config_proto(
         }],
         backends: vec![static_backend_proto("be", upstream_port, protocol)],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
@@ -298,6 +299,7 @@ async fn host_routing_picks_matching_listener() {
             static_backend("be-b", upstream_b),
         ],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -361,6 +363,7 @@ async fn path_routing_longest_prefix_wins() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -430,6 +433,7 @@ async fn request_header_modifier_applies() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -540,6 +544,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
             static_backend("be-b", upstream_b),
         ],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -558,11 +563,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(
         served, "A",
         "header set should route to header-matched rule"
@@ -576,11 +577,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(served, "B", "no header should fall through to catchall");
 
     // Request 3: wrong header value → catchall.
@@ -592,11 +589,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(
         served, "B",
         "wrong header value should fall through to catchall"
@@ -612,6 +605,14 @@ async fn header_routing_picks_header_rule_over_catchall() {
 /// A regex `path` match routes to its backend when the request
 /// path matches the (anchored) pattern, and falls through to a
 /// sibling catchall when it doesn't.
+/// The `x-echo-served-by` header the echo upstream reflected, or "".
+fn served_by<B>(resp: &Response<B>) -> &str {
+    resp.headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 #[tokio::test]
 async fn regex_path_routes_matching_request() {
     let upstream_match = spawn_http_echo().await;
@@ -678,6 +679,7 @@ async fn regex_path_routes_matching_request() {
             static_backend("be-catchall", upstream_catchall),
         ],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -695,11 +697,7 @@ async fn regex_path_routes_matching_request() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(
         served, "REGEX",
         "regex-matching path should hit the regex route"
@@ -713,11 +711,7 @@ async fn regex_path_routes_matching_request() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(served, "CATCHALL", "non-matching path should fall through");
 
     drop(shutdown_tx);
@@ -772,6 +766,7 @@ async fn response_header_modifier_applies() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1014,6 +1009,7 @@ async fn route_with_unregistered_backend_returns_500() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1082,6 +1078,7 @@ async fn weighted_refs_split_between_resolved_and_missing() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1164,6 +1161,7 @@ async fn redirect_short_circuit_skips_response_filters() {
         }],
         backends: vec![],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1230,6 +1228,7 @@ async fn invalid_filter_config_answers_500_before_dispatch() {
         }],
         backends: vec![static_backend("be", dead_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1291,6 +1290,7 @@ fn extension_ref_config(bind_port: u16, upstream_port: u16, plugin: &str) -> Gat
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
@@ -2141,6 +2141,7 @@ fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
         }],
         backends: vec![static_backend("be-a", be_a), static_backend("be-b", be_b)],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
@@ -2365,6 +2366,7 @@ async fn two_selectors_on_one_rule_fail_the_request() {
         }],
         backends: vec![static_backend("be-a", be)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);

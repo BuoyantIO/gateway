@@ -2052,6 +2052,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             binds: vec![],
             backends: vec![],
             secrets: vec![tls_secret("app-tls")],
+            extensions: vec![],
         };
         let report = store.apply(&cfg);
         assert_eq!(report.applied, 1);

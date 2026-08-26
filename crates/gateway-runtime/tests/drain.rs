@@ -106,6 +106,7 @@ fn config(binds: Vec<Bind>, upstream_port: u16) -> GatewayConfig {
             protocol: BackendProtocol::Http1,
         })],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 

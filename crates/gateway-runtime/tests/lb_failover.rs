@@ -137,6 +137,7 @@ fn cfg_endpoints(bind_port: u16, ports: &[u16]) -> GatewayConfig {
             protocol: BackendProtocol::Http1,
         })],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
