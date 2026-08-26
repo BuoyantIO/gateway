@@ -339,7 +339,9 @@ every frame exactly as the upstream sent it. The final call carries
 `end_of_stream: true` under the same single-latch guarantee as the
 request side. For an LLM response, the first tap call is the
 time-to-first-token moment — response headers arrive before inference
-starts, the first body frame after.
+starts, the first body frame after. The tap also runs on a response
+synthesized after dispatch (a dial-failure 502); the terminal's
+`upstream` field says which case the tap measured.
 
 Wrapping is conditional: a route whose instances all declared
 `ResponseMode::None` returns the upstream body untouched — no
@@ -352,8 +354,9 @@ response back defeats streaming it.
 Every request ends exactly once, and instances that declared
 `ResponseMode::End` or `Tap` are told how: `on_response_end` receives
 `ResponseEnd` — the status the client got, the response body bytes
-delivered, and `complete`, true only if the response body ran to its
-end.
+delivered, `complete`, true only if the response body ran to its
+end, and `upstream`, true only if the status came from an upstream
+response rather than being synthesized here.
 
 The hook fires in one of two ways:
 
@@ -388,7 +391,7 @@ The endings, grouped by phase:
 | instantiation failed | 500 | `internal` |
 
 **Answered without an upstream response** — `on_response_end` fires
-immediately: zero body bytes, `complete: false`.
+immediately: zero body bytes, `complete: false`, `upstream: false`.
 
 | ending | status | reason |
 |---|---|---|
@@ -402,12 +405,12 @@ immediately: zero body bytes, `complete: false`.
 
 **Dispatched** — `on_response_end` fires when the response body finishes.
 
-| ending | status | reason | `complete` |
-|---|---|---|---|
-| dial failed | 502 | `dial_failure` | true — the 502 ran to its end |
-| response delivered | upstream's status | `ok` | true |
-| client disconnected mid-response | as sent | `ok` | false |
-| upstream body failed mid-response | as sent | `ok` | false |
+| ending | status | reason | `complete` | `upstream` |
+|---|---|---|---|---|
+| dial failed | 502 | `dial_failure` | true — the 502 ran to its end | false — no upstream answered |
+| response delivered | upstream's status | `ok` | true | true |
+| client disconnected mid-response | as sent | `ok` | false | true |
+| upstream body failed mid-response | as sent | `ok` | false | true |
 
 One metric reason per request, on every row.
 

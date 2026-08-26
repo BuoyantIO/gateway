@@ -1728,7 +1728,7 @@ async fn hyper_frames_a_full_body_from_its_size_hint() {
 #[derive(Default)]
 struct ResponseSeen {
     chunks: Vec<(usize, bool)>,
-    ends: Vec<(StatusCode, u64, bool)>,
+    ends: Vec<ResponseEnd>,
 }
 
 struct ResponseProbeBuilder {
@@ -1786,11 +1786,7 @@ impl Extension for ResponseProbe {
     }
 
     fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
-        self.seen
-            .lock()
-            .unwrap()
-            .ends
-            .push((end.status, end.body_bytes, end.complete));
+        self.seen.lock().unwrap().ends.push(*end);
     }
 }
 
@@ -1857,7 +1853,15 @@ async fn a_response_tap_sees_the_body_and_the_client_still_gets_it() {
     let total: usize = seen.chunks.iter().map(|(len, _)| len).sum();
     assert_eq!(total, body.len());
     assert!(seen.chunks.last().unwrap().1, "terminal chunk not flagged");
-    assert_eq!(seen.ends, vec![(StatusCode::OK, body.len() as u64, true)]);
+    assert_eq!(
+        seen.ends,
+        vec![ResponseEnd {
+            status: StatusCode::OK,
+            body_bytes: body.len() as u64,
+            complete: true,
+            upstream: true,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -1902,7 +1906,12 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
         assert!(seen.chunks.is_empty(), "no upstream body to tap");
         assert_eq!(
             seen.ends,
-            vec![(StatusCode::TOO_MANY_REQUESTS, 0, false)],
+            vec![ResponseEnd {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body_bytes: 0,
+                complete: false,
+                upstream: false,
+            }],
             "a member that reserved on the request must still settle"
         );
     }

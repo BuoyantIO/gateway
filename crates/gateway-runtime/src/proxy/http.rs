@@ -654,7 +654,11 @@ fn finish_response(
     // Members stay alive past this function only when a route has
     // them: the response phase owns what the request phase borrowed.
     let body = if tap::wants_response_phase(&members) {
-        tap::tap(body, members, cx, parts.status)
+        // `Ok` here means the headers came from an upstream; anything
+        // else (`DialFailure`, `Internal`) is a response synthesized
+        // after dispatch, streaming through the same wrapper.
+        let upstream = matches!(outcome.reason, Reason::Ok);
+        tap::tap(body, members, cx, parts.status, upstream)
     } else {
         body
     };

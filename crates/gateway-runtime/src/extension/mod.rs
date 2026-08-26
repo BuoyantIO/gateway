@@ -270,8 +270,9 @@ impl std::fmt::Debug for BodySource {
     }
 }
 
-/// Terminal summary handed to [`Extension::on_response_end`].
-#[derive(Debug)]
+/// Terminal summary handed to [`Extension::on_response_end`]. Plain
+/// data: copy it, compare it, keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseEnd {
     /// What the client was answered with, whether that came from an
     /// upstream or was synthesized here.
@@ -282,4 +283,9 @@ pub struct ResponseEnd {
     /// that disconnected mid-stream, a failed body, and a request
     /// answered before any upstream response existed.
     pub complete: bool,
+    /// Whether the status came from an upstream response. `false`
+    /// covers a filter answering, a body limit, a failed selection,
+    /// and a failed dial — endings where no upstream response
+    /// existed. Host-populated.
+    pub upstream: bool,
 }
