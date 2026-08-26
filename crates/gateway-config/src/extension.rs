@@ -5,6 +5,25 @@ use serde::Deserialize;
 /// The opaque config type handed to an extension class.
 pub type ConfigValue = serde_yaml::Value;
 
+/// Serialize a class's config type into the opaque value — how an
+/// inline filter's typed config is handled.
+///
+/// # Errors
+/// A value the format cannot represent.
+pub fn to_value<T: serde::Serialize>(config: &T) -> Result<ConfigValue, serde_yaml::Error> {
+    serde_yaml::to_value(config)
+}
+
+/// Deserialize the opaque value into a class's config type.
+///
+/// # Errors
+/// A value the config type does not accept.
+pub fn from_value<T: serde::de::DeserializeOwned>(
+    value: &ConfigValue,
+) -> Result<T, serde_yaml::Error> {
+    serde_yaml::from_value(value.clone())
+}
+
 /// A named instantiation of an extension class: which class, the
 /// operator's policy, and an opaque config only the class reads.
 #[derive(Debug, Clone, Deserialize)]

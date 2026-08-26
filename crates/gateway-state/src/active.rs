@@ -57,6 +57,7 @@ pub struct ActiveTls {
 #[derive(Debug, Clone)]
 pub struct ActiveHttpRoute {
     pub key: RouteKey,
+    pub revision: u64,
     pub matches: Vec<HttpMatch>,
     pub filters: Vec<HttpFilter>,
     pub backends: Vec<ActiveBackendRef>,

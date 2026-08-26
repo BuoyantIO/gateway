@@ -13,13 +13,16 @@ use bytes::Bytes;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
-use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, Scheme};
+use gateway_config::extension::ConfigValue;
+use gateway_config::filter::{
+    HeaderOps, HeaderPair, HttpFilter, RedirectConfig, RedirectStatus, Scheme,
+};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
     Action, BodyMode, BodySource, Cx, Declarations, Error as ExtensionError, Extension,
-    ExtensionBuilder, Held, LocalResponse, Registry, ResponseEnd, ResponseMode, Selected,
-    Selection, Target, async_trait,
+    ExtensionBuilder, ExtensionClass, Held, LocalResponse, Registry, ResponseEnd, ResponseMode,
+    Selected, Selection, Target, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
@@ -1142,11 +1145,11 @@ async fn redirect_short_circuit_skips_response_filters() {
             },
             HttpFilter::RequestRedirect {
                 name: "to-https".into(),
-                scheme: Some(Scheme::Https),
-                hostname: None,
-                port: None,
-                status_code: RedirectStatus::MovedPermanently,
-                path: None,
+                redirect: RedirectConfig {
+                    scheme: Some(Scheme::Https),
+                    status_code: RedirectStatus::MovedPermanently,
+                    ..Default::default()
+                },
             },
         ],
     };
@@ -1321,6 +1324,77 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
             .get("x-stamped")
             .and_then(|v| v.to_str().ok()),
         Some("by-extension"),
+    );
+
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// Members are configured once per route revision: two requests share
+/// one configure; re-applying the route bumps the revision and
+/// configures again.
+#[tokio::test]
+async fn members_configure_once_per_route_revision() {
+    struct CountingClass {
+        configures: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExtensionClass for CountingClass {
+        fn configure(
+            &self,
+            _config: &ConfigValue,
+        ) -> Result<Arc<dyn ExtensionBuilder>, ExtensionError> {
+            self.configures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(StampBuilder))
+        }
+    }
+
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream_port, "counted");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let configures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::new();
+    registry
+        .register(
+            "counted",
+            Arc::new(CountingClass {
+                configures: Arc::clone(&configures),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store.clone()).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let url: hyper::Uri = format!("http://127.0.0.1:{bind_port}/").parse().unwrap();
+    for _ in 0..2 {
+        let resp = client.get(url.clone()).await.expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        configures.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "two requests on one route revision share one configure"
+    );
+
+    // Re-applying the route rebuilds it with a fresh revision.
+    let _ = store.apply(&cfg);
+    let resp = client.get(url).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        configures.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a rebuilt route configures its members again"
     );
 
     drop(stop);
