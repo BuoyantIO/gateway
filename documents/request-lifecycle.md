@@ -92,11 +92,11 @@ filter serializes its typed config and names its reserved class; an
 (`class_and_config` is the one funnel). The class configures a
 builder once per route revision — the store stamps
 `ActiveHttpRoute.revision` on every rebuild — and the runtime caches
-the result (`MemberCache`). Config parsing and validation happen
+the result (`ExtensionCache`). Config parsing and validation happen
 there, never per request.
 
 Per request, each cached builder constructs one extension instance
-(in code: `Member`), holding the instance and the builder's
+(in code: `Instance`), holding the hook receiver and the builder's
 `Declarations` (`request_body`, `response`, `selects_targets`). The
 declarations drive everything downstream — the body tier, response
 wrapping, `on_response_end` delivery.

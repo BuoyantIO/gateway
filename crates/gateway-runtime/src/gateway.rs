@@ -14,8 +14,8 @@ use crate::extension::Registry;
 use crate::extension::builtin::register_builtins;
 use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
 use crate::metrics::Metrics;
+use crate::proxy::extensions::ExtensionCache;
 use crate::proxy::http::HttpClient;
-use crate::proxy::members::MemberCache;
 
 /// The gateway data-plane runtime. Subscribes to `BindEvent`s from a
 /// `Store` and manages one accept task per active bind.
@@ -37,10 +37,10 @@ pub struct Gateway {
     /// (never scraped) unless the caller registered them.
     pub(crate) metrics: Arc<Metrics>,
     /// Extension classes a route's filters resolve against. Always
-    /// holds the built-ins; `with_extensions` adds the caller's.
-    pub(crate) extensions: Arc<Registry>,
-    /// Configured route members, cached per route revision.
-    pub(crate) members: Arc<MemberCache>,
+    /// holds the built-ins; `with_classes` adds the caller's.
+    pub(crate) classes: Arc<Registry>,
+    /// The routes' resolved extensions, cached per route revision.
+    pub(crate) extensions: Arc<ExtensionCache>,
 }
 
 /// Everything an accepted connection needs from its bind, bundled so
@@ -54,8 +54,8 @@ pub(crate) struct ProxyCtx {
     pub(crate) lb: Arc<LoadBalancer>,
     pub(crate) http_client: HttpClient,
     pub(crate) metrics: Arc<Metrics>,
-    pub(crate) extensions: Arc<Registry>,
-    pub(crate) members: Arc<MemberCache>,
+    pub(crate) classes: Arc<Registry>,
+    pub(crate) extensions: Arc<ExtensionCache>,
 }
 
 impl Gateway {
@@ -75,8 +75,8 @@ impl Gateway {
             lb: Arc::new(lb),
             http_client: HttpClient::default(),
             metrics: Metrics::new(),
-            extensions: Arc::new(registry),
-            members: Arc::new(MemberCache::default()),
+            classes: Arc::new(registry),
+            extensions: Arc::new(ExtensionCache::default()),
         }
     }
 
@@ -95,9 +95,9 @@ impl Gateway {
     /// The built-ins are registered on top; their reserved names are
     /// not available to callers.
     #[must_use]
-    pub fn with_extensions(mut self, mut registry: Registry) -> Self {
+    pub fn with_classes(mut self, mut registry: Registry) -> Self {
         register_builtins(&mut registry);
-        self.extensions = Arc::new(registry);
+        self.classes = Arc::new(registry);
         self
     }
 
@@ -197,8 +197,8 @@ impl Gateway {
             lb: Arc::clone(&self.lb),
             http_client: self.http_client.clone(),
             metrics: Arc::clone(&self.metrics),
+            classes: Arc::clone(&self.classes),
             extensions: Arc::clone(&self.extensions),
-            members: Arc::clone(&self.members),
         };
         let (bind_signal, bind_drain) = drain::channel();
         // One merged watch per bind: connections fire on process

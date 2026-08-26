@@ -39,7 +39,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::drain;
 use crate::extension::{
-    Action, BodyMode, Cx, Held, LocalResponse, Member, Selected, Target, TargetBackend, Targets,
+    Action, BodyMode, Cx, Held, Instance, LocalResponse, Selected, Target, TargetBackend, Targets,
 };
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
@@ -218,7 +218,7 @@ async fn serve_request_inner(
     cx.set_matched_path_prefix(resolved.matched_path_prefix.as_deref());
     cx.set_request_host(host_stripped.as_deref());
 
-    let Some(mut extensions) = instantiate_members(ctx, &resolved.route) else {
+    let Some(mut extensions) = instantiate_extensions(ctx, &resolved.route) else {
         return (
             synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
             RequestOutcome::short_circuit(listener, route, Reason::Internal),
@@ -231,7 +231,7 @@ async fn serve_request_inner(
         return early;
     }
 
-    // At most one member may select; two is a config error the
+    // At most one instance may select; two is a config error the
     // registry cannot see, so it fails here, loudly.
     if extensions.iter().filter(|m| m.decl.selects_targets).count() > 1 {
         let names: Vec<&str> = resolved
@@ -307,7 +307,7 @@ async fn serve_request_inner(
 /// redirect) is the route working as configured.
 fn phase_response(
     phase: RequestPhase,
-    members: &mut [Member],
+    instances: &mut [Instance],
     cx: &mut Cx,
     listener: Option<&str>,
     route: Option<&str>,
@@ -321,7 +321,7 @@ fn phase_response(
         ),
     };
     Some(short_circuit(
-        members,
+        instances,
         cx,
         resp,
         RequestOutcome::short_circuit(listener, route, reason),
@@ -329,42 +329,42 @@ fn phase_response(
 }
 
 /// Answer without ever reaching an upstream response, firing the
-/// terminal hook on members that were already built. A member that
+/// terminal hook on instances that were already built. An instance that
 /// reserved something on the request — a limiter's budget — settles
 /// it here exactly as it would on a served response.
 fn short_circuit(
-    members: &mut [Member],
+    instances: &mut [Instance],
     cx: &mut Cx,
     resp: Response<ResponseBody>,
     outcome: RequestOutcome,
 ) -> (Response<ResponseBody>, RequestOutcome) {
-    tap::end_without_response(members, cx, resp.status());
+    tap::end_without_response(instances, cx, resp.status());
     (resp, outcome)
 }
 
 /// Body phase and upstream dispatch, in the order the strictest
-/// declared body mode requires. Routes whose members want nothing
+/// declared body mode requires. Routes whose instances want nothing
 /// take the passthrough and never read a frame.
 async fn dispatch(
     ctx: &ProxyCtx,
     parts: http::request::Parts,
     body: Incoming,
-    mut members: Vec<Member>,
+    mut instances: Vec<Instance>,
     mut cx: Cx,
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
-    let mode = members
+    let mode = instances
         .iter()
         .map(|m| m.decl.request_body)
         .max()
         .unwrap_or_default();
     if mode == BodyMode::Stream {
-        return serve_streamed(ctx, parts, body, members, cx, backend, (listener, route)).await;
+        return serve_streamed(ctx, parts, body, instances, cx, backend, (listener, route)).await;
     }
     let upstream_body = if mode == BodyMode::Buffer {
         match gate::run(
-            &mut members,
+            &mut instances,
             &parts,
             body,
             &mut cx,
@@ -377,7 +377,7 @@ async fn dispatch(
             gate::GateOutcome::Drained => unreachable!("buffered drain always forwards"),
             gate::GateOutcome::Halt(halt) => {
                 let (resp, outcome) = halt_response(halt, listener, route);
-                return short_circuit(&mut members, &mut cx, resp, outcome);
+                return short_circuit(&mut instances, &mut cx, resp, outcome);
             }
         }
     } else {
@@ -387,7 +387,7 @@ async fn dispatch(
 
     let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
         return short_circuit(
-            &mut members,
+            &mut instances,
             &mut cx,
             synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
@@ -405,25 +405,25 @@ async fn dispatch(
         endpoint: Some(endpoint_authority),
         dial_ms,
     };
-    finish_response(members, cx, upstream, outcome)
+    finish_response(instances, cx, upstream, outcome)
 }
 
 /// Stream tier: the destination is already known, so dispatch first
 /// and pump body frames through the hooks while the request is in
-/// flight. Joined, not spawned — the pump borrows the members and the
+/// flight. Joined, not spawned — the pump borrows the instances and the
 /// context, and the borrow ends at the join.
 async fn serve_streamed(
     ctx: &ProxyCtx,
     parts: http::request::Parts,
     body: Incoming,
-    mut members: Vec<Member>,
+    mut instances: Vec<Instance>,
     mut cx: Cx,
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
     let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
         return short_circuit(
-            &mut members,
+            &mut instances,
             &mut cx,
             synthesize_status(StatusCode::SERVICE_UNAVAILABLE),
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
@@ -438,7 +438,7 @@ async fn serve_streamed(
         UpstreamBody::Stream(StreamBody::new(ReceiverStream::new(rx))),
     );
     let forward_fut = forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info);
-    let pump_fut = gate::pump(&mut members, body, tx, &mut cx);
+    let pump_fut = gate::pump(&mut instances, body, tx, &mut cx);
     let ((upstream, reason, dial_ms), pump) = tokio::join!(forward_fut, pump_fut);
 
     // The pump's verdict wins: nothing has reached the client yet, so
@@ -446,7 +446,7 @@ async fn serve_streamed(
     // and the upstream send was already reset through the pipe.
     if let gate::PumpOutcome::Halt(halt) = pump {
         let (resp, outcome) = halt_response(halt, listener, route);
-        return short_circuit(&mut members, &mut cx, resp, outcome);
+        return short_circuit(&mut instances, &mut cx, resp, outcome);
     }
     let outcome = RequestOutcome {
         listener: listener.map(str::to_owned),
@@ -455,7 +455,7 @@ async fn serve_streamed(
         endpoint: Some(endpoint_authority),
         dial_ms,
     };
-    finish_response(members, cx, upstream, outcome)
+    finish_response(instances, cx, upstream, outcome)
 }
 
 /// Selection path: the body settles first, the rule's selector picks
@@ -465,16 +465,16 @@ async fn serve_selected(
     ctx: &ProxyCtx,
     mut parts: http::request::Parts,
     body: Incoming,
-    mut members: Vec<Member>,
+    mut instances: Vec<Instance>,
     mut cx: Cx,
     route: &Arc<ActiveHttpRoute>,
     (listener, route_name): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
-    let held_body = match settle_body(&mut members, &parts, body, &mut cx).await {
+    let held_body = match settle_body(&mut instances, &parts, body, &mut cx).await {
         Ok(held) => held,
         Err(halt) => {
             let (resp, outcome) = halt_response(halt, listener, route_name);
-            return short_circuit(&mut members, &mut cx, resp, outcome);
+            return short_circuit(&mut instances, &mut cx, resp, outcome);
         }
     };
 
@@ -483,7 +483,7 @@ async fn serve_selected(
         HeldBody::Untouched(_) => Held::Untouched,
         HeldBody::Nothing => Held::Nothing,
     };
-    let selector = members
+    let selector = instances
         .iter_mut()
         .find(|m| m.decl.selects_targets)
         .expect("caller checked a selector exists");
@@ -493,7 +493,7 @@ async fn serve_selected(
         // the route working as configured.
         Ok(Selected::Respond(resp)) => {
             return short_circuit(
-                &mut members,
+                &mut instances,
                 &mut cx,
                 local_response(resp),
                 RequestOutcome::short_circuit(listener, route_name, Reason::Ok),
@@ -504,7 +504,7 @@ async fn serve_selected(
         Err(e) => {
             tracing::warn!(error = %e, "selector failed");
             return short_circuit(
-                &mut members,
+                &mut instances,
                 &mut cx,
                 synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
                 RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
@@ -514,7 +514,7 @@ async fn serve_selected(
 
     let Some((backend, endpoint, info)) = validate_target(&selection.target, route, &ctx.lb) else {
         return short_circuit(
-            &mut members,
+            &mut instances,
             &mut cx,
             synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
             RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
@@ -528,7 +528,7 @@ async fn serve_selected(
         Err(e) => {
             tracing::warn!(error = %e, "selector body source cannot be honored");
             return short_circuit(
-                &mut members,
+                &mut instances,
                 &mut cx,
                 synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
                 RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
@@ -546,7 +546,7 @@ async fn serve_selected(
         endpoint: Some(endpoint_authority),
         dial_ms,
     };
-    finish_response(members, cx, upstream, outcome)
+    finish_response(instances, cx, upstream, outcome)
 }
 
 /// Settle the request body ahead of selection. Buffer retains it for
@@ -554,12 +554,12 @@ async fn serve_selected(
 /// supplies the forwarded body); None never reads it, so the client's
 /// stream stays whole.
 async fn settle_body(
-    members: &mut [Member],
+    instances: &mut [Instance],
     parts: &http::request::Parts,
     body: Incoming,
     cx: &mut Cx,
 ) -> Result<HeldBody, gate::Halt> {
-    let mode = members
+    let mode = instances
         .iter()
         .map(|m| m.decl.request_body)
         .max()
@@ -569,7 +569,7 @@ async fn settle_body(
         BodyMode::Buffer => gate::DrainMode::RetainForSelection,
         BodyMode::Stream => gate::DrainMode::DeliverOnly,
     };
-    match gate::run(members, parts, body, cx, drain_mode).await {
+    match gate::run(instances, parts, body, cx, drain_mode).await {
         gate::GateOutcome::Drained => Ok(match mode {
             BodyMode::Buffer => HeldBody::Buffered(cx.take_request_buffer().unwrap_or_default()),
             _ => HeldBody::Nothing,
@@ -632,25 +632,25 @@ fn validate_target(
 /// runs after, so an extension can't accidentally keep a hop-by-hop
 /// header alive.
 fn finish_response(
-    mut members: Vec<Member>,
+    mut instances: Vec<Instance>,
     mut cx: Cx,
     upstream: Response<ResponseBody>,
     outcome: RequestOutcome,
 ) -> (Response<ResponseBody>, RequestOutcome) {
     let (mut parts, body) = upstream.into_parts();
-    for member in members.iter_mut().rev() {
-        member.ext.on_response_start(&mut parts, &mut cx);
+    for instance in instances.iter_mut().rev() {
+        instance.ext.on_response_start(&mut parts, &mut cx);
     }
     strip_hop_by_hop_headers(&mut parts.headers);
 
     // Members stay alive past this function only when a route has
     // them: the response phase owns what the request phase borrowed.
-    let body = if tap::wants_response_phase(&members) {
+    let body = if tap::wants_response_phase(&instances) {
         // `Ok` here means the headers came from an upstream; anything
         // else (`DialFailure`, `Internal`) is a response synthesized
         // after dispatch, streaming through the same wrapper.
         let upstream = matches!(outcome.reason, Reason::Ok);
-        tap::tap(body, members, cx, parts.status, upstream)
+        tap::tap(body, instances, cx, parts.status, upstream)
     } else {
         body
     };
@@ -683,16 +683,16 @@ fn halt_response(
     (resp, RequestOutcome::short_circuit(listener, route, reason))
 }
 
-/// Per-request instances from the route's cached members. Members
+/// Per-request instances from the route's cached instances. Members
 /// are configured once per route revision; per request each cached
 /// builder constructs one instance. A filter the registry rejects
 /// resolves to `None` — the failure was logged when it was cached.
-fn instantiate_members(ctx: &ProxyCtx, route: &ActiveHttpRoute) -> Option<Vec<Member>> {
-    let members = ctx.members.members_for(&ctx.extensions, route).ok()?;
+fn instantiate_extensions(ctx: &ProxyCtx, route: &ActiveHttpRoute) -> Option<Vec<Instance>> {
+    let resolved = ctx.extensions.for_route(&ctx.classes, route).ok()?;
     Some(
-        members
+        resolved
             .iter()
-            .map(|m| Member {
+            .map(|m| Instance {
                 decl: m.decl,
                 ext: m.builder.build(),
             })
@@ -709,12 +709,12 @@ enum RequestPhase {
 
 /// Run the request-side hooks in route order.
 async fn run_request_hooks(
-    members: &mut [Member],
+    instances: &mut [Instance],
     parts: &mut http::request::Parts,
     cx: &mut Cx,
 ) -> RequestPhase {
-    for member in members.iter_mut() {
-        match member.ext.on_request_start(parts, cx).await {
+    for instance in instances.iter_mut() {
+        match instance.ext.on_request_start(parts, cx).await {
             Ok(Action::Continue) => {}
             Ok(Action::Respond(resp)) => return RequestPhase::Respond(resp),
             Err(e) => {
@@ -742,7 +742,7 @@ fn local_response(resp: LocalResponse) -> Response<ResponseBody> {
 
 struct ResolvedRoute {
     backend: BackendChoice,
-    /// The route itself, for rules whose members select: the full
+    /// The route itself, for rules whose instances select: the full
     /// backendRef set is the selection allowlist, and the weighted
     /// pick above only kept its winner.
     route: Arc<ActiveHttpRoute>,

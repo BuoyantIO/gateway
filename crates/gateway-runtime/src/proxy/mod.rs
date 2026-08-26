@@ -4,7 +4,7 @@
 
 pub(crate) mod access;
 pub(crate) mod body;
+pub(crate) mod extensions;
 pub(crate) mod gate;
 pub(crate) mod http;
-pub(crate) mod members;
 pub(crate) mod tap;

@@ -1,8 +1,8 @@
 //! Request-body gate: delivers body chunks to the route's extension
-//! members. Two tiers, picked by the rule's strictest declared mode.
+//! instances. Two tiers, picked by the rule's strictest declared mode.
 //! `Buffer` drains the body before dispatch ([`run`]); `Stream` pumps
 //! frames toward an already-dispatched upstream ([`pump`]). Routes
-//! whose members declare neither never enter this module.
+//! whose instances declare neither never enter this module.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Full};
 use tokio::sync::mpsc;
 
-use crate::extension::{Action, BodyMode, Cx, LocalResponse, Member};
+use crate::extension::{Action, BodyMode, Cx, Instance, LocalResponse};
 use crate::proxy::body::{BoxError, UpstreamBody};
 
 /// Buffer-tier size cap. A memory bound: the whole body is held until
@@ -83,11 +83,11 @@ enum Delivery {
 }
 
 /// Buffer tier: drain the whole body before dispatch, delivering each
-/// chunk to the body members and accumulating into
+/// chunk to the body instances and accumulating into
 /// [`Cx::request_buffer`]. Generic over the body so tests can drive
 /// it with synthetic frames.
 pub(super) async fn run<B>(
-    members: &mut [Member],
+    instances: &mut [Instance],
     parts: &http::request::Parts,
     mut body: B,
     cx: &mut Cx,
@@ -127,7 +127,7 @@ where
             // end-of-stream on a data frame (chunked bodies end
             // here): the terminal call carries an empty chunk.
             None => {
-                return match deliver(members, &Bytes::new(), true, cx).await {
+                return match deliver(instances, &Bytes::new(), true, cx).await {
                     Delivery::Continue => drained(mode, cx),
                     Delivery::Respond(resp) => GateOutcome::Halt(Halt::Respond(Box::new(resp))),
                     Delivery::Failed => GateOutcome::Halt(Halt::Failed),
@@ -156,7 +156,7 @@ where
         // stay `false` and end at the `None` arm above — between the
         // two, the end-of-stream call fires exactly once.
         let end_of_stream = body.is_end_stream();
-        match deliver(members, &data, end_of_stream, cx).await {
+        match deliver(instances, &data, end_of_stream, cx).await {
             Delivery::Continue => {}
             Delivery::Respond(resp) => return GateOutcome::Halt(Halt::Respond(Box::new(resp))),
             Delivery::Failed => return GateOutcome::Halt(Halt::Failed),
@@ -181,7 +181,7 @@ fn drained(mode: DrainMode, cx: &mut Cx) -> GateOutcome {
 /// and [`Cx::request_buffer`] stays `None`. The caller joins this
 /// with the response future.
 pub(super) async fn pump<B>(
-    members: &mut [Member],
+    instances: &mut [Instance],
     mut body: B,
     tx: mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
     cx: &mut Cx,
@@ -197,7 +197,7 @@ where
         };
         let frame = match polled {
             None => {
-                return match deliver(members, &Bytes::new(), true, cx).await {
+                return match deliver(instances, &Bytes::new(), true, cx).await {
                     // Dropping `tx` half-closes the upstream body.
                     Delivery::Continue => PumpOutcome::Done,
                     Delivery::Respond(resp) => {
@@ -230,7 +230,7 @@ where
             return abort(&tx, "request body over stream cap", Halt::TooLarge).await;
         }
         let end_of_stream = body.is_end_stream();
-        match deliver(members, &data, end_of_stream, cx).await {
+        match deliver(instances, &data, end_of_stream, cx).await {
             Delivery::Continue => {}
             Delivery::Respond(resp) => {
                 return abort(&tx, "extension responded", Halt::Respond(Box::new(resp))).await;
@@ -250,18 +250,18 @@ where
     }
 }
 
-/// One chunk through every body-mode member, in list order.
+/// One chunk through every body-mode instance, in list order.
 async fn deliver(
-    members: &mut [Member],
+    instances: &mut [Instance],
     chunk: &Bytes,
     end_of_stream: bool,
     cx: &mut Cx,
 ) -> Delivery {
-    for member in members
+    for instance in instances
         .iter_mut()
         .filter(|m| m.decl.request_body != BodyMode::None)
     {
-        match member
+        match instance
             .ext
             .on_request_body(chunk.clone(), end_of_stream, cx)
             .await
@@ -349,23 +349,23 @@ mod tests {
         }
     }
 
-    fn member(
+    fn instance(
         mode: BodyMode,
         respond_at: Option<usize>,
-    ) -> (Member, std::sync::Arc<std::sync::Mutex<Recorder>>) {
+    ) -> (Instance, std::sync::Arc<std::sync::Mutex<Recorder>>) {
         let rec = std::sync::Arc::new(std::sync::Mutex::new(Recorder {
             calls: Vec::new(),
             buffer_seen: Vec::new(),
             respond_at,
         }));
-        let member = Member {
+        let instance = Instance {
             decl: crate::extension::Declarations {
                 request_body: mode,
                 ..Default::default()
             },
             ext: Box::new(Handle(std::sync::Arc::clone(&rec))),
         };
-        (member, rec)
+        (instance, rec)
     }
 
     fn parts() -> http::request::Parts {
@@ -392,11 +392,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_body_delivers_one_terminal_call() {
-        let (m, rec) = member(BodyMode::Buffer, None);
-        let mut members = [m];
+        let (m, rec) = instance(BodyMode::Buffer, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let out = run(
-            &mut members,
+            &mut instances,
             &parts(),
             chunked(&[]),
             &mut cx,
@@ -413,11 +413,11 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_body_accumulates_and_flags_the_terminal_call() {
-        let (m, rec) = member(BodyMode::Buffer, None);
-        let mut members = [m];
+        let (m, rec) = instance(BodyMode::Buffer, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let out = run(
-            &mut members,
+            &mut instances,
             &parts(),
             chunked(&[b"hel", b"lo"]),
             &mut cx,
@@ -449,12 +449,12 @@ mod tests {
     async fn content_length_body_ends_on_its_last_frame_exactly_once() {
         // `Full` reports end-of-stream right after its single frame;
         // its terminal `None` must never produce a second call.
-        let (m, rec) = member(BodyMode::Buffer, None);
-        let mut members = [m];
+        let (m, rec) = instance(BodyMode::Buffer, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let body = Full::new(Bytes::from_static(b"payload"));
         let out = run(
-            &mut members,
+            &mut instances,
             &parts_with_len(7),
             body,
             &mut cx,
@@ -470,11 +470,11 @@ mod tests {
     #[tokio::test]
     async fn over_cap_rejects_on_both_paths() {
         // Declared up front: rejected before a single hook call.
-        let (m, rec) = member(BodyMode::Buffer, None);
-        let mut members = [m];
+        let (m, rec) = instance(BodyMode::Buffer, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let out = run(
-            &mut members,
+            &mut instances,
             &parts_with_len(REQUEST_BODY_MAX_BYTES + 1),
             chunked(&[b"never read"]),
             &mut cx,
@@ -485,12 +485,12 @@ mod tests {
         assert!(rec.lock().unwrap().calls.is_empty());
 
         // Undeclared: rejected from the running total mid-body.
-        let (m, _rec) = member(BodyMode::Buffer, None);
-        let mut members = [m];
+        let (m, _rec) = instance(BodyMode::Buffer, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let big = vec![0u8; usize::try_from(REQUEST_BODY_MAX_BYTES).unwrap() + 1];
         let out = run(
-            &mut members,
+            &mut instances,
             &parts(),
             chunked(&[&big]),
             &mut cx,
@@ -502,12 +502,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stalled_client_times_out() {
-        let (m, _rec) = member(BodyMode::Buffer, None);
-        let mut members = [m];
+        let (m, _rec) = instance(BodyMode::Buffer, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let body = StreamBody::new(stream::pending::<Result<Frame<Bytes>, BoxError>>());
         let out = run(
-            &mut members,
+            &mut instances,
             &parts(),
             body,
             &mut cx,
@@ -519,11 +519,11 @@ mod tests {
 
     #[tokio::test]
     async fn respond_mid_body_stops_the_drain() {
-        let (m, rec) = member(BodyMode::Buffer, Some(0));
-        let mut members = [m];
+        let (m, rec) = instance(BodyMode::Buffer, Some(0));
+        let mut instances = [m];
         let mut cx = Cx::new();
         let out = run(
-            &mut members,
+            &mut instances,
             &parts(),
             chunked(&[b"a", b"b"]),
             &mut cx,
@@ -539,13 +539,13 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_rule_delivers_to_stream_members_too() {
-        let (buffered, rec_b) = member(BodyMode::Buffer, None);
-        let (streaming, rec_s) = member(BodyMode::Stream, None);
-        let (none, rec_n) = member(BodyMode::None, None);
-        let mut members = [buffered, streaming, none];
+        let (buffered, rec_b) = instance(BodyMode::Buffer, None);
+        let (streaming, rec_s) = instance(BodyMode::Stream, None);
+        let (none, rec_n) = instance(BodyMode::None, None);
+        let mut instances = [buffered, streaming, none];
         let mut cx = Cx::new();
         let out = run(
-            &mut members,
+            &mut instances,
             &parts(),
             chunked(&[b"x"]),
             &mut cx,
@@ -560,8 +560,8 @@ mod tests {
 
     #[tokio::test]
     async fn pump_forwards_chunks_and_leaves_the_buffer_empty() {
-        let (m, rec) = member(BodyMode::Stream, None);
-        let mut members = [m];
+        let (m, rec) = instance(BodyMode::Stream, None);
+        let mut instances = [m];
         let mut cx = Cx::new();
         let (tx, rx) = mpsc::channel(BODY_PIPE_CAPACITY);
         let collect = tokio::spawn(async move {
@@ -570,7 +570,7 @@ mod tests {
                 .await
                 .map(http_body_util::Collected::to_bytes)
         });
-        let out = pump(&mut members, chunked(&[b"one", b"two"]), tx, &mut cx).await;
+        let out = pump(&mut instances, chunked(&[b"one", b"two"]), tx, &mut cx).await;
         assert!(matches!(out, PumpOutcome::Done));
         assert_eq!(
             collect.await.unwrap().unwrap(),
@@ -585,11 +585,11 @@ mod tests {
 
     #[tokio::test]
     async fn pump_respond_injects_an_error_into_the_pipe() {
-        let (m, _rec) = member(BodyMode::Stream, Some(0));
-        let mut members = [m];
+        let (m, _rec) = instance(BodyMode::Stream, Some(0));
+        let mut instances = [m];
         let mut cx = Cx::new();
         let (tx, mut rx) = mpsc::channel(BODY_PIPE_CAPACITY);
-        let out = pump(&mut members, chunked(&[b"a"]), tx, &mut cx).await;
+        let out = pump(&mut instances, chunked(&[b"a"]), tx, &mut cx).await;
         assert!(matches!(out, PumpOutcome::Halt(Halt::Respond(_))));
         // The pipe carries the injected error, so hyper resets the
         // upstream instead of half-closing a truncated body.
