@@ -1,6 +1,6 @@
 //! Per-request extensions attached to routes.
 //!
-//! An extension is built once per configured plugin and instantiated
+//! A builder is configured once per extension and instantiated
 //! once per request. Request hooks run in the rule's filter order and
 //! may gate the request; response hooks run in reverse order and only
 //! observe. One extension per rule may select the upstream target.
@@ -19,7 +19,9 @@ mod registry;
 // same macro version the trait was defined with.
 pub use async_trait::async_trait;
 pub use cx::{Cx, TargetBackend, Targets};
-pub use registry::{Registry, RegistryError};
+pub use registry::{
+    ConfigureError, ConfiguredExtension, ExtensionClass, PreConfigured, Registry, RegistryError,
+};
 
 /// Error an extension hook returns, and the error type of a body an
 /// extension supplies.

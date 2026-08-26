@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use gateway_config::extension::ConfigValue;
 use gateway_config::filter::{
     HeaderOps, HeaderPair, HttpFilter as ConfigFilter, RedirectPath, RedirectStatus, Scheme,
 };
@@ -13,7 +14,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Member, Registry};
 
-/// Reserved plugin names for the built-ins.
+/// Reserved class names for the built-ins.
 pub const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
 pub const RESPONSE_HEADER_MODIFIER: &str = "response_header_modifier";
 pub const REQUEST_REDIRECT: &str = "request_redirect";
@@ -24,8 +25,10 @@ pub enum FilterError {
     InvalidHeaderName(String),
     #[error("invalid header value for `{0}`")]
     InvalidHeaderValue(String),
-    #[error("no extension registered under `{0}`")]
-    UnknownPlugin(String),
+    #[error("no extension class registered under `{0}`")]
+    UnknownClass(String),
+    #[error("extension class `{class}` rejected the config: {detail}")]
+    ClassRejected { class: String, detail: String },
 }
 
 /// `HeaderOps` with names and values parsed up front. Invalid `remove`
@@ -113,9 +116,19 @@ pub fn instance_for(cfg: &ConfigFilter, registry: &Registry) -> Result<Member, F
             path.clone(),
         ))),
         ConfigFilter::ExtensionRef { name } => {
-            let builder = registry
+            let class = registry
                 .get(name)
-                .ok_or_else(|| FilterError::UnknownPlugin(name.clone()))?;
+                .ok_or_else(|| FilterError::UnknownClass(name.clone()))?;
+            // Provisional refs carry no config; a class that needs
+            // one rejects `Null` here. Runs per request until member
+            // resolution moves to config apply.
+            let builder =
+                class
+                    .configure(&ConfigValue::Null)
+                    .map_err(|e| FilterError::ClassRejected {
+                        class: name.clone(),
+                        detail: e.to_string(),
+                    })?;
             Ok(Member::from_builder(builder.as_ref()))
         }
     }
@@ -556,7 +569,7 @@ mod tests {
 
         let mut registry = Registry::new();
         registry
-            .register("noop", std::sync::Arc::new(NoopBuilder))
+            .register_builder("noop", std::sync::Arc::new(NoopBuilder))
             .expect("register");
 
         let known = ConfigFilter::ExtensionRef {
@@ -569,7 +582,7 @@ mod tests {
         };
         assert!(matches!(
             instance_for(&unknown, &registry),
-            Err(FilterError::UnknownPlugin(name)) if name == "absent"
+            Err(FilterError::UnknownClass(name)) if name == "absent"
         ));
     }
 
