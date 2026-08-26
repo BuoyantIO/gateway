@@ -84,6 +84,8 @@ struct Inner {
     active_listeners: HashMap<ListenerKey, Arc<ActiveListener>>,
     /// Routes that satisfy every precondition right now.
     active_routes: HashMap<RouteKey, Arc<ActiveHttpRoute>>,
+    /// Monotonic stamp for [`ActiveHttpRoute::revision`].
+    route_revision: u64,
 
     /// Index: listeners under a bind, active OR pending.
     listeners_by_parent: HashMap<BindKey, HashSet<ListenerKey>>,
@@ -840,8 +842,10 @@ impl Inner {
                 }
             })
             .collect();
+        self.route_revision += 1;
         let active = Arc::new(ActiveHttpRoute {
             key: key.clone(),
+            revision: self.route_revision,
             matches: route.matches,
             filters: route.filters,
             backends: resolved,
@@ -2111,6 +2115,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             binds: vec![],
             backends: vec![],
             secrets: vec![tls_secret("app-tls")],
+            extensions: vec![],
         };
         let report = store.apply(&cfg);
         assert_eq!(report.applied, 1);
@@ -2201,6 +2206,31 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
     // v0 terminates only — a passthrough HTTPS listener is rejected,
     // not accepted and then mis-gated on secrets.
+    #[test]
+    fn route_revision_changes_on_every_rebuild() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+
+        let revision =
+            |store: &Store| store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
+        let first = revision(&store);
+
+        // A route re-upsert rebuilds it.
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        let second = revision(&store);
+        assert!(second > first);
+
+        // A backend cascade rebuilds it too.
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.2", 8080)]));
+        let third = revision(&store);
+        assert!(third > second);
+    }
+
     #[test]
     fn https_listener_passthrough_mode_rejected() {
         let store = Store::new();

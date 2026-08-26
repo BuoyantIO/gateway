@@ -13,17 +13,20 @@ use bytes::Bytes;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
-use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter, RedirectStatus, Scheme};
+use gateway_config::extension::ConfigValue;
+use gateway_config::filter::{
+    HeaderOps, HeaderPair, HttpFilter, RedirectConfig, RedirectStatus, Scheme,
+};
 use gateway_config::listener::{HttpListener as SchemaHttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
 use gateway_runtime::extension::{
     Action, BodyMode, BodySource, Cx, Declarations, Error as ExtensionError, Extension,
-    ExtensionBuilder, Held, LocalResponse, Registry, ResponseEnd, ResponseMode, Selected,
-    Selection, Target, async_trait,
+    ExtensionBuilder, ExtensionClass, Held, LocalResponse, Registry, ResponseEnd, ResponseMode,
+    Selected, Selection, Target, async_trait,
 };
 use gateway_runtime::{Gateway, drain};
 use gateway_state::Store;
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -178,6 +181,7 @@ fn http_config_proto(
         }],
         backends: vec![static_backend_proto("be", upstream_port, protocol)],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
@@ -298,6 +302,7 @@ async fn host_routing_picks_matching_listener() {
             static_backend("be-b", upstream_b),
         ],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -361,6 +366,7 @@ async fn path_routing_longest_prefix_wins() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -430,6 +436,7 @@ async fn request_header_modifier_applies() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -540,6 +547,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
             static_backend("be-b", upstream_b),
         ],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -558,11 +566,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(
         served, "A",
         "header set should route to header-matched rule"
@@ -576,11 +580,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(served, "B", "no header should fall through to catchall");
 
     // Request 3: wrong header value → catchall.
@@ -592,11 +592,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(
         served, "B",
         "wrong header value should fall through to catchall"
@@ -612,6 +608,14 @@ async fn header_routing_picks_header_rule_over_catchall() {
 /// A regex `path` match routes to its backend when the request
 /// path matches the (anchored) pattern, and falls through to a
 /// sibling catchall when it doesn't.
+/// The `x-echo-served-by` header the echo upstream reflected, or "".
+fn served_by<B>(resp: &Response<B>) -> &str {
+    resp.headers()
+        .get("x-echo-served-by")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 #[tokio::test]
 async fn regex_path_routes_matching_request() {
     let upstream_match = spawn_http_echo().await;
@@ -678,6 +682,7 @@ async fn regex_path_routes_matching_request() {
             static_backend("be-catchall", upstream_catchall),
         ],
         secrets: vec![],
+        extensions: vec![],
     };
 
     let store = Store::new();
@@ -695,11 +700,7 @@ async fn regex_path_routes_matching_request() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(
         served, "REGEX",
         "regex-matching path should hit the regex route"
@@ -713,11 +714,7 @@ async fn regex_path_routes_matching_request() {
         .unwrap();
     let resp = client.request(req).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-    let served = resp
-        .headers()
-        .get("x-echo-served-by")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let served = served_by(&resp);
     assert_eq!(served, "CATCHALL", "non-matching path should fall through");
 
     drop(shutdown_tx);
@@ -772,6 +769,7 @@ async fn response_header_modifier_applies() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1014,6 +1012,7 @@ async fn route_with_unregistered_backend_returns_500() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1082,6 +1081,7 @@ async fn weighted_refs_split_between_resolved_and_missing() {
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1145,11 +1145,11 @@ async fn redirect_short_circuit_skips_response_filters() {
             },
             HttpFilter::RequestRedirect {
                 name: "to-https".into(),
-                scheme: Some(Scheme::Https),
-                hostname: None,
-                port: None,
-                status_code: RedirectStatus::MovedPermanently,
-                path: None,
+                redirect: RedirectConfig {
+                    scheme: Some(Scheme::Https),
+                    status_code: RedirectStatus::MovedPermanently,
+                    ..Default::default()
+                },
             },
         ],
     };
@@ -1164,6 +1164,7 @@ async fn redirect_short_circuit_skips_response_filters() {
         }],
         backends: vec![],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1230,6 +1231,7 @@ async fn invalid_filter_config_answers_500_before_dispatch() {
         }],
         backends: vec![static_backend("be", dead_port)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1272,10 +1274,8 @@ impl Extension for Stamp {
     }
 }
 
-fn extension_ref_config(bind_port: u16, upstream_port: u16, plugin: &str) -> GatewayConfig {
-    let filter = HttpFilter::ExtensionRef {
-        name: plugin.into(),
-    };
+fn extension_ref_config(bind_port: u16, upstream_port: u16, class: &str) -> GatewayConfig {
+    let filter = HttpFilter::ExtensionRef { name: class.into() };
     GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -1291,6 +1291,7 @@ fn extension_ref_config(bind_port: u16, upstream_port: u16, plugin: &str) -> Gat
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
@@ -1303,7 +1304,9 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
     let _ = store.apply(&cfg);
 
     let mut registry = Registry::new();
-    registry.register("stamp", Arc::new(StampBuilder)).unwrap();
+    registry
+        .register_builder("stamp", Arc::new(StampBuilder))
+        .unwrap();
 
     let (stop, watch) = drain::channel();
     let gw = Gateway::new(store).with_extensions(registry);
@@ -1330,7 +1333,78 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
         .unwrap();
 }
 
-/// A route referencing a plugin nobody registered must not serve —
+/// Members are configured once per route revision: two requests share
+/// one configure; re-applying the route bumps the revision and
+/// configures again.
+#[tokio::test]
+async fn members_configure_once_per_route_revision() {
+    struct CountingClass {
+        configures: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExtensionClass for CountingClass {
+        fn configure(
+            &self,
+            _config: &ConfigValue,
+        ) -> Result<Arc<dyn ExtensionBuilder>, ExtensionError> {
+            self.configures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(StampBuilder))
+        }
+    }
+
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = extension_ref_config(bind_port, upstream_port, "counted");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let configures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = Registry::new();
+    registry
+        .register(
+            "counted",
+            Arc::new(CountingClass {
+                configures: Arc::clone(&configures),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store.clone()).with_extensions(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let url: hyper::Uri = format!("http://127.0.0.1:{bind_port}/").parse().unwrap();
+    for _ in 0..2 {
+        let resp = client.get(url.clone()).await.expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        configures.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "two requests on one route revision share one configure"
+    );
+
+    // Re-applying the route rebuilds it with a fresh revision.
+    let _ = store.apply(&cfg);
+    let resp = client.get(url).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        configures.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a rebuilt route configures its members again"
+    );
+
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// A route referencing a class nobody registered must not serve —
 /// skipping the member silently would be worse than failing.
 #[tokio::test]
 async fn unregistered_extension_ref_answers_500() {
@@ -1509,7 +1583,7 @@ async fn spawn_gated_route(
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "probe",
             Arc::new(BodyProbeBuilder {
                 mode,
@@ -1602,7 +1676,7 @@ async fn routes_without_body_members_never_read_a_frame() {
 
     let mut registry = Registry::new();
     registry
-        .register("no-body", Arc::new(NoBodyBuilder))
+        .register_builder("no-body", Arc::new(NoBodyBuilder))
         .unwrap();
 
     let (stop, watch) = drain::channel();
@@ -1728,7 +1802,7 @@ async fn hyper_frames_a_full_body_from_its_size_hint() {
 #[derive(Default)]
 struct ResponseSeen {
     chunks: Vec<(usize, bool)>,
-    ends: Vec<(StatusCode, u64, bool)>,
+    ends: Vec<ResponseEnd>,
 }
 
 struct ResponseProbeBuilder {
@@ -1786,11 +1860,7 @@ impl Extension for ResponseProbe {
     }
 
     fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
-        self.seen
-            .lock()
-            .unwrap()
-            .ends
-            .push((end.status, end.body_bytes, end.complete));
+        self.seen.lock().unwrap().ends.push(*end);
     }
 }
 
@@ -1810,7 +1880,7 @@ async fn spawn_tapped_route(upstream_port: u16, mode: ResponseMode) -> TappedRou
     let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "resp-probe",
             Arc::new(ResponseProbeBuilder {
                 mode,
@@ -1857,7 +1927,15 @@ async fn a_response_tap_sees_the_body_and_the_client_still_gets_it() {
     let total: usize = seen.chunks.iter().map(|(len, _)| len).sum();
     assert_eq!(total, body.len());
     assert!(seen.chunks.last().unwrap().1, "terminal chunk not flagged");
-    assert_eq!(seen.ends, vec![(StatusCode::OK, body.len() as u64, true)]);
+    assert_eq!(
+        seen.ends,
+        vec![ResponseEnd {
+            status: StatusCode::OK,
+            body_bytes: body.len() as u64,
+            complete: true,
+            upstream: true,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -1874,7 +1952,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
     let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "resp-probe",
             Arc::new(ResponseProbeBuilder {
                 mode: ResponseMode::Tap,
@@ -1902,7 +1980,12 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
         assert!(seen.chunks.is_empty(), "no upstream body to tap");
         assert_eq!(
             seen.ends,
-            vec![(StatusCode::TOO_MANY_REQUESTS, 0, false)],
+            vec![ResponseEnd {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body_bytes: 0,
+                complete: false,
+                upstream: false,
+            }],
             "a member that reserved on the request must still settle"
         );
     }
@@ -1953,7 +2036,7 @@ async fn a_request_only_member_never_sees_the_response() {
 
     let mut registry = Registry::new();
     registry
-        .register("request-only", Arc::new(RequestOnlyBuilder))
+        .register_builder("request-only", Arc::new(RequestOnlyBuilder))
         .unwrap();
 
     let (stop, watch) = drain::channel();
@@ -2132,6 +2215,7 @@ fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
         }],
         backends: vec![static_backend("be-a", be_a), static_backend("be-b", be_b)],
         secrets: vec![],
+        extensions: vec![],
     }
 }
 
@@ -2151,7 +2235,7 @@ async fn spawn_picked_route(be_a: u16, be_b: u16, mode: BodyMode, plan: PickPlan
     let buffer_at_select = Arc::new(StdMutex::new(HeldSeen::NotCalled));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "picker",
             Arc::new(PickerBuilder {
                 mode,
@@ -2356,6 +2440,7 @@ async fn two_selectors_on_one_rule_fail_the_request() {
         }],
         backends: vec![static_backend("be-a", be)],
         secrets: vec![],
+        extensions: vec![],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -2363,7 +2448,7 @@ async fn two_selectors_on_one_rule_fail_the_request() {
     let mut registry = Registry::new();
     for name in ["picker-one", "picker-two"] {
         registry
-            .register(
+            .register_builder(
                 name,
                 Arc::new(PickerBuilder {
                     mode: BodyMode::None,

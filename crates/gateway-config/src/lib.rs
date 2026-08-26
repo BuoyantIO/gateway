@@ -5,6 +5,7 @@ pub mod backend;
 pub mod bind;
 pub mod config;
 pub mod error;
+pub mod extension;
 pub mod filter;
 pub mod listener;
 pub mod parse;

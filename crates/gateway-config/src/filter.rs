@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
@@ -16,18 +16,8 @@ pub enum HttpFilter {
     #[serde(rename_all = "camelCase")]
     RequestRedirect {
         name: String,
-        #[serde(default)]
-        scheme: Option<Scheme>,
-        #[serde(default)]
-        hostname: Option<String>,
-        #[serde(default)]
-        port: Option<u16>,
-        /// Gateway API defaults this to 302; the default lives on
-        /// [`RedirectStatus`], not here.
-        #[serde(default)]
-        status_code: RedirectStatus,
-        #[serde(default)]
-        path: Option<RedirectPath>,
+        #[serde(flatten)]
+        redirect: RedirectConfig,
     },
     /// Runs the extension registered under `name`. `name` is also the
     /// filter's identity within the rule, so a rule references a
@@ -37,10 +27,29 @@ pub enum HttpFilter {
     ExtensionRef { name: String },
 }
 
+/// A redirect's settings — the `RequestRedirect` class's config
+/// type, shared with the inline filter so the two cannot drift.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedirectConfig {
+    #[serde(default)]
+    pub scheme: Option<Scheme>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Gateway API defaults this to 302; the default lives on
+    /// [`RedirectStatus`], not here.
+    #[serde(default)]
+    pub status_code: RedirectStatus,
+    #[serde(default)]
+    pub path: Option<RedirectPath>,
+}
+
 /// The scheme a redirect's `Location` uses. Gateway API restricts
 /// this to `http` or `https`; an unset scheme (`None` on the filter)
 /// keeps the request's scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scheme {
     Http,
@@ -60,8 +69,8 @@ impl Scheme {
 /// HTTP status for a redirect. Gateway API restricts this to 301 or
 /// 302 and defaults it to 302, both encoded here rather than in the
 /// deserialization or conversion layers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(try_from = "u16")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
 pub enum RedirectStatus {
     /// 302 Found — the Gateway API default.
     #[default]
@@ -77,6 +86,12 @@ impl RedirectStatus {
             Self::Found => 302,
             Self::MovedPermanently => 301,
         }
+    }
+}
+
+impl From<RedirectStatus> for u16 {
+    fn from(status: RedirectStatus) -> Self {
+        status.code()
     }
 }
 
@@ -96,7 +111,7 @@ impl TryFrom<u16> for RedirectStatus {
 
 /// Path modifier for a [`HttpFilter::RequestRedirect`]. At most one
 /// form applies per filter.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RedirectPath {
     /// Replace the entire request path with this value.
@@ -118,7 +133,7 @@ pub enum TcpFilter {
     TcpConnectionLog { name: String },
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeaderOps {
     #[serde(default)]
     pub add: Vec<HeaderPair>,
@@ -128,7 +143,7 @@ pub struct HeaderOps {
     pub remove: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeaderPair {
     pub name: String,
     pub value: String,
@@ -177,20 +192,16 @@ path:
 ";
         let f: HttpFilter = serde_yaml::from_str(yaml).expect("valid redirect filter");
         match f {
-            HttpFilter::RequestRedirect {
-                name,
-                scheme,
-                hostname,
-                port,
-                status_code,
-                path,
-            } => {
+            HttpFilter::RequestRedirect { name, redirect } => {
                 assert_eq!(name, "to-https");
-                assert_eq!(scheme, Some(Scheme::Https));
-                assert_eq!(hostname, None);
-                assert_eq!(port, None);
-                assert_eq!(status_code, RedirectStatus::MovedPermanently);
-                assert_eq!(path, Some(RedirectPath::ReplacePrefixMatch("/new".into())));
+                assert_eq!(redirect.scheme, Some(Scheme::Https));
+                assert_eq!(redirect.hostname, None);
+                assert_eq!(redirect.port, None);
+                assert_eq!(redirect.status_code, RedirectStatus::MovedPermanently);
+                assert_eq!(
+                    redirect.path,
+                    Some(RedirectPath::ReplacePrefixMatch("/new".into()))
+                );
             }
             other => panic!("expected RequestRedirect, got {other:?}"),
         }
@@ -204,11 +215,11 @@ name: bounce
 scheme: https
 ";
         let f: HttpFilter = serde_yaml::from_str(yaml).expect("valid redirect filter");
-        let HttpFilter::RequestRedirect { status_code, .. } = f else {
+        let HttpFilter::RequestRedirect { redirect, .. } = f else {
             panic!("expected RequestRedirect");
         };
-        assert_eq!(status_code, RedirectStatus::Found);
-        assert_eq!(status_code.code(), 302);
+        assert_eq!(redirect.status_code, RedirectStatus::Found);
+        assert_eq!(redirect.status_code.code(), 302);
     }
 
     #[test]

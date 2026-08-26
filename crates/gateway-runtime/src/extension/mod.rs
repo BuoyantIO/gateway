@@ -1,6 +1,6 @@
 //! Per-request extensions attached to routes.
 //!
-//! An extension is built once per configured plugin and instantiated
+//! A builder is configured once per extension and instantiated
 //! once per request. Request hooks run in the rule's filter order and
 //! may gate the request; response hooks run in reverse order and only
 //! observe. One extension per rule may select the upstream target.
@@ -19,7 +19,9 @@ mod registry;
 // same macro version the trait was defined with.
 pub use async_trait::async_trait;
 pub use cx::{Cx, TargetBackend, Targets};
-pub use registry::{Registry, RegistryError};
+pub use registry::{
+    ConfigureError, ConfiguredExtension, ExtensionClass, PreConfigured, Registry, RegistryError,
+};
 
 /// Error an extension hook returns, and the error type of a body an
 /// extension supplies.
@@ -101,9 +103,10 @@ pub trait Extension: Send {
     /// has been fully delivered. Members that did not declare it are
     /// never asked.
     ///
-    /// `held` is what the host kept of the request body, and the only
-    /// source of [`BodySource::Original`] — a selector on a streaming
-    /// rule consumed the body and must supply the one to forward.
+    /// `held` is what the host kept of the request body;
+    /// [`Held::forward`] turns it into the source to forward, `None`
+    /// when nothing was kept — a selector on a streaming rule
+    /// consumed the body and must supply the one to forward.
     ///
     /// # Errors
     /// An error fails the request. There is no fallback to the
@@ -138,20 +141,14 @@ pub enum Held<'a> {
 impl Held<'_> {
     /// Forward the body the host kept (or never touched). `None`
     /// when it kept none: there is nothing to forward, and the
-    /// selector must supply a body instead. This is the only
-    /// constructor of [`BodySource::Original`].
+    /// selector must supply a body instead.
     pub fn forward(&self) -> Option<BodySource> {
         match self {
-            Self::Buffered(_) | Self::Untouched => Some(BodySource::Original(Kept(()))),
+            Self::Buffered(_) | Self::Untouched => Some(BodySource::Original),
             Self::Nothing => None,
         }
     }
 }
-
-/// Proof the host holds the original body. No public constructor:
-/// obtained through [`Held::forward`], so asking to forward a body
-/// the host discarded does not compile.
-pub struct Kept(());
 
 /// Request-body access an extension declares. The rule's effective
 /// mode is the strictest across its members
@@ -248,10 +245,11 @@ pub enum Target {
 
 /// The request body the host forwards upstream.
 pub enum BodySource {
-    /// The bytes the host kept while draining. Constructed only via
-    /// [`Held::forward`], which is how "forward a body the host
-    /// discarded" is unrepresentable rather than a runtime error.
-    Original(Kept),
+    /// The body the host kept (or never touched), as
+    /// [`Held::forward`] hands it out. Invalid on a rule that
+    /// retained nothing: the host fails the request rather than
+    /// forward a silently empty body.
+    Original,
     /// A complete body replacing the original. The host reframes
     /// content-length and discards the rest of the client upload.
     Replace(Bytes),
@@ -267,15 +265,16 @@ pub enum BodySource {
 impl std::fmt::Debug for BodySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Original(_) => f.write_str("Original"),
+            Self::Original => f.write_str("Original"),
             Self::Replace(bytes) => f.debug_tuple("Replace").field(&bytes.len()).finish(),
             Self::Stream(_, len) => f.debug_tuple("Stream").field(len).finish(),
         }
     }
 }
 
-/// Terminal summary handed to [`Extension::on_response_end`].
-#[derive(Debug)]
+/// Terminal summary handed to [`Extension::on_response_end`]. Plain
+/// data: copy it, compare it, keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseEnd {
     /// What the client was answered with, whether that came from an
     /// upstream or was synthesized here.
@@ -286,4 +285,9 @@ pub struct ResponseEnd {
     /// that disconnected mid-stream, a failed body, and a request
     /// answered before any upstream response existed.
     pub complete: bool,
+    /// Whether the status came from an upstream response. `false`
+    /// covers a filter answering, a body limit, a failed selection,
+    /// and a failed dial — endings where no upstream response
+    /// existed. Host-populated.
+    pub upstream: bool,
 }

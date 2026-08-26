@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::filter::{
-    HeaderOps, HeaderPair, HttpFilter, RedirectPath, RedirectStatus, Scheme,
+    HeaderOps, HeaderPair, HttpFilter, RedirectConfig, RedirectPath, RedirectStatus, Scheme,
 };
 use gateway_config::listener::{
     CertRef, HttpListener, HttpsListener, Listener, TlsConfig, TlsMode,
@@ -313,20 +313,24 @@ fn http_filter(msg: pb::HttpFilter) -> Option<HttpFilter> {
             });
             Some(HttpFilter::RequestRedirect {
                 name: rr.name,
-                scheme: match pb::RedirectScheme::try_from(rr.scheme) {
-                    Ok(pb::RedirectScheme::Http) => Some(Scheme::Http),
-                    Ok(pb::RedirectScheme::Https) => Some(Scheme::Https),
-                    // Unspecified (keep request scheme) or unknown.
-                    _ => None,
+                redirect: RedirectConfig {
+                    scheme: match pb::RedirectScheme::try_from(rr.scheme) {
+                        Ok(pb::RedirectScheme::Http) => Some(Scheme::Http),
+                        Ok(pb::RedirectScheme::Https) => Some(Scheme::Https),
+                        // Unspecified (keep request scheme) or unknown.
+                        _ => None,
+                    },
+                    hostname: (!rr.hostname.is_empty()).then_some(rr.hostname),
+                    port: u16::try_from(rr.port).ok().filter(|p| *p != 0),
+                    status_code: match pb::RedirectStatus::try_from(rr.status_code) {
+                        Ok(pb::RedirectStatus::MovedPermanently) => {
+                            RedirectStatus::MovedPermanently
+                        }
+                        // Found, Unspecified (unset), or unknown all default to 302.
+                        _ => RedirectStatus::default(),
+                    },
+                    path,
                 },
-                hostname: (!rr.hostname.is_empty()).then_some(rr.hostname),
-                port: u16::try_from(rr.port).ok().filter(|p| *p != 0),
-                status_code: match pb::RedirectStatus::try_from(rr.status_code) {
-                    Ok(pb::RedirectStatus::MovedPermanently) => RedirectStatus::MovedPermanently,
-                    // Found, Unspecified (unset), or unknown all default to 302.
-                    _ => RedirectStatus::default(),
-                },
-                path,
             })
         }
     }
@@ -642,19 +646,15 @@ mod tests {
             )),
         };
         match http_filter(filter).expect("known kind") {
-            HttpFilter::RequestRedirect {
-                scheme,
-                hostname,
-                port,
-                status_code,
-                path,
-                ..
-            } => {
-                assert_eq!(scheme, Some(Scheme::Https));
-                assert_eq!(hostname, None, "empty hostname maps to None");
-                assert_eq!(port, None, "zero port maps to None");
-                assert_eq!(status_code, RedirectStatus::MovedPermanently);
-                assert_eq!(path, Some(RedirectPath::ReplacePrefixMatch("/new".into())));
+            HttpFilter::RequestRedirect { redirect, .. } => {
+                assert_eq!(redirect.scheme, Some(Scheme::Https));
+                assert_eq!(redirect.hostname, None, "empty hostname maps to None");
+                assert_eq!(redirect.port, None, "zero port maps to None");
+                assert_eq!(redirect.status_code, RedirectStatus::MovedPermanently);
+                assert_eq!(
+                    redirect.path,
+                    Some(RedirectPath::ReplacePrefixMatch("/new".into()))
+                );
             }
             other => panic!("expected RequestRedirect, got {other:?}"),
         }
@@ -675,19 +675,14 @@ mod tests {
             )),
         };
         match http_filter(filter).expect("known kind") {
-            HttpFilter::RequestRedirect {
-                status_code,
-                scheme,
-                path,
-                ..
-            } => {
+            HttpFilter::RequestRedirect { redirect, .. } => {
                 assert_eq!(
-                    status_code,
+                    redirect.status_code,
                     RedirectStatus::Found,
                     "zero status defaults to 302"
                 );
-                assert_eq!(scheme, None);
-                assert_eq!(path, None);
+                assert_eq!(redirect.scheme, None);
+                assert_eq!(redirect.path, None);
             }
             other => panic!("expected RequestRedirect, got {other:?}"),
         }

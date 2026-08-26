@@ -11,9 +11,11 @@ use crate::accept;
 use crate::drain;
 use crate::error::RuntimeError;
 use crate::extension::Registry;
+use crate::extension::builtin::register_builtins;
 use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
 use crate::metrics::Metrics;
 use crate::proxy::http::HttpClient;
+use crate::proxy::members::MemberCache;
 
 /// The gateway data-plane runtime. Subscribes to `BindEvent`s from a
 /// `Store` and manages one accept task per active bind.
@@ -34,9 +36,11 @@ pub struct Gateway {
     /// Metric families the request path records into. Detached
     /// (never scraped) unless the caller registered them.
     pub(crate) metrics: Arc<Metrics>,
-    /// Extensions a route may reference by name. Empty unless the
-    /// caller registered some.
+    /// Extension classes a route's filters resolve against. Always
+    /// holds the built-ins; `with_extensions` adds the caller's.
     pub(crate) extensions: Arc<Registry>,
+    /// Configured route members, cached per route revision.
+    pub(crate) members: Arc<MemberCache>,
 }
 
 /// Everything an accepted connection needs from its bind, bundled so
@@ -51,6 +55,7 @@ pub(crate) struct ProxyCtx {
     pub(crate) http_client: HttpClient,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) extensions: Arc<Registry>,
+    pub(crate) members: Arc<MemberCache>,
 }
 
 impl Gateway {
@@ -63,12 +68,15 @@ impl Gateway {
 
     /// Custom load balancer (caller-constructed picker + state policy).
     pub fn with_lb(store: Store, lb: LoadBalancer) -> Self {
+        let mut registry = Registry::new();
+        register_builtins(&mut registry);
         Self {
             store,
             lb: Arc::new(lb),
             http_client: HttpClient::default(),
             metrics: Metrics::new(),
-            extensions: Arc::new(Registry::new()),
+            extensions: Arc::new(registry),
+            members: Arc::new(MemberCache::default()),
         }
     }
 
@@ -84,8 +92,11 @@ impl Gateway {
     /// Extensions routes may reference by name. Consuming builder
     /// rather than another constructor: lb, metrics and registry are
     /// independent, and a constructor per combination does not scale.
+    /// The built-ins are registered on top; their reserved names are
+    /// not available to callers.
     #[must_use]
-    pub fn with_extensions(mut self, registry: Registry) -> Self {
+    pub fn with_extensions(mut self, mut registry: Registry) -> Self {
+        register_builtins(&mut registry);
         self.extensions = Arc::new(registry);
         self
     }
@@ -187,6 +198,7 @@ impl Gateway {
             http_client: self.http_client.clone(),
             metrics: Arc::clone(&self.metrics),
             extensions: Arc::clone(&self.extensions),
+            members: Arc::clone(&self.members),
         };
         let (bind_signal, bind_drain) = drain::channel();
         // One merged watch per bind: connections fire on process

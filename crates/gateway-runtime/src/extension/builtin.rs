@@ -6,14 +6,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use gateway_config::extension::{ConfigValue, from_value, to_value};
 use gateway_config::filter::{
-    HeaderOps, HeaderPair, HttpFilter as ConfigFilter, RedirectPath, RedirectStatus, Scheme,
+    HeaderOps, HeaderPair, HttpFilter as ConfigFilter, RedirectConfig, RedirectPath, Scheme,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-use super::{Action, Cx, Error, Extension, ExtensionBuilder, LocalResponse, Member, Registry};
+use super::{
+    Action, Cx, Error, Extension, ExtensionBuilder, ExtensionClass, LocalResponse, Registry,
+};
 
-/// Reserved plugin names for the built-ins.
+/// Reserved class names for the built-ins.
 pub const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
 pub const RESPONSE_HEADER_MODIFIER: &str = "response_header_modifier";
 pub const REQUEST_REDIRECT: &str = "request_redirect";
@@ -24,8 +27,8 @@ pub enum FilterError {
     InvalidHeaderName(String),
     #[error("invalid header value for `{0}`")]
     InvalidHeaderValue(String),
-    #[error("no extension registered under `{0}`")]
-    UnknownPlugin(String),
+    #[error("`{class}` config cannot serialize: {detail}")]
+    ConfigSerialize { class: String, detail: String },
 }
 
 /// `HeaderOps` with names and values parsed up front. Invalid `remove`
@@ -79,46 +82,51 @@ fn parse_pairs(pairs: &[HeaderPair]) -> Result<Vec<(HeaderName, HeaderValue)>, F
         .collect()
 }
 
-/// Build the member for one filter config: the extension instance
-/// plus its builder's declarations. Core filters build from their
-/// inline config; a reference resolves against the registry.
+/// Register the built-in classes under their reserved names.
+///
+/// # Panics
+/// A reserved name is already taken — a startup configuration bug.
+pub fn register_builtins(registry: &mut Registry) {
+    registry
+        .register(
+            REQUEST_HEADER_MODIFIER,
+            Arc::new(RequestHeaderModifierClass),
+        )
+        .expect("reserved class name");
+    registry
+        .register(
+            RESPONSE_HEADER_MODIFIER,
+            Arc::new(ResponseHeaderModifierClass),
+        )
+        .expect("reserved class name");
+    registry
+        .register(REQUEST_REDIRECT, Arc::new(RequestRedirectClass))
+        .expect("reserved class name");
+}
+
+/// The class name and config for one filter — the funnel every
+/// filter construction goes through. Inline filters serialize their
+/// typed config into the opaque value; a ref names its class with no
+/// config.
 ///
 /// # Errors
-/// Invalid header names or values, or a reference to a name the
-/// registry does not hold.
-pub fn instance_for(cfg: &ConfigFilter, registry: &Registry) -> Result<Member, FilterError> {
-    match cfg {
+/// A config the value format cannot represent.
+pub fn class_and_config(cfg: &ConfigFilter) -> Result<(&str, ConfigValue), FilterError> {
+    let (class, config) = match cfg {
         ConfigFilter::RequestHeaderModifier {
             request_headers, ..
-        } => Ok(Member::from_builder(
-            &RequestHeaderModifierBuilder::try_new(request_headers)?,
-        )),
+        } => (REQUEST_HEADER_MODIFIER, to_value(request_headers)),
         ConfigFilter::ResponseHeaderModifier {
             response_headers, ..
-        } => Ok(Member::from_builder(
-            &ResponseHeaderModifierBuilder::try_new(response_headers)?,
-        )),
-        ConfigFilter::RequestRedirect {
-            scheme,
-            hostname,
-            port,
-            status_code,
-            path,
-            ..
-        } => Ok(Member::from_builder(&RequestRedirectBuilder::new(
-            *scheme,
-            hostname.clone(),
-            *port,
-            *status_code,
-            path.clone(),
-        ))),
-        ConfigFilter::ExtensionRef { name } => {
-            let builder = registry
-                .get(name)
-                .ok_or_else(|| FilterError::UnknownPlugin(name.clone()))?;
-            Ok(Member::from_builder(builder.as_ref()))
-        }
-    }
+        } => (RESPONSE_HEADER_MODIFIER, to_value(response_headers)),
+        ConfigFilter::RequestRedirect { redirect, .. } => (REQUEST_REDIRECT, to_value(redirect)),
+        ConfigFilter::ExtensionRef { name } => return Ok((name.as_str(), ConfigValue::Null)),
+    };
+    let config = config.map_err(|e| FilterError::ConfigSerialize {
+        class: class.to_owned(),
+        detail: e.to_string(),
+    })?;
+    Ok((class, config))
 }
 
 /// Build the authority (`host` or `host:port`), omitting the port for
@@ -155,7 +163,16 @@ pub fn replace_prefix(path: &str, matched_prefix: &str, replacement: &str) -> St
     }
 }
 
-/// `RequestHeaderModifier` as an extension.
+/// `RequestHeaderModifier` as an extension class.
+pub struct RequestHeaderModifierClass;
+
+impl ExtensionClass for RequestHeaderModifierClass {
+    fn configure(&self, config: &ConfigValue) -> Result<Arc<dyn ExtensionBuilder>, Error> {
+        let ops: HeaderOps = from_value(config)?;
+        Ok(Arc::new(RequestHeaderModifierBuilder::try_new(&ops)?))
+    }
+}
+
 pub struct RequestHeaderModifierBuilder {
     ops: Arc<ParsedHeaderOps>,
 }
@@ -194,7 +211,16 @@ impl Extension for RequestHeaderModifier {
     }
 }
 
-/// `ResponseHeaderModifier` as an extension.
+/// `ResponseHeaderModifier` as an extension class.
+pub struct ResponseHeaderModifierClass;
+
+impl ExtensionClass for ResponseHeaderModifierClass {
+    fn configure(&self, config: &ConfigValue) -> Result<Arc<dyn ExtensionBuilder>, Error> {
+        let ops: HeaderOps = from_value(config)?;
+        Ok(Arc::new(ResponseHeaderModifierBuilder::try_new(&ops)?))
+    }
+}
+
 pub struct ResponseHeaderModifierBuilder {
     ops: Arc<ParsedHeaderOps>,
 }
@@ -228,35 +254,24 @@ impl Extension for ResponseHeaderModifier {
     }
 }
 
-/// `RequestRedirect` as an extension.
+/// `RequestRedirect` as an extension class.
+pub struct RequestRedirectClass;
+
+impl ExtensionClass for RequestRedirectClass {
+    fn configure(&self, config: &ConfigValue) -> Result<Arc<dyn ExtensionBuilder>, Error> {
+        let redirect: RedirectConfig = from_value(config)?;
+        Ok(Arc::new(RequestRedirectBuilder::new(redirect)))
+    }
+}
+
 pub struct RequestRedirectBuilder {
     config: Arc<RedirectConfig>,
 }
 
-struct RedirectConfig {
-    scheme: Option<Scheme>,
-    hostname: Option<String>,
-    port: Option<u16>,
-    status_code: RedirectStatus,
-    path: Option<RedirectPath>,
-}
-
 impl RequestRedirectBuilder {
-    pub fn new(
-        scheme: Option<Scheme>,
-        hostname: Option<String>,
-        port: Option<u16>,
-        status_code: RedirectStatus,
-        path: Option<RedirectPath>,
-    ) -> Self {
+    pub fn new(config: RedirectConfig) -> Self {
         Self {
-            config: Arc::new(RedirectConfig {
-                scheme,
-                hostname,
-                port,
-                status_code,
-                path,
-            }),
+            config: Arc::new(config),
         }
     }
 }
@@ -340,6 +355,8 @@ impl Extension for RequestRedirect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use gateway_config::filter::RedirectStatus;
 
     fn ops(set: &[(&str, &str)], add: &[(&str, &str)], remove: &[&str]) -> HeaderOps {
         HeaderOps {
@@ -458,13 +475,11 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_scheme_only_keeps_host_and_path() {
-        let builder = RequestRedirectBuilder::new(
-            Some(Scheme::Https),
-            None,
-            None,
-            RedirectStatus::MovedPermanently,
-            None,
-        );
+        let builder = RequestRedirectBuilder::new(RedirectConfig {
+            scheme: Some(Scheme::Https),
+            status_code: RedirectStatus::MovedPermanently,
+            ..Default::default()
+        });
         let (status, location) =
             run_redirect(&builder, "/foo/bar?x=1", Some("app.example"), None).await;
         assert_eq!(status, StatusCode::MOVED_PERMANENTLY);
@@ -473,36 +488,29 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_omits_well_known_port() {
-        let builder = RequestRedirectBuilder::new(
-            Some(Scheme::Https),
-            None,
-            Some(443),
-            RedirectStatus::default(),
-            None,
-        );
+        let builder = RequestRedirectBuilder::new(RedirectConfig {
+            scheme: Some(Scheme::Https),
+            port: Some(443),
+            ..Default::default()
+        });
         let (_, location) = run_redirect(&builder, "/p", Some("h.example"), None).await;
         assert_eq!(location, "https://h.example/p");
 
-        let builder = RequestRedirectBuilder::new(
-            Some(Scheme::Https),
-            None,
-            Some(8443),
-            RedirectStatus::default(),
-            None,
-        );
+        let builder = RequestRedirectBuilder::new(RedirectConfig {
+            scheme: Some(Scheme::Https),
+            port: Some(8443),
+            ..Default::default()
+        });
         let (_, location) = run_redirect(&builder, "/p", Some("h.example"), None).await;
         assert_eq!(location, "https://h.example:8443/p");
     }
 
     #[tokio::test]
     async fn redirect_replace_full_path() {
-        let builder = RequestRedirectBuilder::new(
-            None,
-            None,
-            None,
-            RedirectStatus::default(),
-            Some(RedirectPath::ReplaceFullPath("/new".to_owned())),
-        );
+        let builder = RequestRedirectBuilder::new(RedirectConfig {
+            path: Some(RedirectPath::ReplaceFullPath("/new".to_owned())),
+            ..Default::default()
+        });
         let (status, location) =
             run_redirect(&builder, "/old/thing", Some("h.example"), None).await;
         assert_eq!(status, StatusCode::FOUND);
@@ -511,13 +519,10 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_replace_prefix_match() {
-        let builder = RequestRedirectBuilder::new(
-            None,
-            None,
-            None,
-            RedirectStatus::default(),
-            Some(RedirectPath::ReplacePrefixMatch("/new".to_owned())),
-        );
+        let builder = RequestRedirectBuilder::new(RedirectConfig {
+            path: Some(RedirectPath::ReplacePrefixMatch("/new".to_owned())),
+            ..Default::default()
+        });
         let (_, location) =
             run_redirect(&builder, "/foo/bar", Some("h.example"), Some("/foo")).await;
         assert_eq!(location, "http://h.example/new/bar");
@@ -528,49 +533,49 @@ mod tests {
 
     #[tokio::test]
     async fn redirect_prefix_match_without_prefix_keeps_path() {
-        let builder = RequestRedirectBuilder::new(
-            None,
-            None,
-            None,
-            RedirectStatus::default(),
-            Some(RedirectPath::ReplacePrefixMatch("/new".to_owned())),
-        );
+        let builder = RequestRedirectBuilder::new(RedirectConfig {
+            path: Some(RedirectPath::ReplacePrefixMatch("/new".to_owned())),
+            ..Default::default()
+        });
         let (_, location) = run_redirect(&builder, "/foo/bar", Some("h.example"), None).await;
         assert_eq!(location, "http://h.example/foo/bar");
     }
 
-    #[tokio::test]
-    async fn instance_for_resolves_refs_through_the_registry() {
-        struct NoopBuilder;
-        struct Noop;
-
-        impl ExtensionBuilder for NoopBuilder {
-            fn build(&self) -> Box<dyn Extension> {
-                Box::new(Noop)
-            }
-        }
-
-        // Every hook defaulted: the empty impl is valid.
-        #[async_trait::async_trait]
-        impl Extension for Noop {}
-
+    #[test]
+    fn class_and_config_funnels_every_filter() {
         let mut registry = Registry::new();
-        registry
-            .register("noop", std::sync::Arc::new(NoopBuilder))
-            .expect("register");
+        register_builtins(&mut registry);
 
-        let known = ConfigFilter::ExtensionRef {
-            name: "noop".to_owned(),
+        // An inline filter serializes its typed config and configures
+        // through its reserved class.
+        let inline = ConfigFilter::RequestHeaderModifier {
+            name: "h".to_owned(),
+            request_headers: ops(&[("x-a", "1")], &[], &[]),
         };
-        assert!(instance_for(&known, &registry).is_ok());
+        let (class, config) = class_and_config(&inline).expect("serializes");
+        assert_eq!(class, REQUEST_HEADER_MODIFIER);
+        let builder = registry
+            .get(class)
+            .expect("built-in registered")
+            .configure(&config)
+            .expect("valid ops");
+        let _ = builder.build();
 
-        let unknown = ConfigFilter::ExtensionRef {
-            name: "absent".to_owned(),
+        // A ref names its class with no config.
+        let reference = ConfigFilter::ExtensionRef {
+            name: "custom".to_owned(),
         };
-        assert!(matches!(
-            instance_for(&unknown, &registry),
-            Err(FilterError::UnknownPlugin(name)) if name == "absent"
-        ));
+        let (class, config) = class_and_config(&reference).expect("no serialization");
+        assert_eq!(class, "custom");
+        assert!(config.is_null());
+
+        // Invalid ops fail at configure, not per request.
+        let bad = ConfigFilter::RequestHeaderModifier {
+            name: "h".to_owned(),
+            request_headers: ops(&[("bad name", "v")], &[], &[]),
+        };
+        let (class, config) = class_and_config(&bad).expect("serializes");
+        assert!(registry.get(class).unwrap().configure(&config).is_err());
     }
 
     #[test]

@@ -86,25 +86,29 @@ drawn winner. Selector rules validate against the whole list.
 
 ## Extension instances
 
-Each filter on the resolved route becomes one extension instance for
-this request (in code: `Member`), holding the instance and a copy of
-its builder's `Declarations` (`request_body`, `response`,
-`selects_targets`). The copy is taken at
-instantiation because the declarations drive everything downstream —
-the body tier, response wrapping, `on_response_end` delivery — and the builder
-is not consulted again.
+Every filter resolves through an extension class. An inline core
+filter serializes its typed config and names its reserved class; an
+`ExtensionRef` names a registered class with no config
+(`class_and_config` is the one funnel). The class configures a
+builder once per route revision — the store stamps
+`ActiveHttpRoute.revision` on every rebuild — and the runtime caches
+the result (`MemberCache`). Config parsing and validation happen
+there, never per request.
 
-Core filters construct from their inline config. An `ExtensionRef`
-filter resolves by name against the `Registry`.
+Per request, each cached builder constructs one extension instance
+(in code: `Member`), holding the instance and the builder's
+`Declarations` (`request_body`, `response`, `selects_targets`). The
+declarations drive everything downstream — the body tier, response
+wrapping, `on_response_end` delivery.
 
-Instantiation can fail: a ref naming a plugin the registry does not
-hold, or two instances on one route declaring `selects_targets`.
-These are configuration
-invariants, and their proper enforcement is at config apply, before a
-route can receive traffic. The request path keeps a defensive check:
-a route violating them serves nothing (500, reason `internal`, log
-names the filters) — skipping the offending instance would run the
-route with fewer filters than configured.
+Resolution can fail: a filter naming a class the registry does not
+hold, or config the class rejects. The failure is cached for the
+route's revision and logged once; requests matching the route answer
+500 (reason `internal`) until the config changes. Two instances on
+one route declaring `selects_targets` is checked per request as a
+defensive backstop (500, log names the filters) — proper enforcement
+is at config apply, before a route can receive traffic. A route never
+serves with fewer filters than configured.
 
 Instances live until the response ends, whatever the ending.
 
@@ -211,10 +215,11 @@ request body at this point:
   supply that service's (possibly rewritten) stream as the body to
   dispatch; a hook that only observed leaves no body at all.
 
-`Held::forward()` is the only constructor of `BodySource::Original`,
-and returns `None` for `Held::Nothing`. A selector on a rule that
-retained nothing cannot ask the host to forward the original; the
-mistake is unrepresentable rather than a runtime failure.
+`Held::forward()` turns what the host kept into the source to
+forward, and returns `None` for `Held::Nothing`. A selector that
+returns `Original` on a rule that retained nothing fails the request
+(500, reason `internal`): the request would otherwise reach the
+upstream stripped of its payload.
 
 Any body mode may select. What varies is which body sources the
 selector may return, and this follows the rule's effective mode — not
@@ -345,7 +350,9 @@ every frame exactly as the upstream sent it. The final call carries
 `end_of_stream: true` under the same single-latch guarantee as the
 request side. For an LLM response, the first tap call is the
 time-to-first-token moment — response headers arrive before inference
-starts, the first body frame after.
+starts, the first body frame after. The tap also runs on a response
+synthesized after dispatch (a dial-failure 502); the terminal's
+`upstream` field says which case the tap measured.
 
 Wrapping is conditional: a route whose instances all declared
 `ResponseMode::None` returns the upstream body untouched — no
@@ -358,8 +365,9 @@ response back defeats streaming it.
 Every request ends exactly once, and instances that declared
 `ResponseMode::End` or `Tap` are told how: `on_response_end` receives
 `ResponseEnd` — the status the client got, the response body bytes
-delivered, and `complete`, true only if the response body ran to its
-end.
+delivered, `complete`, true only if the response body ran to its
+end, and `upstream`, true only if the status came from an upstream
+response rather than being synthesized here.
 
 The hook fires in one of two ways:
 
@@ -394,7 +402,7 @@ The endings, grouped by phase:
 | instantiation failed | 500 | `internal` |
 
 **Answered without an upstream response** — `on_response_end` fires
-immediately: zero body bytes, `complete: false`.
+immediately: zero body bytes, `complete: false`, `upstream: false`.
 
 | ending | status | reason |
 |---|---|---|
@@ -408,12 +416,12 @@ immediately: zero body bytes, `complete: false`.
 
 **Dispatched** — `on_response_end` fires when the response body finishes.
 
-| ending | status | reason | `complete` |
-|---|---|---|---|
-| dial failed | 502 | `dial_failure` | true — the 502 ran to its end |
-| response delivered | upstream's status | `ok` | true |
-| client disconnected mid-response | as sent | `ok` | false |
-| upstream body failed mid-response | as sent | `ok` | false |
+| ending | status | reason | `complete` | `upstream` |
+|---|---|---|---|---|
+| dial failed | 502 | `dial_failure` | true — the 502 ran to its end | false — no upstream answered |
+| response delivered | upstream's status | `ok` | true | true |
+| client disconnected mid-response | as sent | `ok` | false | true |
+| upstream body failed mid-response | as sent | `ok` | false | true |
 
 One metric reason per request, on every row.
 
