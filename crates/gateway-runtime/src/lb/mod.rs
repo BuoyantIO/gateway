@@ -61,7 +61,7 @@ impl LoadBalancer {
         }
     }
 
-    /// Build candidates from `backend.endpoints` (looking up
+    /// Build candidates from `backend.endpoints()` (looking up
     /// `EndpointInfo` per endpoint) and ask the picker. Evicted
     /// endpoints are excluded while at least one non-evicted sibling
     /// exists; when every endpoint is evicted the picker runs over
@@ -70,9 +70,10 @@ impl LoadBalancer {
     /// clears the eviction on the spot.
     ///
     /// Returns `None` only when the backend has zero endpoints,
-    /// which config validation already rejects for static backends.
-    /// The HTTP caller maps `None` to a synthesized
-    /// `503 Service Unavailable`.
+    /// which config validation already rejects for static backends;
+    /// a dialable backend has none by construction and is not routed
+    /// to through this path. The HTTP caller maps `None` to a
+    /// synthesized `503 Service Unavailable`.
     pub fn pick_endpoint(
         &self,
         backend: &Arc<ActiveBackend>,
@@ -80,7 +81,7 @@ impl LoadBalancer {
         let now = Instant::now();
         let mut viable: Vec<Candidate<'_>> = Vec::new();
         let mut evicted: Vec<Candidate<'_>> = Vec::new();
-        for ep in &backend.endpoints {
+        for ep in backend.endpoints() {
             let key = EndpointKey {
                 backend: backend.key.clone(),
                 endpoint: ep.name.clone(),
@@ -127,7 +128,7 @@ impl LoadBalancer {
         addr: SocketAddr,
     ) -> Option<(Endpoint, Arc<EndpointInfo>)> {
         let endpoint = backend
-            .endpoints
+            .endpoints()
             .iter()
             .find(|ep| ep.address == addr.ip() && ep.port == addr.port())?;
         let info = self.endpoint_state.get_or_create(EndpointKey {
@@ -146,7 +147,7 @@ mod tests {
     use std::time::Duration;
 
     use gateway_config::backend::BackendProtocol;
-    use gateway_state::BackendKey;
+    use gateway_state::{ActiveBackendKind, ActiveDialable, ActiveEndpointSet, BackendKey};
 
     fn endpoint(name: &str, port: u16) -> Endpoint {
         Endpoint {
@@ -159,8 +160,21 @@ mod tests {
     fn backend(endpoints: Vec<Endpoint>) -> Arc<ActiveBackend> {
         Arc::new(ActiveBackend {
             key: BackendKey::new("be"),
-            endpoints,
-            protocol: BackendProtocol::Http1,
+            kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
+                endpoints,
+                protocol: BackendProtocol::Http1,
+            }),
+        })
+    }
+
+    fn dialable_backend() -> Arc<ActiveBackend> {
+        Arc::new(ActiveBackend {
+            key: BackendKey::new("be"),
+            kind: ActiveBackendKind::Dialable(ActiveDialable {
+                host: "api.example.com".into(),
+                port: 443,
+                path_prefix: None,
+            }),
         })
     }
 
@@ -188,6 +202,15 @@ mod tests {
     fn zero_endpoints_returns_none() {
         let lb = lb();
         assert!(lb.pick_endpoint(&backend(vec![])).is_none());
+    }
+
+    #[test]
+    fn dialable_backend_offers_no_endpoint() {
+        let lb = lb();
+        let be = dialable_backend();
+        assert!(lb.pick_endpoint(&be).is_none());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        assert!(lb.endpoint_by_addr(&be, addr).is_none());
     }
 
     #[test]

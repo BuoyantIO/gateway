@@ -63,11 +63,9 @@ fn apply_upsert(store: &Store, upsert: pb::Upsert, out: &mut Affected) -> Result
         }
         pb::upsert::Body::Backend(b) => {
             let backend = convert::backend(b)?;
-            let name = match &backend {
-                gateway_config::backend::Backend::Static(s) => s.name.clone(),
-            };
+            let key = BackendKey::new(backend.name());
             store.upsert_backend(backend);
-            out.backends.push(BackendKey::new(name));
+            out.backends.push(key);
         }
         pb::upsert::Body::Secret(s) => {
             let secret = convert::secret(s)?;
@@ -257,8 +255,8 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         let route = &listener.routes[0];
         assert_eq!(route.backends.len(), 1);
         let backend = route.backends[0].backend.as_ref().expect("ref resolves");
-        assert_eq!(backend.endpoints[0].port, 8080);
-        assert_eq!(backend.endpoints[0].address.to_string(), "10.0.0.1");
+        assert_eq!(backend.endpoints()[0].port, 8080);
+        assert_eq!(backend.endpoints()[0].address.to_string(), "10.0.0.1");
     }
 
     #[test]

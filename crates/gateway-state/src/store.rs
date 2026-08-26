@@ -13,7 +13,8 @@ use gateway_config::route::HttpRoute;
 use gateway_config::secret::TlsSecret;
 
 use crate::active::{
-    ActiveBackend, ActiveBackendRef, ActiveBind, ActiveHttpRoute, ActiveListener, ActiveTls,
+    ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveBind, ActiveDialable,
+    ActiveEndpointSet, ActiveHttpRoute, ActiveListener, ActiveTls,
 };
 use crate::error::{ApplyReport, StoreError};
 use crate::event::BindEvent;
@@ -580,12 +581,21 @@ impl Inner {
     }
 
     fn upsert_backend(&mut self, backend: Backend) -> Vec<BindEvent> {
-        let Backend::Static(s) = backend;
-        let key = BackendKey::new(s.name.clone());
+        let key = BackendKey::new(backend.name().to_string());
+        let kind = match backend {
+            Backend::Static(s) => ActiveBackendKind::Endpoints(ActiveEndpointSet {
+                endpoints: s.endpoints,
+                protocol: s.protocol,
+            }),
+            Backend::Dialable(d) => ActiveBackendKind::Dialable(ActiveDialable {
+                host: d.host,
+                port: d.port,
+                path_prefix: d.path_prefix,
+            }),
+        };
         let new = Arc::new(ActiveBackend {
             key: key.clone(),
-            endpoints: s.endpoints,
-            protocol: s.protocol,
+            kind,
         });
         self.backends.insert(key.clone(), new);
         self.cascade_routes_by_backend(&key)
@@ -1075,7 +1085,9 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr};
 
-    use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
+    use gateway_config::backend::{
+        Backend, BackendProtocol, BackendRef, DialableBackend, Endpoint, StaticBackend,
+    };
     use gateway_config::bind::{Bind, BindProtocol};
     use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
     use gateway_config::listener::{
@@ -1199,8 +1211,19 @@ mod tests {
         })
     }
 
+    fn dialable_backend(name: &str) -> Backend {
+        Backend::Dialable(DialableBackend {
+            name: name.into(),
+            host: "api.example.com".into(),
+            port: 443,
+            path_prefix: Some("/v1".into()),
+        })
+    }
+
     fn static_backend_h2(name: &str, endpoints: &[(&str, &str, u16)]) -> Backend {
-        let Backend::Static(mut s) = static_backend(name, endpoints);
+        let Backend::Static(mut s) = static_backend(name, endpoints) else {
+            unreachable!("static_backend builds a static backend");
+        };
         s.protocol = BackendProtocol::Http2;
         Backend::Static(s)
     }
@@ -1250,7 +1273,10 @@ mod tests {
         assert_eq!(listener.routes.len(), 1);
         let route = &listener.routes[0];
         assert_eq!(route.backends.len(), 1);
-        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 8080);
+        assert_eq!(
+            resolved_backend(&route.backends[0]).endpoints()[0].port,
+            8080
+        );
     }
 
     #[test]
@@ -1315,7 +1341,10 @@ mod tests {
         let read = store.read();
         let bind = read.bind(&bkey("b")).unwrap();
         let route = &bind.listeners[0].routes[0];
-        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 8080);
+        assert_eq!(
+            resolved_backend(&route.backends[0]).endpoints()[0].port,
+            8080
+        );
     }
 
     #[test]
@@ -1379,7 +1408,10 @@ mod tests {
         store.upsert_backend(static_backend("be", &[("e0", "10.0.0.99", 9999)]));
         let bind = store.read().bind(&bkey("b")).unwrap();
         let route = &bind.listeners[0].routes[0];
-        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 9999);
+        assert_eq!(
+            resolved_backend(&route.backends[0]).endpoints()[0].port,
+            9999
+        );
     }
 
     #[test]
@@ -1395,7 +1427,10 @@ mod tests {
         store.upsert_backend(static_backend("be", &[("e0", "10.0.0.2", 9090)]));
         let bind = store.read().bind(&bkey("b")).unwrap();
         let route = &bind.listeners[0].routes[0];
-        assert_eq!(resolved_backend(&route.backends[0]).endpoints[0].port, 9090);
+        assert_eq!(
+            resolved_backend(&route.backends[0]).endpoints()[0].port,
+            9090
+        );
     }
 
     #[test]
@@ -1416,7 +1451,7 @@ mod tests {
         assert_eq!(listener.hostname.as_deref(), Some("svc.local"));
         assert_eq!(listener.routes.len(), 1);
         assert_eq!(
-            resolved_backend(&listener.routes[0].backends[0]).endpoints[0].port,
+            resolved_backend(&listener.routes[0].backends[0]).endpoints()[0].port,
             8080
         );
     }
@@ -1594,6 +1629,30 @@ mod tests {
     }
 
     #[test]
+    fn dialable_backend_registers_with_no_endpoints() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_backend(dialable_backend("be"));
+
+        let read = store.read();
+        let backend = read.backend(&backendkey("be")).expect("backend registered");
+        let ActiveBackendKind::Dialable(d) = &backend.kind else {
+            panic!("expected a dialable backend");
+        };
+        assert_eq!(d.host, "api.example.com");
+        assert_eq!(d.port, 443);
+        assert_eq!(d.path_prefix.as_deref(), Some("/v1"));
+        // The route ref resolves — the backend is registered — but
+        // nothing treats it as an endpoint set.
+        let route = &read.bind(&bkey("b")).expect("bind active").listeners[0].routes[0];
+        assert!(resolved_backend(&route.backends[0]).endpoints().is_empty());
+    }
+
+    #[test]
     fn backend_protocol_round_trips() {
         let store = Store::new();
         store.upsert_backend(static_backend("h1be", &[("e0", "10.0.0.1", 8080)]));
@@ -1601,11 +1660,11 @@ mod tests {
 
         let read = store.read();
         assert_eq!(
-            read.backend(&backendkey("h1be")).unwrap().protocol,
+            read.backend(&backendkey("h1be")).unwrap().protocol(),
             BackendProtocol::Http1
         );
         assert_eq!(
-            read.backend(&backendkey("h2be")).unwrap().protocol,
+            read.backend(&backendkey("h2be")).unwrap().protocol(),
             BackendProtocol::Http2
         );
     }

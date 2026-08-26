@@ -145,11 +145,12 @@ impl TargetBackend {
     }
 
     /// The endpoints behind this ref. Empty when the ref names a
-    /// backend that is not registered — a selector must treat such a
+    /// backend that is not registered, or one that is dialable
+    /// rather than a set of endpoints — a selector must treat such a
     /// ref as having nothing to offer.
     pub fn endpoints(&self) -> &[Endpoint] {
         self.backend
             .as_deref()
-            .map_or(&[], |b| b.endpoints.as_slice())
+            .map_or(&[], ActiveBackend::endpoints)
     }
 }
