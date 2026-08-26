@@ -206,10 +206,11 @@ request body at this point:
   supply that service's (possibly rewritten) stream as the body to
   dispatch; a hook that only observed leaves no body at all.
 
-`Held::forward()` is the only constructor of `BodySource::Original`,
-and returns `None` for `Held::Nothing`. A selector on a rule that
-retained nothing cannot ask the host to forward the original; the
-mistake is unrepresentable rather than a runtime failure.
+`Held::forward()` turns what the host kept into the source to
+forward, and returns `None` for `Held::Nothing`. A selector that
+returns `Original` on a rule that retained nothing fails the request
+(500, reason `internal`): the request would otherwise reach the
+upstream stripped of its payload.
 
 Any body mode may select. What varies is which body sources the
 selector may return, and this follows the rule's effective mode — not

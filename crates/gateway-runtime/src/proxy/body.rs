@@ -116,11 +116,10 @@ pub(super) fn apply_body_source(
 ) -> Result<UpstreamBody, SupplyError> {
     match source {
         // Unaltered bytes, so whatever the client declared is still
-        // true. Nothing to fix. The `Kept` token proves the caller
-        // got this source from `Held::forward`, so the `Nothing` arm
-        // is unreachable through the public API; it stays as the
-        // honest answer if an internal caller violates that.
-        BodySource::Original(_) => match held {
+        // true. Nothing to fix. `Nothing` is a selector bug: the
+        // request would reach the upstream stripped of its payload,
+        // so it fails instead.
+        BodySource::Original => match held {
             HeldBody::Buffered(buf) => Ok(UpstreamBody::Full(Full::new(buf.freeze()))),
             HeldBody::Untouched(body) => Ok(UpstreamBody::Incoming(body)),
             HeldBody::Nothing => Err(SupplyError::NothingHeld),
@@ -301,11 +300,7 @@ mod tests {
     #[test]
     fn original_without_a_held_body_is_an_error() {
         let mut parts = parts_with_len(Some(5));
-        // `Held::Nothing` refuses to mint an `Original`, so this arm
-        // is only reachable through a host bug; forge the source via
-        // the one legitimate mint to test the guard.
-        let source = Held::Buffered(b"").forward().expect("kept");
-        let err = apply_body_source(source, &mut parts, HeldBody::Nothing);
+        let err = apply_body_source(BodySource::Original, &mut parts, HeldBody::Nothing);
         // Never a silent empty body: the request would reach the
         // upstream stripped of its payload.
         assert!(matches!(err, Err(SupplyError::NothingHeld)));
