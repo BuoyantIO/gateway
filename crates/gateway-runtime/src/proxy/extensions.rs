@@ -1,4 +1,4 @@
-//! Route members configured once per route revision. The store
+//! Route instances configured once per route revision. The store
 //! stamps a fresh revision on every route rebuild; anything derived
 //! from the route's filter config is valid for exactly one revision,
 //! so the cache invalidates itself. Per request only `build()` runs.
@@ -14,18 +14,18 @@ use crate::extension::{Declarations, ExtensionBuilder, Registry};
 
 /// One filter of a route, configured: the builder plus its
 /// declarations.
-pub(crate) struct ResolvedMember {
+pub(crate) struct ResolvedExtension {
     pub decl: Declarations,
     pub builder: Arc<dyn ExtensionBuilder>,
 }
 
-type Members = Arc<Vec<ResolvedMember>>;
-type ResolveResult = Result<Members, Arc<str>>;
+type Resolved = Arc<Vec<ResolvedExtension>>;
+type ResolveResult = Result<Resolved, Arc<str>>;
 
-/// Configured members per route, keyed by route and validated by
+/// Configured instances per route, keyed by route and validated by
 /// revision.
 #[derive(Default)]
-pub(crate) struct MemberCache {
+pub(crate) struct ExtensionCache {
     routes: RwLock<HashMap<RouteKey, CachedRoute>>,
 }
 
@@ -36,18 +36,14 @@ struct CachedRoute {
     result: ResolveResult,
 }
 
-impl MemberCache {
-    /// The route's configured members — cached, or configured now and
+impl ExtensionCache {
+    /// The route's configured instances — cached, or configured now and
     /// cached for the route's current revision.
     ///
     /// # Errors
     /// The resolution failure, already logged once when it was
     /// cached.
-    pub(crate) fn members_for(
-        &self,
-        registry: &Registry,
-        route: &ActiveHttpRoute,
-    ) -> ResolveResult {
+    pub(crate) fn for_route(&self, registry: &Registry, route: &ActiveHttpRoute) -> ResolveResult {
         let hit = {
             let routes = self.routes.read();
             routes
@@ -75,7 +71,7 @@ impl MemberCache {
 
 /// Configure every filter of `route`, in order.
 fn resolve(registry: &Registry, route: &ActiveHttpRoute) -> ResolveResult {
-    let mut members = Vec::with_capacity(route.filters.len());
+    let mut instances = Vec::with_capacity(route.filters.len());
     for (i, filter) in route.filters.iter().enumerate() {
         let (class, config) =
             class_and_config(filter).map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
@@ -89,10 +85,10 @@ fn resolve(registry: &Registry, route: &ActiveHttpRoute) -> ResolveResult {
                 "filter {i}: class `{class}` rejected the config: {e}"
             ))
         })?;
-        members.push(ResolvedMember {
+        instances.push(ResolvedExtension {
             decl: builder.declares(),
             builder,
         });
     }
-    Ok(Arc::new(members))
+    Ok(Arc::new(instances))
 }

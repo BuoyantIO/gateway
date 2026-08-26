@@ -1309,7 +1309,7 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1371,7 +1371,7 @@ async fn members_configure_once_per_route_revision() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store.clone()).with_extensions(registry);
+    let gw = Gateway::new(store.clone()).with_classes(registry);
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1394,7 +1394,7 @@ async fn members_configure_once_per_route_revision() {
     assert_eq!(
         configures.load(std::sync::atomic::Ordering::SeqCst),
         2,
-        "a rebuilt route configures its members again"
+        "a rebuilt route configures its instances again"
     );
 
     drop(stop);
@@ -1405,7 +1405,7 @@ async fn members_configure_once_per_route_revision() {
 }
 
 /// A route referencing a class nobody registered must not serve —
-/// skipping the member silently would be worse than failing.
+/// skipping the instance silently would be worse than failing.
 #[tokio::test]
 async fn unregistered_extension_ref_answers_500() {
     let upstream_port = spawn_http_echo().await;
@@ -1495,7 +1495,7 @@ impl Extension for BodyProbe {
     }
 }
 
-/// A None-mode member whose body hook must never run.
+/// A None-mode instance whose body hook must never run.
 struct NoBodyBuilder;
 struct NoBody;
 
@@ -1513,7 +1513,7 @@ impl Extension for NoBody {
         _end_of_stream: bool,
         _cx: &mut Cx,
     ) -> Result<Action, ExtensionError> {
-        panic!("body hook ran for a member that declared no body access");
+        panic!("body hook ran for an instance that declared no body access");
     }
 }
 
@@ -1594,7 +1594,7 @@ async fn spawn_gated_route(
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -1680,7 +1680,7 @@ async fn routes_without_body_members_never_read_a_frame() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1891,7 +1891,7 @@ async fn spawn_tapped_route(upstream_port: u16, mode: ResponseMode) -> TappedRou
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -1946,7 +1946,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
     let store = Store::new();
     let _ = store.apply(&cfg);
 
-    // The member answers at request time, so no upstream response
+    // The instance answers at request time, so no upstream response
     // ever exists — the terminal has to come from the short-circuit
     // path rather than from the response body wrapper.
     let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
@@ -1963,7 +1963,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1986,7 +1986,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
                 complete: false,
                 upstream: false,
             }],
-            "a member that reserved on the request must still settle"
+            "an instance that reserved on the request must still settle"
         );
     }
 
@@ -1994,7 +1994,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
 }
 
-/// A member that declares nothing on the response side must never be
+/// An instance that declares nothing on the response side must never be
 /// asked about one — the route keeps the upstream body untouched.
 struct RequestOnlyBuilder;
 struct RequestOnly;
@@ -2018,11 +2018,11 @@ impl Extension for RequestOnly {
     }
 
     fn on_response_body(&mut self, _chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {
-        panic!("response tap ran for a member that declared no response access");
+        panic!("response tap ran for an instance that declared no response access");
     }
 
     fn on_response_end(&mut self, _end: &ResponseEnd, _cx: &mut Cx) {
-        panic!("terminal ran for a member that never asked for it");
+        panic!("terminal ran for an instance that never asked for it");
     }
 }
 
@@ -2040,7 +2040,7 @@ async fn a_request_only_member_never_sees_the_response() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -2247,7 +2247,7 @@ async fn spawn_picked_route(be_a: u16, be_b: u16, mode: BodyMode, plan: PickPlan
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -2461,7 +2461,7 @@ async fn two_selectors_on_one_rule_fail_the_request() {
     }
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_extensions(registry);
+    let gw = Gateway::new(store).with_classes(registry);
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
