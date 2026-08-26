@@ -113,6 +113,24 @@ impl LoadBalancer {
         Some((chosen.endpoint.clone(), Arc::clone(&chosen.info)))
     }
 
+    /// The runtime state a dialable backend accounts against: one
+    /// logical endpoint keyed by the backend's own name, so its
+    /// in-flight count, latency estimate and failure streak are kept
+    /// exactly like an endpoint's and balanced and selected traffic
+    /// account identically.
+    ///
+    /// There is nothing to choose between, so eviction is recorded
+    /// but never consulted here — refusing to dial the only
+    /// destination would fail every request for the eviction window,
+    /// where an endpoint set in the same position fails open over
+    /// its evicted members.
+    pub fn dialable_state(&self, backend: &Arc<ActiveBackend>) -> Arc<EndpointInfo> {
+        self.endpoint_state.get_or_create(EndpointKey {
+            backend: backend.key.clone(),
+            endpoint: backend.key.0.clone(),
+        })
+    }
+
     /// Look up the backend endpoint at `addr` and its runtime state,
     /// for a caller that chose the address itself. Returning the same
     /// pair as [`LoadBalancer::pick_endpoint`] keeps in-flight and
@@ -211,6 +229,29 @@ mod tests {
         assert!(lb.pick_endpoint(&be).is_none());
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
         assert!(lb.endpoint_by_addr(&be, addr).is_none());
+    }
+
+    #[test]
+    fn dialable_state_is_one_logical_endpoint_keyed_by_name() {
+        let lb = lb();
+        let be = dialable_backend();
+        let info = lb.dialable_state(&be);
+        // Same state on every request, and the same state the
+        // endpoint map would hand out for an endpoint named after
+        // the backend: balanced and selected traffic account
+        // against one entry.
+        assert!(Arc::ptr_eq(&info, &lb.dialable_state(&be)));
+        assert!(Arc::ptr_eq(
+            &info,
+            &lb.endpoint_state.get_or_create(EndpointKey {
+                backend: be.key.clone(),
+                endpoint: be.key.0.clone(),
+            })
+        ));
+        // Dial failures count toward eviction like any endpoint's,
+        // even though nothing consults it for a dialable backend.
+        info.record_failure(); // threshold = 1 evicts immediately
+        assert!(info.is_evicted(Instant::now()));
     }
 
     #[test]

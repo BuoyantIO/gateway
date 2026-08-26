@@ -10,7 +10,9 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
+use gateway_config::backend::{
+    Backend, BackendProtocol, BackendRef, DialableBackend, Endpoint, StaticBackend,
+};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
 use gateway_config::extension::ConfigValue;
@@ -65,10 +67,21 @@ async fn spawn_http_echo() -> u16 {
                             echoed.push((format!("x-echo-{rest}"), value.to_owned()));
                         }
                     }
+                    // Whatever authority the gateway addressed us
+                    // as: the `Host` header on H1, the `:authority`
+                    // hyper folded into the URI on H2.
+                    let host = req
+                        .headers()
+                        .get(http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned)
+                        .or_else(|| req.uri().authority().map(ToString::to_string))
+                        .unwrap_or_default();
                     let body_text = format!("{method} {path}");
                     let mut builder = http::Response::builder()
                         .status(StatusCode::OK)
-                        .header("x-server-version", server_version);
+                        .header("x-server-version", server_version)
+                        .header("x-echo-host", host);
                     for (k, v) in echoed {
                         builder = builder.header(k, v);
                     }
@@ -128,6 +141,17 @@ fn http_listener(name: &str, hostname: Option<&str>, routes: Vec<HttpRoute>) -> 
         name: name.into(),
         hostname: hostname.map(str::to_owned),
         routes,
+    })
+}
+
+/// A backend the gateway reaches by name rather than by address:
+/// `localhost` resolves to the loopback the echo server is on.
+fn dialable_backend(name: &str, port: u16, path_prefix: Option<&str>) -> Backend {
+    Backend::Dialable(DialableBackend {
+        name: name.into(),
+        host: "localhost".into(),
+        port,
+        path_prefix: path_prefix.map(str::to_owned),
     })
 }
 
@@ -2114,6 +2138,8 @@ enum HeldSeen {
 enum PickPlan {
     /// Pick this endpoint and forward this body source.
     Target(SocketAddr, PickBody),
+    /// Pick the rule's ref by name, as a dialable backend.
+    Backend(PickBody),
     Respond,
     Fail,
 }
@@ -2163,27 +2189,19 @@ impl Extension for Picker {
             Held::Untouched | Held::Nothing => HeldSeen::Empty,
         };
         match &*self.plan {
-            PickPlan::Target(addr, body) => {
-                let body = match body {
-                    PickBody::Forward => held.forward().ok_or("nothing held to forward")?,
-                    PickBody::Replace(bytes) => BodySource::Replace(Bytes::from_static(bytes)),
-                    PickBody::Supply(bytes) => {
-                        let frames: Vec<Result<http_body::Frame<Bytes>, ExtensionError>> =
-                            vec![Ok(http_body::Frame::data(Bytes::from_static(bytes)))];
-                        BodySource::Stream(
-                            http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed(),
-                            Some(bytes.len() as u64),
-                        )
-                    }
-                };
-                Ok(Selected::Target(Selection {
-                    target: Target::Endpoint {
-                        backend: self.backend.to_owned(),
-                        addr: *addr,
-                    },
-                    body,
-                }))
-            }
+            PickPlan::Target(addr, body) => Ok(Selected::Target(Selection {
+                target: Target::Endpoint {
+                    backend: self.backend.to_owned(),
+                    addr: *addr,
+                },
+                body: pick_body(body, &held)?,
+            })),
+            PickPlan::Backend(body) => Ok(Selected::Target(Selection {
+                target: Target::Backend {
+                    name: self.backend.to_owned(),
+                },
+                body: pick_body(body, &held)?,
+            })),
             PickPlan::Respond => Ok(Selected::Respond(LocalResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: http::HeaderMap::new(),
@@ -2194,8 +2212,24 @@ impl Extension for Picker {
     }
 }
 
-/// Two-backend route with a picker attached by ref.
-fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
+fn pick_body(body: &PickBody, held: &Held<'_>) -> Result<BodySource, ExtensionError> {
+    Ok(match body {
+        PickBody::Forward => held.forward().ok_or("nothing held to forward")?,
+        PickBody::Replace(bytes) => BodySource::Replace(Bytes::from_static(bytes)),
+        PickBody::Supply(bytes) => {
+            let frames: Vec<Result<http_body::Frame<Bytes>, ExtensionError>> =
+                vec![Ok(http_body::Frame::data(Bytes::from_static(bytes)))];
+            BodySource::Stream(
+                http_body_util::StreamBody::new(futures::stream::iter(frames)).boxed(),
+                Some(bytes.len() as u64),
+            )
+        }
+    })
+}
+
+/// Two-backend route with a picker attached by ref. `be_b` is the
+/// backend the picker names, of either kind.
+fn selection_config(bind_port: u16, be_a: u16, be_b: Backend) -> GatewayConfig {
     let mut route = http_route("picked", "/", "be-a");
     route.backend_refs.push(BackendRef {
         name: "be-b".into(),
@@ -2213,7 +2247,7 @@ fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
             bind_protocol: BindProtocol::Http,
             listeners: vec![http_listener("l", None, vec![route])],
         }],
-        backends: vec![static_backend("be-a", be_a), static_backend("be-b", be_b)],
+        backends: vec![static_backend("be-a", be_a), be_b],
         secrets: vec![],
         extensions: vec![],
     }
@@ -2228,7 +2262,24 @@ struct PickedRoute {
 
 async fn spawn_picked_route(be_a: u16, be_b: u16, mode: BodyMode, plan: PickPlan) -> PickedRoute {
     let bind_port = free_port().await;
-    let cfg = selection_config(bind_port, be_a, be_b);
+    let cfg = selection_config(bind_port, be_a, static_backend("be-b", be_b));
+    spawn_picker_on(cfg, bind_port, mode, plan).await
+}
+
+/// As [`spawn_picked_route`], with the picked backend dialed by host
+/// under a `/v1` prefix instead of listed as an endpoint set.
+async fn spawn_picked_dialable_route(be_a: u16, be_b: u16, plan: PickPlan) -> PickedRoute {
+    let bind_port = free_port().await;
+    let cfg = selection_config(bind_port, be_a, dialable_backend("be-b", be_b, Some("/v1")));
+    spawn_picker_on(cfg, bind_port, BodyMode::None, plan).await
+}
+
+async fn spawn_picker_on(
+    cfg: GatewayConfig,
+    bind_port: u16,
+    mode: BodyMode,
+    plan: PickPlan,
+) -> PickedRoute {
     let store = Store::new();
     let _ = store.apply(&cfg);
 
@@ -2475,4 +2526,260 @@ async fn two_selectors_on_one_rule_fail_the_request() {
 
     drop(stop);
     let _ = tokio::time::timeout(Duration::from_secs(2), gw_handle).await;
+}
+
+#[tokio::test]
+async fn dialable_backend_round_trip() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![http_route("r", "/", "be")])],
+        }],
+        backends: vec![dialable_backend("be", upstream_port, Some("/v1"))],
+        secrets: vec![],
+        extensions: vec![],
+    };
+
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/chat?a=1"))
+        .header("host", "gateway.example.com")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The backend was addressed as itself, not as the host the
+    // client asked for.
+    assert_eq!(
+        resp.headers().get("x-echo-host").unwrap(),
+        &format!("localhost:{upstream_port}")
+    );
+    // Prefix joined ahead of the request path; query preserved.
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"GET /v1/chat");
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn endpoint_backend_keeps_the_client_host() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let cfg = http_config_one_listener(bind_port, upstream_port, "/");
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{bind_port}/hello"))
+        .header("host", "gateway.example.com")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("x-echo-host").unwrap(),
+        "gateway.example.com"
+    );
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn weighted_refs_split_across_backend_kinds() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+
+    // Both refs reach the same echo server; only the dialable one
+    // prefixes the path, so the response body says which was used.
+    let route = HttpRoute {
+        name: "r".into(),
+        matches: vec![HttpMatch {
+            host: None,
+            path: PathMatch::PathPrefix { value: "/".into() },
+            method: None,
+            headers: vec![],
+            query_params: vec![],
+        }],
+        backend_refs: vec![
+            BackendRef {
+                name: "endpoints".into(),
+                weight: 1,
+            },
+            BackendRef {
+                name: "dialable".into(),
+                weight: 1,
+            },
+        ],
+        filters: vec![],
+    };
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![route])],
+        }],
+        backends: vec![
+            static_backend("endpoints", upstream_port),
+            dialable_backend("dialable", upstream_port, Some("/v1")),
+        ],
+        secrets: vec![],
+        extensions: vec![],
+    };
+
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let mut endpoints = 0;
+    let mut dialable = 0;
+    for _ in 0..40 {
+        let resp = client
+            .get(format!("http://127.0.0.1:{bind_port}/x").parse().unwrap())
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        match &body[..] {
+            b"GET /x" => endpoints += 1,
+            b"GET /v1/x" => dialable += 1,
+            other => panic!("unexpected body {:?}", String::from_utf8_lossy(other)),
+        }
+    }
+    // A 50/50 draw missing either side 40 times running is a 1-in-2^39
+    // event, so this is a fair test of "both kinds are reachable".
+    assert!(endpoints > 0, "no request reached the endpoint set");
+    assert!(dialable > 0, "no request reached the dialable backend");
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_selector_can_target_a_dialable_backend() {
+    let (be_a, hits_a) = spawn_port_echo().await;
+    let be_b = spawn_http_echo().await;
+    let picked =
+        spawn_picked_dialable_route(be_a, be_b, PickPlan::Backend(PickBody::Forward)).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://127.0.0.1:{}/chat", picked.bind_port))
+        .header("host", "gateway.example.com")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Dialed by host, under the backend's prefix — the same rewrite
+    // the weighted pick performs.
+    assert_eq!(
+        resp.headers().get("x-echo-host").unwrap(),
+        &format!("localhost:{be_b}")
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"GET /v1/chat");
+    assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn targeting_an_endpoint_set_as_dialable_fails_the_request() {
+    let (be_a, hits_a) = spawn_port_echo().await;
+    let (be_b, hits_b) = spawn_port_echo().await;
+    // `be-b` is an endpoint set, so naming it as a dialable backend
+    // is a selector bug, not a route the gateway improvises.
+    let picked = spawn_picked_route(
+        be_a,
+        be_b,
+        BodyMode::None,
+        PickPlan::Backend(PickBody::Forward),
+    )
+    .await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(
+            format!("http://127.0.0.1:{}/", picked.bind_port)
+                .parse()
+                .unwrap(),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(hits_b.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_dialable_backend_that_refuses_answers_502() {
+    // Nothing is listening on this port, so the dial fails the same
+    // way an endpoint's would: 502, and the failure is recorded
+    // against the backend's own state.
+    let dead_port = free_port().await;
+    let bind_port = free_port().await;
+
+    let cfg = GatewayConfig {
+        name: "test".into(),
+        binds: vec![Bind {
+            name: "b".into(),
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: bind_port,
+            bind_protocol: BindProtocol::Http,
+            listeners: vec![http_listener("l", None, vec![http_route("r", "/", "be")])],
+        }],
+        backends: vec![dialable_backend("be", dead_port, None)],
+        secrets: vec![],
+        extensions: vec![],
+    };
+
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (gw_handle, shutdown_tx) = spawn_gateway(store);
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/x").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    drop(shutdown_tx);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
 }
