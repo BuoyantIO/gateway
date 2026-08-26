@@ -176,6 +176,7 @@ fn https_config(bind_port: u16, upstream_port: u16, with_secret: bool) -> Gatewa
         } else {
             vec![]
         },
+        extensions: vec![],
     }
 }
 
@@ -398,6 +399,7 @@ fn two_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
             TlsSecret::new("", "secret-a", CERT_PEM, KEY_PEM).unwrap(),
             TlsSecret::new("", "secret-b", CERT_B_PEM, KEY_B_PEM).unwrap(),
         ],
+        extensions: vec![],
     }
 }
 

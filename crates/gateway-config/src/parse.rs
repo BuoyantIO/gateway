@@ -236,6 +236,57 @@ gatewayConfig:
     }
 
     #[test]
+    fn extension_object() {
+        let cfg = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  extensions:
+    - name: chat-picker
+      class: bllmp_selector
+      failureMode: Open
+      limits: { requestBody: Buffer, maxBufferBytes: 1048576 }
+      config:
+        service: bllmp.inference-d.svc:50051
+        pool: { namespace: inference, name: my-pool }
+",
+        )
+        .unwrap();
+        let ext = &cfg.extensions[0];
+        assert_eq!(ext.name, "chat-picker");
+        assert_eq!(ext.class, "bllmp_selector");
+        assert_eq!(ext.failure_mode, crate::extension::FailureMode::Open);
+        assert_eq!(
+            ext.limits.request_body,
+            Some(crate::extension::RequestBodyLimit::Buffer)
+        );
+        assert_eq!(ext.limits.max_buffer_bytes, Some(1_048_576));
+        // The opaque config keeps its nested shape verbatim.
+        assert_eq!(ext.config["service"], "bllmp.inference-d.svc:50051");
+        assert_eq!(ext.config["pool"]["namespace"], "inference");
+    }
+
+    #[test]
+    fn extension_object_defaults() {
+        let cfg = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  extensions:
+    - { name: x, class: c }
+",
+        )
+        .unwrap();
+        let ext = &cfg.extensions[0];
+        assert_eq!(ext.failure_mode, crate::extension::FailureMode::Closed);
+        assert!(ext.limits.request_body.is_none());
+        assert!(ext.limits.max_buffer_bytes.is_none());
+        assert!(ext.config.is_null());
+    }
+
+    #[test]
     fn tls_client_hello_log_filter() {
         let cfg = parse_yaml(
             r"

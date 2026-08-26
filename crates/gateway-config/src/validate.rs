@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::backend::Backend;
 use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
+use crate::extension::{Extension, RequestBodyLimit};
 use crate::filter::{HeaderOps, HttpFilter};
 use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
 use crate::route::{HttpMatch, HttpRoute, PathMatch, QueryParamMatch, TcpRoute, TlsRoute};
@@ -45,6 +46,10 @@ pub enum RejectionReason {
     /// time — empty / malformed names can't reach validation.)
     #[error("query param match `name` must not be empty")]
     EmptyQueryParamName,
+    #[error("extension `class` must not be empty")]
+    EmptyExtensionClass,
+    #[error("maxBufferBytes requires `requestBody: Buffer`")]
+    BufferBytesWithoutBuffer,
 }
 
 impl fmt::Display for BindProtocol {
@@ -83,12 +88,20 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), Vec<Rejection>> {
         cfg.secrets.iter().map(|s| s.name.as_str()),
         &mut rejections,
     );
+    check_unique(
+        "extensions",
+        cfg.extensions.iter().map(|e| e.name.as_str()),
+        &mut rejections,
+    );
 
     for (i, bind) in cfg.binds.iter().enumerate() {
         validate_bind(&format!("binds[{i}]"), bind, &mut rejections);
     }
     for (i, backend) in cfg.backends.iter().enumerate() {
         validate_backend(&format!("backends[{i}]"), backend, &mut rejections);
+    }
+    for (i, ext) in cfg.extensions.iter().enumerate() {
+        validate_extension(&format!("extensions[{i}]"), ext, &mut rejections);
     }
 
     if rejections.is_empty() {
@@ -325,6 +338,23 @@ fn validate_backend(key: &str, backend: &Backend, out: &mut Vec<Rejection>) {
                 out,
             );
         }
+    }
+}
+
+fn validate_extension(key: &str, ext: &Extension, out: &mut Vec<Rejection>) {
+    if ext.class.is_empty() {
+        out.push(Rejection {
+            key: key.to_string(),
+            reason: RejectionReason::EmptyExtensionClass,
+        });
+    }
+    if ext.limits.max_buffer_bytes.is_some()
+        && ext.limits.request_body != Some(RequestBodyLimit::Buffer)
+    {
+        out.push(Rejection {
+            key: key.to_string(),
+            reason: RejectionReason::BufferBytesWithoutBuffer,
+        });
     }
 }
 
@@ -938,5 +968,78 @@ gatewayConfig:
             errs.iter()
                 .any(|r| matches!(&r.reason, RejectionReason::DuplicateName(n) if n == "same"))
         );
+    }
+
+    #[test]
+    fn duplicate_extension_names_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  extensions:
+    - { name: x, class: a }
+    - { name: x, class: b }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(&r.reason, RejectionReason::DuplicateName(n) if n == "x"))
+        );
+    }
+
+    #[test]
+    fn empty_extension_class_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  extensions:
+    - { name: x, class: '' }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::EmptyExtensionClass))
+        );
+    }
+
+    #[test]
+    fn extension_buffer_bytes_requires_buffer_ceiling() {
+        // Absent requestBody and a lower ceiling both reject.
+        for limits in [
+            "{ maxBufferBytes: 1 }",
+            "{ requestBody: Stream, maxBufferBytes: 1 }",
+        ] {
+            let cfg = parse(&format!(
+                r"
+gatewayConfig:
+  name: g
+  binds: []
+  extensions:
+    - {{ name: x, class: c, limits: {limits} }}
+",
+            ));
+            let errs = validate(&cfg).unwrap_err();
+            assert!(
+                errs.iter()
+                    .any(|r| matches!(r.reason, RejectionReason::BufferBytesWithoutBuffer)),
+                "limits {limits} must be rejected"
+            );
+        }
+
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  extensions:
+    - { name: x, class: c, limits: { requestBody: Buffer, maxBufferBytes: 1048576 } }
+",
+        );
+        assert!(validate(&cfg).is_ok());
     }
 }
