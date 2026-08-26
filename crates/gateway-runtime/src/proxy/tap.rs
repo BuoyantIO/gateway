@@ -34,12 +34,14 @@ pub(super) fn tap(
     members: Vec<Member>,
     cx: Cx,
     status: StatusCode,
+    upstream: bool,
 ) -> ResponseBody {
     TappedBody {
         inner: body,
         members,
         cx,
         status,
+        upstream,
         bytes: 0,
         armed: true,
     }
@@ -55,6 +57,7 @@ pub(super) fn end_without_response(members: &mut [Member], cx: &mut Cx, status: 
         status,
         body_bytes: 0,
         complete: false,
+        upstream: false,
     };
     for member in members
         .iter_mut()
@@ -70,6 +73,9 @@ struct TappedBody {
     members: Vec<Member>,
     cx: Cx,
     status: StatusCode,
+    /// Whether the status came from an upstream response — false for
+    /// a response synthesized after dispatch (a dial-failure 502).
+    upstream: bool,
     bytes: u64,
     /// Cleared when the terminal fires. Still set in `Drop` means the
     /// response never finished — the client went away mid-stream.
@@ -88,6 +94,7 @@ impl TappedBody {
             status: self.status,
             body_bytes: self.bytes,
             complete,
+            upstream: self.upstream,
         };
         for member in self
             .members
@@ -187,7 +194,7 @@ mod tests {
     #[derive(Default)]
     struct Seen {
         chunks: Vec<(Vec<u8>, bool)>,
-        ends: Vec<(StatusCode, u64, bool)>,
+        ends: Vec<ResponseEnd>,
     }
 
     struct Probe {
@@ -208,11 +215,7 @@ mod tests {
         }
 
         fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
-            self.seen
-                .lock()
-                .unwrap()
-                .ends
-                .push((end.status, end.body_bytes, end.complete));
+            self.seen.lock().unwrap().ends.push(*end);
         }
     }
 
@@ -268,6 +271,7 @@ mod tests {
             vec![first, second],
             Cx::new(),
             StatusCode::OK,
+            true,
         );
         assert_eq!(drain(body).await, Bytes::from_static(b"onetwo"));
 
@@ -294,23 +298,72 @@ mod tests {
         // `None` never arrives, so the latch is what prevents a miss.
         let order = Arc::new(Mutex::new(Vec::new()));
         let (m, seen) = member("m", ResponseMode::Tap, &order);
-        let body = tap(sized(b"payload"), vec![m], Cx::new(), StatusCode::OK);
+        let body = tap(sized(b"payload"), vec![m], Cx::new(), StatusCode::OK, true);
         assert_eq!(drain(body).await, Bytes::from_static(b"payload"));
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.chunks, vec![(b"payload".to_vec(), true)]);
-        assert_eq!(seen.ends, vec![(StatusCode::OK, 7, true)]);
+        assert_eq!(
+            seen.ends,
+            vec![ResponseEnd {
+                status: StatusCode::OK,
+                body_bytes: 7,
+                complete: true,
+                upstream: true,
+            }]
+        );
     }
 
     #[tokio::test]
     async fn a_chunked_response_fires_the_terminal_exactly_once() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let (m, seen) = member("m", ResponseMode::Tap, &order);
-        let body = tap(chunked(&[b"ab"]), vec![m], Cx::new(), StatusCode::CREATED);
+        let body = tap(
+            chunked(&[b"ab"]),
+            vec![m],
+            Cx::new(),
+            StatusCode::CREATED,
+            true,
+        );
         drain(body).await;
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.ends, vec![(StatusCode::CREATED, 2, true)]);
+        assert_eq!(
+            seen.ends,
+            vec![ResponseEnd {
+                status: StatusCode::CREATED,
+                body_bytes: 2,
+                complete: true,
+                upstream: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_synthesized_response_reports_no_upstream() {
+        // A dial-failure 502 streams through the wrapper like any
+        // response; the terminal says no upstream answered.
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (m, seen) = member("m", ResponseMode::End, &order);
+        let body = tap(
+            sized(b"bad gateway"),
+            vec![m],
+            Cx::new(),
+            StatusCode::BAD_GATEWAY,
+            false,
+        );
+        drain(body).await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.ends,
+            vec![ResponseEnd {
+                status: StatusCode::BAD_GATEWAY,
+                body_bytes: 11,
+                complete: true,
+                upstream: false,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -322,6 +375,7 @@ mod tests {
             vec![m],
             Cx::new(),
             StatusCode::OK,
+            true,
         );
 
         // One frame, then walk away — the client disconnect case.
@@ -330,14 +384,28 @@ mod tests {
         drop(body);
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.ends, vec![(StatusCode::OK, 5, false)]);
+        assert_eq!(
+            seen.ends,
+            vec![ResponseEnd {
+                status: StatusCode::OK,
+                body_bytes: 5,
+                complete: false,
+                upstream: true,
+            }]
+        );
     }
 
     #[tokio::test]
     async fn a_member_without_response_access_sees_no_chunks_but_still_ends() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let (m, seen) = member("m", ResponseMode::End, &order);
-        let body = tap(chunked(&[b"data"]), vec![m], Cx::new(), StatusCode::OK);
+        let body = tap(
+            chunked(&[b"data"]),
+            vec![m],
+            Cx::new(),
+            StatusCode::OK,
+            true,
+        );
         drain(body).await;
 
         let seen = seen.lock().unwrap();
@@ -366,6 +434,7 @@ mod tests {
             vec![m],
             Cx::new(),
             StatusCode::OK,
+            true,
         );
         let mut body = body;
 
@@ -409,6 +478,14 @@ mod tests {
         end_without_response(&mut members, &mut cx, StatusCode::PAYLOAD_TOO_LARGE);
 
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.ends, vec![(StatusCode::PAYLOAD_TOO_LARGE, 0, false)]);
+        assert_eq!(
+            seen.ends,
+            vec![ResponseEnd {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                body_bytes: 0,
+                complete: false,
+                upstream: false,
+            }]
+        );
     }
 }
