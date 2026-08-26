@@ -2,6 +2,9 @@
 
 use serde::Deserialize;
 
+/// The opaque config type handed to an extension class.
+pub type ConfigValue = serde_yaml::Value;
+
 /// A named instantiation of an extension class: which class, the
 /// operator's policy, and an opaque config only the class reads.
 #[derive(Debug, Clone, Deserialize)]

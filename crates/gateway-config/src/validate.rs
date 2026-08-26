@@ -253,7 +253,7 @@ fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
             HttpFilter::ResponseHeaderModifier {
                 response_headers, ..
             } => response_headers,
-            // No header ops on a redirect, and a ref's plugin is
+            // No header ops on a redirect, and a ref's class is
             // resolved by the runtime, not here.
             HttpFilter::RequestRedirect { .. } | HttpFilter::ExtensionRef { .. } => continue,
         };

@@ -1271,10 +1271,8 @@ impl Extension for Stamp {
     }
 }
 
-fn extension_ref_config(bind_port: u16, upstream_port: u16, plugin: &str) -> GatewayConfig {
-    let filter = HttpFilter::ExtensionRef {
-        name: plugin.into(),
-    };
+fn extension_ref_config(bind_port: u16, upstream_port: u16, class: &str) -> GatewayConfig {
+    let filter = HttpFilter::ExtensionRef { name: class.into() };
     GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -1303,7 +1301,9 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
     let _ = store.apply(&cfg);
 
     let mut registry = Registry::new();
-    registry.register("stamp", Arc::new(StampBuilder)).unwrap();
+    registry
+        .register_builder("stamp", Arc::new(StampBuilder))
+        .unwrap();
 
     let (stop, watch) = drain::channel();
     let gw = Gateway::new(store).with_extensions(registry);
@@ -1330,7 +1330,7 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
         .unwrap();
 }
 
-/// A route referencing a plugin nobody registered must not serve —
+/// A route referencing a class nobody registered must not serve —
 /// skipping the member silently would be worse than failing.
 #[tokio::test]
 async fn unregistered_extension_ref_answers_500() {
@@ -1509,7 +1509,7 @@ async fn spawn_gated_route(
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "probe",
             Arc::new(BodyProbeBuilder {
                 mode,
@@ -1602,7 +1602,7 @@ async fn routes_without_body_members_never_read_a_frame() {
 
     let mut registry = Registry::new();
     registry
-        .register("no-body", Arc::new(NoBodyBuilder))
+        .register_builder("no-body", Arc::new(NoBodyBuilder))
         .unwrap();
 
     let (stop, watch) = drain::channel();
@@ -1806,7 +1806,7 @@ async fn spawn_tapped_route(upstream_port: u16, mode: ResponseMode) -> TappedRou
     let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "resp-probe",
             Arc::new(ResponseProbeBuilder {
                 mode,
@@ -1878,7 +1878,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
     let seen = Arc::new(StdMutex::new(ResponseSeen::default()));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "resp-probe",
             Arc::new(ResponseProbeBuilder {
                 mode: ResponseMode::Tap,
@@ -1962,7 +1962,7 @@ async fn a_request_only_member_never_sees_the_response() {
 
     let mut registry = Registry::new();
     registry
-        .register("request-only", Arc::new(RequestOnlyBuilder))
+        .register_builder("request-only", Arc::new(RequestOnlyBuilder))
         .unwrap();
 
     let (stop, watch) = drain::channel();
@@ -2161,7 +2161,7 @@ async fn spawn_picked_route(be_a: u16, be_b: u16, mode: BodyMode, plan: PickPlan
     let buffer_at_select = Arc::new(StdMutex::new(HeldSeen::NotCalled));
     let mut registry = Registry::new();
     registry
-        .register(
+        .register_builder(
             "picker",
             Arc::new(PickerBuilder {
                 mode,
@@ -2374,7 +2374,7 @@ async fn two_selectors_on_one_rule_fail_the_request() {
     let mut registry = Registry::new();
     for name in ["picker-one", "picker-two"] {
         registry
-            .register(
+            .register_builder(
                 name,
                 Arc::new(PickerBuilder {
                     mode: BodyMode::None,
