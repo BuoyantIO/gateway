@@ -20,7 +20,6 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
-use gateway_config::filter::HttpFilter as HttpFilterConfig;
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
@@ -39,10 +38,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::drain;
-use crate::extension::builtin::instance_for;
 use crate::extension::{
-    Action, BodyMode, Cx, Held, LocalResponse, Member, Registry, Selected, Target, TargetBackend,
-    Targets,
+    Action, BodyMode, Cx, Held, LocalResponse, Member, Selected, Target, TargetBackend, Targets,
 };
 use crate::gateway::ProxyCtx;
 use crate::lb::EndpointInfo;
@@ -221,18 +218,11 @@ async fn serve_request_inner(
     cx.set_matched_path_prefix(resolved.matched_path_prefix.as_deref());
     cx.set_request_host(host_stripped.as_deref());
 
-    // One extension instance per filter, alive from the request phase
-    // through the response phase. Invalid filter config fails here,
-    // before dispatch.
-    let mut extensions = match build_extensions(&resolved.filters, &ctx.extensions) {
-        Ok(exts) => exts,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to build filter extension");
-            return (
-                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                RequestOutcome::short_circuit(listener, route, Reason::Internal),
-            );
-        }
+    let Some(mut extensions) = instantiate_members(ctx, &resolved.route) else {
+        return (
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            RequestOutcome::short_circuit(listener, route, Reason::Internal),
+        );
     };
 
     let (mut parts, body) = req.into_parts();
@@ -245,6 +235,7 @@ async fn serve_request_inner(
     // registry cannot see, so it fails here, loudly.
     if extensions.iter().filter(|m| m.decl.selects_targets).count() > 1 {
         let names: Vec<&str> = resolved
+            .route
             .filters
             .iter()
             .map(gateway_config::filter::HttpFilter::name)
@@ -691,15 +682,21 @@ fn halt_response(
     (resp, RequestOutcome::short_circuit(listener, route, reason))
 }
 
-/// Build one member per filter, in route order.
-fn build_extensions(
-    filters: &[HttpFilterConfig],
-    registry: &Registry,
-) -> Result<Vec<Member>, crate::extension::builtin::FilterError> {
-    filters
-        .iter()
-        .map(|cfg| instance_for(cfg, registry))
-        .collect()
+/// Per-request instances from the route's cached members. Members
+/// are configured once per route revision; per request each cached
+/// builder constructs one instance. A filter the registry rejects
+/// resolves to `None` — the failure was logged when it was cached.
+fn instantiate_members(ctx: &ProxyCtx, route: &ActiveHttpRoute) -> Option<Vec<Member>> {
+    let members = ctx.members.members_for(&ctx.extensions, route).ok()?;
+    Some(
+        members
+            .iter()
+            .map(|m| Member {
+                decl: m.decl,
+                ext: m.builder.build(),
+            })
+            .collect(),
+    )
 }
 
 /// What the request-side hooks decided for this request.
@@ -748,7 +745,6 @@ struct ResolvedRoute {
     /// backendRef set is the selection allowlist, and the weighted
     /// pick above only kept its winner.
     route: Arc<ActiveHttpRoute>,
-    filters: Vec<HttpFilterConfig>,
     route_name: String,
     /// Name of the listener the route hangs off — the `listener`
     /// metric label.
@@ -850,7 +846,6 @@ fn resolve_http_route(
     Ok(ResolvedRoute {
         backend,
         route: Arc::clone(chosen),
-        filters: chosen.filters.clone(),
         route_name: chosen.key.name.clone(),
         listener_name: chosen.key.listener.name.clone(),
         matched_path_prefix: matched_prefix(&chosen.matches, ctx.path).map(str::to_owned),
@@ -1965,6 +1960,7 @@ mod tests {
 
     fn selection_route(refs: Vec<ActiveBackendRef>) -> Arc<ActiveHttpRoute> {
         Arc::new(ActiveHttpRoute {
+            revision: 0,
             key: gateway_state::RouteKey {
                 listener: gateway_state::ListenerKey {
                     bind: BindKey("b".into()),

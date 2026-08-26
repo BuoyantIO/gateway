@@ -81,25 +81,29 @@ drawn winner. Selector rules validate against the whole list.
 
 ## Extension instances
 
-Each filter on the resolved route becomes one extension instance for
-this request (in code: `Member`), holding the instance and a copy of
-its builder's `Declarations` (`request_body`, `response`,
-`selects_targets`). The copy is taken at
-instantiation because the declarations drive everything downstream —
-the body tier, response wrapping, `on_response_end` delivery — and the builder
-is not consulted again.
+Every filter resolves through an extension class. An inline core
+filter serializes its typed config and names its reserved class; an
+`ExtensionRef` names a registered class with no config
+(`class_and_config` is the one funnel). The class configures a
+builder once per route revision — the store stamps
+`ActiveHttpRoute.revision` on every rebuild — and the runtime caches
+the result (`MemberCache`). Config parsing and validation happen
+there, never per request.
 
-Core filters construct from their inline config. An `ExtensionRef`
-filter resolves by name against the `Registry`.
+Per request, each cached builder constructs one extension instance
+(in code: `Member`), holding the instance and the builder's
+`Declarations` (`request_body`, `response`, `selects_targets`). The
+declarations drive everything downstream — the body tier, response
+wrapping, `on_response_end` delivery.
 
-Instantiation can fail: a ref naming a plugin the registry does not
-hold, or two instances on one route declaring `selects_targets`.
-These are configuration
-invariants, and their proper enforcement is at config apply, before a
-route can receive traffic. The request path keeps a defensive check:
-a route violating them serves nothing (500, reason `internal`, log
-names the filters) — skipping the offending instance would run the
-route with fewer filters than configured.
+Resolution can fail: a filter naming a class the registry does not
+hold, or config the class rejects. The failure is cached for the
+route's revision and logged once; requests matching the route answer
+500 (reason `internal`) until the config changes. Two instances on
+one route declaring `selects_targets` is checked per request as a
+defensive backstop (500, log names the filters) — proper enforcement
+is at config apply, before a route can receive traffic. A route never
+serves with fewer filters than configured.
 
 Instances live until the response ends, whatever the ending.
 
