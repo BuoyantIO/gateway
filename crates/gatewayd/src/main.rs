@@ -136,7 +136,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let gateway = gateway_runtime::Gateway::with_metrics(store, metrics);
+    let mut classes = gateway_runtime::extension::Registry::new();
+    gateway_extension_impls::register_builtins(&mut classes);
+    let gateway = gateway_runtime::Gateway::with_metrics(store, metrics).with_classes(classes);
     gateway.run(drain_watch).await?;
 
     // The run loop exited: on a signal the driver is already waiting

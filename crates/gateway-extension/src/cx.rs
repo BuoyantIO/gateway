@@ -36,7 +36,7 @@ impl Cx {
 
     /// Install the rule's resolved refs. Host-side, selector rules
     /// only.
-    pub(crate) fn set_targets(&mut self, targets: Targets) {
+    pub fn set_targets(&mut self, targets: Targets) {
         self.targets = targets;
     }
 
@@ -57,7 +57,7 @@ impl Cx {
 
     /// Append a chunk to the request accumulation, creating it on
     /// first use. Written by the body gate only.
-    pub(crate) fn append_request_buffer(&mut self, chunk: &[u8]) {
+    pub fn append_request_buffer(&mut self, chunk: &[u8]) {
         self.request_buffer
             .get_or_insert_with(BytesMut::new)
             .extend_from_slice(chunk);
@@ -66,7 +66,7 @@ impl Cx {
     /// Take the accumulated request body, leaving the accessor
     /// `None`. The gate calls this once, after end-of-stream, to
     /// forward the bytes without a copy.
-    pub(crate) fn take_request_buffer(&mut self) -> Option<BytesMut> {
+    pub fn take_request_buffer(&mut self) -> Option<BytesMut> {
         self.request_buffer.take()
     }
 
@@ -103,7 +103,7 @@ pub struct Targets {
 }
 
 impl Targets {
-    pub(crate) fn new(backends: Vec<TargetBackend>) -> Self {
+    pub fn new(backends: Vec<TargetBackend>) -> Self {
         Self { backends }
     }
 
@@ -128,7 +128,7 @@ pub struct TargetBackend {
 }
 
 impl TargetBackend {
-    pub(crate) fn new(name: String, weight: u32, backend: Option<Arc<ActiveBackend>>) -> Self {
+    pub fn new(name: String, weight: u32, backend: Option<Arc<ActiveBackend>>) -> Self {
         Self {
             name,
             weight,

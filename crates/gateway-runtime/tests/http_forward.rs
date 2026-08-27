@@ -195,9 +195,16 @@ async fn wait_for_listening(port: u16) {
     panic!("gateway did not start listening on port {port}");
 }
 
+/// The registry a production gateway starts with: the caller's
+/// classes plus the built-ins, registered the way `gatewayd` does it.
+fn with_builtins(mut registry: Registry) -> Registry {
+    gateway_extension_impls::register_builtins(&mut registry);
+    registry
+}
+
 fn spawn_gateway(store: Store) -> (tokio::task::JoinHandle<()>, drain::Signal) {
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store);
+    let gw = Gateway::new(store).with_classes(with_builtins(Registry::new()));
     let handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -1325,7 +1332,7 @@ async fn registered_extension_runs_for_a_route_that_references_it() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1387,7 +1394,7 @@ async fn members_configure_once_per_route_revision() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store.clone()).with_classes(registry);
+    let gw = Gateway::new(store.clone()).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1488,7 +1495,7 @@ async fn failure_mode_decides_what_a_hook_error_does() {
             .unwrap();
 
         let (stop, watch) = drain::channel();
-        let gw = Gateway::new(store).with_classes(registry);
+        let gw = Gateway::new(store).with_classes(with_builtins(registry));
         let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
         wait_for_listening(bind_port).await;
 
@@ -1541,7 +1548,7 @@ async fn an_open_selector_that_fails_still_fails_the_request() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1577,7 +1584,7 @@ async fn extension_object_lifecycle_drives_the_route() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store.clone()).with_classes(registry);
+    let gw = Gateway::new(store.clone()).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -1804,7 +1811,7 @@ async fn spawn_gated_route(
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -1890,7 +1897,7 @@ async fn routes_without_body_members_never_read_a_frame() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -2101,7 +2108,7 @@ async fn spawn_tapped_route(upstream_port: u16, mode: ResponseMode) -> TappedRou
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -2173,7 +2180,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -2250,7 +2257,7 @@ async fn a_request_only_member_never_sees_the_response() {
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
@@ -2458,7 +2465,7 @@ async fn spawn_picked_route(be_a: u16, be_b: u16, mode: BodyMode, plan: PickPlan
         .unwrap();
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move {
         gw.run(watch).await.unwrap();
     });
@@ -2677,7 +2684,7 @@ async fn two_selectors_on_one_rule_fail_the_request() {
     }
 
     let (stop, watch) = drain::channel();
-    let gw = Gateway::new(store).with_classes(registry);
+    let gw = Gateway::new(store).with_classes(with_builtins(registry));
     let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
     wait_for_listening(bind_port).await;
 
