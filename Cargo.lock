@@ -693,6 +693,7 @@ dependencies = [
  "clap",
  "futures",
  "gateway-api",
+ "gateway-config",
  "gateway-cp-proto",
  "gateway-drain",
  "gateway-state",

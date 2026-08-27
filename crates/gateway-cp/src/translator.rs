@@ -21,6 +21,9 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
     HttpRouteRulesMatchesQueryParamsType,
 };
+use gateway_config::filter::{
+    HeaderOps, HeaderPair, RedirectConfig, RedirectPath, RedirectStatus, Scheme,
+};
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -296,7 +299,17 @@ fn emit_routes_under_edge(
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter_map(|f| translate_filter(f, route.route_ns))
+            .enumerate()
+            .filter_map(|(filter_idx, f)| {
+                translate_filter(
+                    f,
+                    route.route_ns,
+                    route.route_name,
+                    rule_idx,
+                    filter_idx,
+                    &mut snapshot.extensions,
+                )
+            })
             .collect();
 
         snapshot.routes.insert(
@@ -511,9 +524,32 @@ fn translate_query_param_matches(
     out
 }
 
-fn translate_filter(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<pb::HttpFilter> {
+/// Reserved class names for the built-in extensions — the wire
+/// contract with the DP registry. The round-trip tests pin the
+/// config shapes each class deserializes.
+const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
+const RESPONSE_HEADER_MODIFIER: &str = "response_header_modifier";
+const REQUEST_REDIRECT: &str = "request_redirect";
+
+/// A core filter becomes a synthesized `Extension` object plus a ref
+/// at the filter's position; a user `extensionRef` passes through.
+/// The DP sees one carrier either way.
+fn translate_filter(
+    f: &HttpRouteRulesFilters,
+    route_ns: &str,
+    route_name: &str,
+    rule_idx: usize,
+    filter_idx: usize,
+    extensions: &mut HashMap<ExtensionKey, pb::ExtensionUpsert>,
+) -> Option<pb::HttpFilter> {
+    let at = FilterPosition {
+        route_ns,
+        route_name,
+        rule_idx,
+        filter_idx,
+    };
     if let Some(rhm) = f.request_header_modifier.as_ref() {
-        let (add, set, remove) = translate_header_ops(
+        let ops = header_ops(
             rhm.add
                 .as_deref()
                 .unwrap_or(&[])
@@ -530,17 +566,10 @@ fn translate_filter(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<pb::Htt
                 .iter()
                 .map(String::as_str),
         );
-        return Some(pb::HttpFilter {
-            kind: Some(pb::http_filter::Kind::RequestHeaderModifier(
-                pb::RequestHeaderModifier {
-                    name: String::new(),
-                    request_headers: Some(pb::HeaderOps { add, set, remove }),
-                },
-            )),
-        });
+        return synthesize(extensions, &at, REQUEST_HEADER_MODIFIER, &ops);
     }
     if let Some(rhm) = f.response_header_modifier.as_ref() {
-        let (add, set, remove) = translate_header_ops(
+        let ops = header_ops(
             rhm.add
                 .as_deref()
                 .unwrap_or(&[])
@@ -557,52 +586,35 @@ fn translate_filter(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<pb::Htt
                 .iter()
                 .map(String::as_str),
         );
-        return Some(pb::HttpFilter {
-            kind: Some(pb::http_filter::Kind::ResponseHeaderModifier(
-                pb::ResponseHeaderModifier {
-                    name: String::new(),
-                    response_headers: Some(pb::HeaderOps { add, set, remove }),
-                },
-            )),
-        });
+        return synthesize(extensions, &at, RESPONSE_HEADER_MODIFIER, &ops);
     }
     if let Some(rr) = f.request_redirect.as_ref() {
-        let scheme = match rr.scheme {
-            Some(HttpRouteRulesFiltersRequestRedirectScheme::Http) => pb::RedirectScheme::Http,
-            Some(HttpRouteRulesFiltersRequestRedirectScheme::Https) => pb::RedirectScheme::Https,
-            None => pb::RedirectScheme::Unspecified,
-        } as i32;
-        let hostname = rr.hostname.clone().unwrap_or_default();
-        let port = rr.port.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
-        let status_code = match rr.status_code {
-            Some(301) => pb::RedirectStatus::MovedPermanently,
-            Some(302) => pb::RedirectStatus::Found,
-            // Gateway API's CRD enum only permits 301/302; anything
-            // else (or unset) falls to the DP's default.
-            _ => pb::RedirectStatus::Unspecified,
-        } as i32;
-        let path = rr.path.as_ref().and_then(|p| match p.r#type {
-            HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => p
-                .replace_full_path
-                .clone()
-                .map(pb::request_redirect::Path::ReplaceFullPath),
-            HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => p
-                .replace_prefix_match
-                .clone()
-                .map(pb::request_redirect::Path::ReplacePrefixMatch),
-        });
-        return Some(pb::HttpFilter {
-            kind: Some(pb::http_filter::Kind::RequestRedirect(
-                pb::RequestRedirect {
-                    name: String::new(),
-                    scheme,
-                    hostname,
-                    port,
-                    status_code,
-                    path,
-                },
-            )),
-        });
+        let redirect = RedirectConfig {
+            scheme: match rr.scheme {
+                Some(HttpRouteRulesFiltersRequestRedirectScheme::Http) => Some(Scheme::Http),
+                Some(HttpRouteRulesFiltersRequestRedirectScheme::Https) => Some(Scheme::Https),
+                None => None,
+            },
+            hostname: rr.hostname.clone(),
+            port: rr.port.and_then(|p| u16::try_from(p).ok()),
+            status_code: match rr.status_code {
+                Some(301) => RedirectStatus::MovedPermanently,
+                // Gateway API's CRD enum only permits 301/302;
+                // anything else (or unset) takes the 302 default.
+                _ => RedirectStatus::Found,
+            },
+            path: rr.path.as_ref().and_then(|p| match p.r#type {
+                HttpRouteRulesFiltersRequestRedirectPathType::ReplaceFullPath => p
+                    .replace_full_path
+                    .clone()
+                    .map(RedirectPath::ReplaceFullPath),
+                HttpRouteRulesFiltersRequestRedirectPathType::ReplacePrefixMatch => p
+                    .replace_prefix_match
+                    .clone()
+                    .map(RedirectPath::ReplacePrefixMatch),
+            }),
+        };
+        return synthesize(extensions, &at, REQUEST_REDIRECT, &redirect);
     }
     if let Some(filter) = translate_extension_ref(f, route_ns) {
         return Some(filter);
@@ -610,6 +622,53 @@ fn translate_filter(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<pb::Htt
 
     tracing::warn!(?f.r#type, "skipping unsupported HTTPRoute filter");
     None
+}
+
+/// One filter position on one route rule. The synthesized object's
+/// name derives from it, so the name is stable across the route's
+/// listeners and changes only when filters move.
+struct FilterPosition<'a> {
+    route_ns: &'a str,
+    route_name: &'a str,
+    rule_idx: usize,
+    filter_idx: usize,
+}
+
+/// Emit the synthesized `Extension` object for one core filter and
+/// return the ref that takes the filter's place. `~` is not a legal
+/// Kubernetes name character, so a synthesized key can never collide
+/// with a user object.
+fn synthesize<T: serde::Serialize>(
+    extensions: &mut HashMap<ExtensionKey, pb::ExtensionUpsert>,
+    at: &FilterPosition<'_>,
+    class: &str,
+    config: &T,
+) -> Option<pb::HttpFilter> {
+    let config_yaml = match serde_yaml::to_string(config) {
+        Ok(y) => y,
+        Err(e) => {
+            tracing::warn!(class, error = %e, "core filter config cannot serialize; dropping the filter");
+            return None;
+        }
+    };
+    let name = format!("{}~r{}~f{}", at.route_name, at.rule_idx, at.filter_idx);
+    extensions.insert(
+        ExtensionKey::new(at.route_ns, &name),
+        pb::ExtensionUpsert {
+            namespace: at.route_ns.to_string(),
+            name: name.clone(),
+            class: class.to_string(),
+            failure_mode: pb::FailureMode::Closed as i32,
+            limits: None,
+            config_yaml,
+        },
+    );
+    Some(pb::HttpFilter {
+        kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
+            name,
+            namespace: at.route_ns.to_string(),
+        })),
+    })
 }
 
 /// The `extensionRef` arm: only our `Extension` kind translates; a
@@ -628,26 +687,23 @@ fn translate_extension_ref(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<
 }
 
 /// Shared add/set/remove translator for the request- and
-/// response-side header modifiers. Returns proto-shaped vecs.
-fn translate_header_ops<'a, A, S, R>(
-    add: A,
-    set: S,
-    remove: R,
-) -> (Vec<pb::HeaderPair>, Vec<pb::HeaderPair>, Vec<String>)
+/// response-side header modifiers. Builds the `gateway-config` type
+/// the built-in classes deserialize, so the YAML shape cannot drift.
+fn header_ops<'a, A, S, R>(add: A, set: S, remove: R) -> HeaderOps
 where
     A: Iterator<Item = (&'a String, &'a String)>,
     S: Iterator<Item = (&'a String, &'a String)>,
     R: Iterator<Item = &'a str>,
 {
-    let to_pair = |(name, value): (&String, &String)| pb::HeaderPair {
+    let to_pair = |(name, value): (&String, &String)| HeaderPair {
         name: name.clone(),
         value: value.clone(),
     };
-    (
-        add.map(to_pair).collect(),
-        set.map(to_pair).collect(),
-        remove.map(str::to_owned).collect(),
-    )
+    HeaderOps {
+        add: add.map(to_pair).collect(),
+        set: set.map(to_pair).collect(),
+        remove: remove.map(str::to_owned).collect(),
+    }
 }
 
 /// Recognized HTTP/2 indicators on `Service.spec.ports[*].appProtocol`.
@@ -1547,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn request_header_modifier_translated() {
+    fn core_filters_synthesize_extension_objects() {
         let state = K8sState {
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
@@ -1563,7 +1619,7 @@ mod tests {
                 vec![rule(
                     Some("/"),
                     vec![backend_ref("svc", 8080)],
-                    vec![header_modifier_filter()],
+                    vec![header_modifier_filter(), response_header_modifier_filter()],
                 )],
             )],
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
@@ -1574,54 +1630,42 @@ mod tests {
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let route = s.routes.values().next().unwrap();
-        assert_eq!(route.filters.len(), 1);
+
+        // Each core filter became a ref at its position.
+        let names: Vec<&str> = route
+            .filters
+            .iter()
+            .map(|f| match f.kind.as_ref().expect("kind set") {
+                pb::http_filter::Kind::ExtensionRef(er) => {
+                    assert_eq!(er.namespace, "demo");
+                    er.name.as_str()
+                }
+                other => panic!("expected ExtensionRef, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["r~r0~f0", "r~r0~f1"]);
+
+        // ...and one synthesized object each, whose config round-trips
+        // into the exact type the built-in class deserializes.
+        let req = &s.extensions[&ExtensionKey::new("demo", "r~r0~f0")];
+        assert_eq!(req.class, "request_header_modifier");
+        assert_eq!(req.failure_mode, pb::FailureMode::Closed as i32);
+        assert!(req.limits.is_none());
+        let ops: HeaderOps = serde_yaml::from_str(&req.config_yaml).expect("parses");
+        assert_eq!(ops.add[0].name, "x-test");
+        assert_eq!(ops.set[0].name, "x-set");
+        assert_eq!(ops.remove, vec!["x-drop".to_string()]);
+
+        let resp = &s.extensions[&ExtensionKey::new("demo", "r~r0~f1")];
+        assert_eq!(resp.class, "response_header_modifier");
+        let ops: HeaderOps = serde_yaml::from_str(&resp.config_yaml).expect("parses");
+        assert_eq!(ops.add[0].name, "x-csp");
+        assert_eq!(ops.set[0].name, "x-frame-options");
+        assert_eq!(ops.remove, vec!["x-server-version".to_string()]);
     }
 
     #[test]
-    fn response_header_modifier_translated() {
-        let state = K8sState {
-            gateway_classes: vec![gc("zd", OURS)],
-            gateways: vec![gw(
-                "demo",
-                "api",
-                "zd",
-                vec![http_listener("http", 80, None)],
-            )],
-            http_routes: vec![http_route(
-                "demo",
-                "r",
-                vec![parent_ref("api", Some("demo"), None)],
-                vec![rule(
-                    Some("/"),
-                    vec![backend_ref("svc", 8080)],
-                    vec![response_header_modifier_filter()],
-                )],
-            )],
-            services: vec![service("demo", "svc", Some("10.0.0.1"))],
-            endpoint_slices: vec![],
-            secrets: vec![],
-            extensions: vec![],
-        };
-        let out = translate(&state, OURS);
-        let s = out.get(&("demo".into(), "api".into())).unwrap();
-        let route = s.routes.values().next().unwrap();
-        assert_eq!(route.filters.len(), 1);
-        let f = &route.filters[0];
-        match f.kind.as_ref().expect("filter kind set") {
-            pb::http_filter::Kind::ResponseHeaderModifier(rhm) => {
-                let ops = rhm.response_headers.as_ref().expect("response_headers set");
-                assert_eq!(ops.add.len(), 1);
-                assert_eq!(ops.add[0].name, "x-csp");
-                assert_eq!(ops.set.len(), 1);
-                assert_eq!(ops.set[0].name, "x-frame-options");
-                assert_eq!(ops.remove, vec!["x-server-version".to_string()]);
-            }
-            other => panic!("expected ResponseHeaderModifier, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn request_redirect_filter_translated() {
+    fn request_redirect_synthesizes_and_round_trips() {
         use gateway_api::apis::standard::httproutes::{
             HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectPath,
             HttpRouteRulesFiltersRequestRedirectPathType,
@@ -1650,21 +1694,180 @@ mod tests {
             extension_ref: None,
         };
 
-        let out = translate_filter(&filter, "ns").expect("redirect translated");
+        let mut extensions = HashMap::new();
+        let out = translate_filter(&filter, "ns", "r", 0, 0, &mut extensions)
+            .expect("redirect translated");
         match out.kind.expect("kind set") {
-            pb::http_filter::Kind::RequestRedirect(rr) => {
-                assert_eq!(rr.scheme, pb::RedirectScheme::Https as i32);
-                assert_eq!(rr.status_code, pb::RedirectStatus::MovedPermanently as i32);
-                assert_eq!(rr.port, 0);
-                assert_eq!(
-                    rr.path,
-                    Some(pb::request_redirect::Path::ReplacePrefixMatch(
-                        "/new".into()
-                    ))
-                );
+            pb::http_filter::Kind::ExtensionRef(er) => {
+                assert_eq!(er.name, "r~r0~f0");
+                assert_eq!(er.namespace, "ns");
             }
-            other => panic!("expected RequestRedirect, got {other:?}"),
+            other => panic!("expected ExtensionRef, got {other:?}"),
         }
+        let upsert = &extensions[&ExtensionKey::new("ns", "r~r0~f0")];
+        assert_eq!(upsert.class, "request_redirect");
+        let redirect: RedirectConfig = serde_yaml::from_str(&upsert.config_yaml).expect("parses");
+        assert_eq!(redirect.scheme, Some(Scheme::Https));
+        assert_eq!(redirect.status_code, RedirectStatus::MovedPermanently);
+        assert_eq!(redirect.hostname, None);
+        assert_eq!(redirect.port, None);
+        assert_eq!(
+            redirect.path,
+            Some(RedirectPath::ReplacePrefixMatch("/new".into()))
+        );
+
+        // A minimal redirect serializes to YAML that still parses,
+        // with the 302 default.
+        let minimal = HttpRouteRulesFilters {
+            request_redirect: Some(HttpRouteRulesFiltersRequestRedirect {
+                scheme: None,
+                hostname: None,
+                port: None,
+                status_code: None,
+                path: None,
+            }),
+            ..filter
+        };
+        let mut extensions = HashMap::new();
+        translate_filter(&minimal, "ns", "r", 0, 0, &mut extensions).expect("translated");
+        let upsert = &extensions[&ExtensionKey::new("ns", "r~r0~f0")];
+        let redirect: RedirectConfig = serde_yaml::from_str(&upsert.config_yaml).expect("parses");
+        assert_eq!(redirect.status_code, RedirectStatus::Found);
+        assert_eq!(redirect.scheme, None);
+    }
+
+    #[test]
+    fn mixed_filters_keep_their_positions() {
+        // Core filter, user ref, core filter: the refs land in filter
+        // order, and only the core filters synthesize objects.
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![backend_ref("svc", 8080)],
+                    vec![
+                        header_modifier_filter(),
+                        extension_ref_filter("gateway.linkerd.io", "Extension", "picker"),
+                        response_header_modifier_filter(),
+                    ],
+                )],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        let names: Vec<&str> = route
+            .filters
+            .iter()
+            .map(|f| match f.kind.as_ref().expect("kind set") {
+                pb::http_filter::Kind::ExtensionRef(er) => er.name.as_str(),
+                other => panic!("expected ExtensionRef, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["r~r0~f0", "picker", "r~r0~f2"]);
+        assert_eq!(s.extensions.len(), 2, "only core filters synthesize");
+    }
+
+    #[test]
+    fn synthesized_object_is_shared_across_listeners() {
+        // The name derives from (route, rule, filter), not the edge:
+        // a route attached to two listeners emits two route upserts
+        // but one synthesized object.
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![
+                    http_listener("web", 80, None),
+                    http_listener("alt", 8080, None),
+                ],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![backend_ref("svc", 8080)],
+                    vec![header_modifier_filter()],
+                )],
+            )],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![],
+        };
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        assert_eq!(s.routes.len(), 2);
+        assert_eq!(s.extensions.len(), 1);
+    }
+
+    #[test]
+    fn core_filter_config_change_leaves_the_route_untouched() {
+        // The synthesized key is position-derived, so a config edit
+        // re-emits only the extension object; the route upsert is
+        // byte-identical and the diff carries one upsert.
+        let route_with_value = |value: &str| {
+            let mut filter = header_modifier_filter();
+            filter
+                .request_header_modifier
+                .as_mut()
+                .unwrap()
+                .add
+                .as_mut()
+                .unwrap()[0]
+                .value = value.into();
+            http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![backend_ref("svc", 8080)],
+                    vec![filter],
+                )],
+            )
+        };
+        let state = |value: &str| K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![route_with_value(value)],
+            services: vec![service("demo", "svc", Some("10.0.0.1"))],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![],
+        };
+        let before = translate(&state("yes"), OURS);
+        let after = translate(&state("no"), OURS);
+        let key = ("demo".to_string(), "api".to_string());
+        let (b, a) = (before.get(&key).unwrap(), after.get(&key).unwrap());
+        assert_eq!(b.routes, a.routes, "route upsert must not change");
+        assert_ne!(
+            b.extensions, a.extensions,
+            "the synthesized object carries the change"
+        );
     }
 
     // ---------- hostname helpers ----------
