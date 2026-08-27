@@ -1,153 +1,157 @@
-# Agent contract for the `gateway` repo
+# CLAUDE.md
 
-## Single source of truth
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`docs/ARCHITECTURE.md` is canonical for every design decision. Do not
-infer scope, naming, or relationships from any other document, comment,
-or memory. If the master doc is silent on something, ask the user — do
-not invent.
+## What this is
 
-## How the repo grows
+A Kubernetes Gateway API implementation in Rust: a control plane
+(`gateway-cp`) that watches `Gateway`/`HTTPRoute` resources and
+provisions the data plane (`gatewayd`) that serves the traffic.
+Config flows one way, CP to DP, over a streaming gRPC channel;
+nothing in the data plane reads Kubernetes.
 
-- Cargo workspace at the root.
-- One crate per area, named `gateway-<area>` under `crates/`.
-- Do not create empty placeholder crates for areas not yet started.
-- The workspace `members` list grows by exactly one entry per area start.
-- A `bin/gatewayd` and a `tests/e2e/` directory appear only once at least
-  two areas exist and wiring them together is meaningful.
+## Commands
 
-## Implementation order
+`just` drives everything (`just --list`). `protoc`
+(`protobuf-compiler`) must be installed: two crates compile protos in
+`build.rs`.
 
-Areas are tackled in the order they appear in the master doc's TOC. For
-each area, finish the **full v0 scope** (the area's `V0 scope`
-subsection in `docs/ARCHITECTURE.md`) before starting the next area.
-
-## Style and quality gates
-
-- `cargo fmt` — committed code must be formatted.
-- `cargo clippy -- -D warnings` — no warnings.
-- `cargo test` — green before declaring an area v0-complete.
-- Edition: `2024`. Toolchain pinned via `rust-toolchain.toml`.
-
-## Rust file organization
-
-Top-to-bottom order within a `.rs` file (matching `tokio`'s style):
-
-1. **Module-level doc comment** (`//!`) — what this module is, for any
-   non-trivial file. Skip on small helper files.
-2. **`use` statements**, grouped with blank lines between groups, in this
-   order:
-   - `std::` imports.
-   - External-crate imports (`tokio::`, `serde::`, `parking_lot::`, …).
-   - Internal imports (`crate::`, `super::`).
-   Imports are alphabetical within each group. `rustfmt` handles
-   alphabetization but does not reorder between groups — keep the order
-   manually.
-3. **`mod` / `pub mod` declarations.**
-4. **`pub use` re-exports.**
-5. **`const` / `static`** definitions.
-6. **Public types first, principal type at the top.** When a file
-   has one main type (e.g. `Gateway`, `Store`, `EndpointInfo`), it
-   leads. Other public types follow. Private types come after public
-   ones unless they're tightly coupled to a specific public method.
-7. **Pair each type with its `impl`s immediately below it.** This is
-   the strongest rule: a reader looking for methods on `Foo` should
-   find them right under `struct Foo`. Trait `impl`s (`Drop`,
-   `Default`, `Debug`, `From`, etc.) also live next to the type they
-   target. Don't collect all `impl`s into a section at the end.
-8. **Free functions** at the bottom of the type-related section,
-   grouped by what they do.
-9. **Tests last**, in an inline `#[cfg(test)] mod tests { ... }`
-   block. Integration tests live in `tests/`, not in the source file.
-
-A useful concrete example:
-
-```rust
-//! What this module is for.
-
-use std::sync::Arc;
-
-use tokio::net::TcpStream;
-
-use crate::error::ProxyError;
-
-pub struct Gateway { /* fields */ }
-
-impl Gateway {
-    pub fn new(...) -> Self { ... }
-    pub async fn run(...) -> Result<(), RuntimeError> { ... }
-    fn helper(&self) { ... }
-}
-
-impl Drop for Gateway { ... }   // trait impl on the same type
-
-// private helper struct, defined where it's used
-struct BindSession { ... }
-impl Drop for BindSession { ... }
-
-// free helpers
-fn build_addr(...) -> SocketAddr { ... }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // ...
-}
+```sh
+just lint         # cargo fmt --check + clippy --workspace --all-targets -D warnings
+just lint-chart   # helm lint deploy/chart/gateway
+just test-unit    # cargo test --workspace
+just up           # build images, create the gateway-e2e kind cluster, install the chart
+just test-e2e     # cargo test -p gateway-e2e -- --ignored
+just down         # delete the cluster and the cloud-provider-kind container
+just ci           # up + test-e2e + down
 ```
 
-`rustfmt` does NOT reorder items — these are human conventions to
-keep. If you find yourself searching for an `impl` block, the file is
-probably misorganized; move the `impl` next to its type.
+Single unit test:
 
-## What not to do
+```sh
+cargo test -p gateway-cp diff::tests::value_change_yields_upsert
+```
 
-- Don't exceed the v0 scope of the current area. v0 is intentionally
-  narrow.
-- Don't pre-design for stubbed areas (05–07). The master doc lists them
-  but does not yet define their shape.
-- Don't introduce cross-area abstractions until at least two areas
-  exist — early abstractions tend to be wrong.
-- Don't add features, fallbacks, or validation beyond what the master
-  doc requires.
-- do not add references in the code that target the architecture file
+Single e2e test (needs `just up` first; every e2e test is
+`#[ignore]`d so `cargo test --workspace` skips them):
 
-## Commit policy
+```sh
+cargo test -p gateway-e2e --test e2e -- --ignored routing::exact_beats_prefix
+```
 
-- Author is the operator (me). Sign off via `git commit -s`. Never
-  add a `Co-Authored-By` trailer.
-- Commit message is a short imperative subject. No body unless I
-  explicitly ask for one. Match the style of recent commits
-  (`git log --oneline -5`).
-- **Never include any path under `docs/` in a commit.** Docs
-  (issues.md, production-readiness.md, bcloud-readiness.md, plans/,
-  v0-review.md, etc.) evolve out-of-band. Stage code only.
-- Stage files by name. Never use `git add -A` or `git add .`.
-- Never use `--no-verify` or bypass GPG signing
-  (`--no-gpg-sign`, `-c commit.gpgsign=false` is OK only because
-  the repo isn't configured for signing).
-- **Never commit unprompted.** Wait for an explicit "commit"
-  signal — usually `/commit-it`. Implementation steps end with
-  a STOP, not a commit.
+Note `e2e/README.md` is stale on two points: the runner is
+`just test-e2e` (not `just test`), and the suite is one test binary
+named `e2e` (not one per file), so `--test e2e` plus a
+`module::test_name` filter is how you narrow it.
 
-## Issue workflow
+## Architecture
 
-The issue queue lives in three parallel docs:
+### Crate graph
 
-- `docs/issues.md` — the lean GitHub-issue-shaped list. Each item
-  is one section starting `## N. <title>`.
-- `docs/production-readiness.md` — detailed scope, acceptance
-  criteria, prior-art notes, list of tests added. Heading shape
-  `### N. <title>`.
-- `docs/bcloud-readiness.md` — same items, bcloud-grounded.
+Dependencies point in one direction, `gateway-config` and
+`gateway-state` at the bottom, the two binaries at the top:
 
-When an issue ships, mark it DONE in all three (use the existing
-DONE entries for #3, #4, #5 as the template).
+- `gateway-config` — typed config model, YAML parsing, per-object
+  validation. No async, no I/O.
+- `gateway-state` — `Store`: the in-memory runtime config the request
+  path reads. Accepts per-entity upserts/removes and broadcasts
+  `BindEvent`s.
+- `gateway-drain` — the drain primitive both binaries shut down
+  with: a watch channel for "start draining" plus a drop-counted
+  mpsc barrier over an uninhabited type.
+- `gateway-runtime` — the data-plane request path: accept loops, TLS
+  termination, routing, extensions, load balancing, metrics.
+- `gateway-cp-proto` — tonic/prost types for
+  `gateway.controlplane.v1` (`crates/gateway-cp-proto/proto/`).
+- `gateway-cp-client` — DP side of the stream: reconnecting gRPC
+  loop, proto to native conversion, apply into the `Store`.
+- `gateway-cp` — the Kubernetes controller and gRPC server.
+- `gatewayd`, `gateway-cp` — the two binaries.
+- `e2e` — harness plus the `echo`/`grpc_echo` test backends.
 
-Trigger phrases:
+### Config path (CP to DP)
 
-- `/issue N` — plan + implement + test + sync docs for item N,
-  then STOP.
-- `/commit-it` — commit per the policy above.
+`watch.rs` runs six kube reflectors and drives one pass per relevant
+event. A pass is `resolve` then `translate` then `publish` then
+status then infra:
 
-For S-sized issues, skip `TaskCreate`. For L-sized issues, use it
-to track multi-step work.
+- `resolve.rs` makes every accept/reject decision exactly once
+  (ownership, listener classification, route attachment, backend and
+  certificateRef resolution) and records an outcome per element.
+  Classification logic belongs here, nowhere else.
+- `translator.rs` maps the resolved graph onto per-Gateway
+  `Snapshot`s of proto upserts. It only maps; it never re-decides.
+- `status/` builds Gateway API status from the same outcomes;
+  `infra/` computes the desired gatewayd `Deployment`/`Service`/
+  `ServiceAccount`. Both split pure (`build`, `desired`) from writer,
+  and both reach the apiserver through `watch` channels so status
+  writes can never block config publication.
+- `server.rs` holds the last published world plus a broadcast channel
+  per Gateway. `diff.rs` turns snapshot pairs into one batched
+  `ConfigUpdate`. A connecting DP subscribes *before* reading the
+  world so a concurrent publish arrives as a delta instead of being
+  lost, then gets a bootstrap batch with `sync_complete = true`.
+- `lease.rs` is leader election: one replica writes status and
+  reconciles infra, every replica translates and serves DPs.
+
+### The Store's promotion model
+
+`gateway-state/src/store.rs` is a strict partition: every known
+entity is in exactly one of `pending_*` or `active_*`, and it is
+active only when its preconditions hold (a route needs its bind and
+listener registered; a listener needs at least one active route).
+Objects arriving out of order are stashed and re-evaluated when their
+dependencies land, so the request path never observes a partially
+applied config. Read the comment block above `Inner` before changing
+apply logic. `Store::retain` is how a resync drops keys the CP no
+longer sends.
+
+### Request path
+
+`documents/request-lifecycle.md` is the canonical description of one
+request from accepted socket to end of response, including every
+error status and metric reason. Read it before touching
+`crates/gateway-runtime/src/proxy/`; keep it updated when behavior
+there changes. In short: `Gateway` runs one accept task per active
+bind, hyper's `auto::Builder` picks H1 or H2 by peeking the preface,
+routing snapshots what it needs from the `Store` under a read lock
+and drops it, and the P2C-EWMA picker in `lb/` chooses an endpoint
+using per-endpoint state (in-flight count, latency EWMA, passive
+eviction) that outlives the request.
+
+### Extensions
+
+Everything that touches a request, including the Gateway API core
+filters, is an `Extension` (`gateway-runtime/src/extension/`). One
+`ExtensionBuilder` per plugin lives in the `Registry`; one instance
+per filter per request. A builder returns `Declarations`
+(`request_body`, `response`, `selects_targets`), copied into the
+`Member` at instantiation, and those declarations pick the host's
+machinery before any hook runs: which body tier is used, whether the
+response gets wrapped, whether the terminal hook is delivered. Add a
+new declaration as a field on `Declarations`, not as another trait
+method. Request hooks run in filter order and may gate the request;
+response hooks run in reverse and only observe. At most one member
+per rule may declare `selects_targets`.
+
+## Conventions
+
+- Edition 2024, toolchain pinned by `rust-toolchain.toml`,
+  `max_width = 100`.
+- Workspace lints: `unsafe_code` is forbidden, clippy `pedantic` is
+  warned, and CI runs clippy with `-D warnings`. Generated proto
+  modules are the only place blanket `allow`s are acceptable.
+- Prefer a module-level `//!` doc that explains the module's role and
+  its invariants. This codebase leans heavily on those; several
+  ("what `resolve` decides", the Store's promotion rules, why the
+  drain barrier is drop-counted) carry information found nowhere
+  else. Keep them accurate.
+- Rust file order, matching tokio's style: module doc, `use` groups
+  (`std`, external crates, `crate`/`super`, blank line between,
+  alphabetical within a group; rustfmt does not reorder between
+  groups), `mod` declarations, `pub use`, consts, then types with the
+  principal type first and each type's `impl`s (inherent and trait)
+  immediately below it, then free functions, then an inline
+  `#[cfg(test)] mod tests`.
+- Unit tests live inline in the module they cover; `tests/` holds
+  integration tests only.
