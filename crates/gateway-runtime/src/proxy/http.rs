@@ -693,6 +693,7 @@ fn instantiate_extensions(ctx: &ProxyCtx, route: &ActiveHttpRoute) -> Option<Vec
             .iter()
             .map(|m| Instance {
                 decl: m.decl,
+                failure_mode: m.failure_mode,
                 ext: m.builder.build(),
             })
             .collect(),
@@ -1961,6 +1962,7 @@ mod tests {
     fn selection_route(refs: Vec<ActiveBackendRef>) -> Arc<ActiveHttpRoute> {
         Arc::new(ActiveHttpRoute {
             revision: 0,
+            extensions: vec![],
             key: gateway_state::RouteKey {
                 listener: gateway_state::ListenerKey {
                     bind: BindKey("b".into()),

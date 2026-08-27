@@ -230,6 +230,7 @@ mod tests {
                 response: mode,
                 ..Default::default()
             },
+            failure_mode: gateway_config::extension::FailureMode::Closed,
             ext: Box::new(Probe {
                 label,
                 seen: Arc::clone(&seen),

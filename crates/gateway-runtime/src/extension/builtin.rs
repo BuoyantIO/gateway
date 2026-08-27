@@ -104,10 +104,10 @@ pub fn register_builtins(registry: &mut Registry) {
         .expect("reserved class name");
 }
 
-/// The class name and config for one filter — the funnel every
-/// filter construction goes through. Inline filters serialize their
-/// typed config into the opaque value; a ref names its class with no
-/// config.
+/// The class name and config for one inline filter — the funnel
+/// their construction goes through: the typed config serializes into
+/// the opaque value its reserved class deserializes. Refs do not
+/// pass here; they resolve through the route's `Extension` objects.
 ///
 /// # Errors
 /// A config the value format cannot represent.
@@ -120,7 +120,9 @@ pub fn class_and_config(cfg: &ConfigFilter) -> Result<(&str, ConfigValue), Filte
             response_headers, ..
         } => (RESPONSE_HEADER_MODIFIER, to_value(response_headers)),
         ConfigFilter::RequestRedirect { redirect, .. } => (REQUEST_REDIRECT, to_value(redirect)),
-        ConfigFilter::ExtensionRef { name } => return Ok((name.as_str(), ConfigValue::Null)),
+        ConfigFilter::ExtensionRef { .. } => {
+            unreachable!("refs resolve through Extension objects, not the inline funnel")
+        }
     };
     let config = config.map_err(|e| FilterError::ConfigSerialize {
         class: class.to_owned(),
@@ -560,14 +562,6 @@ mod tests {
             .configure(&config)
             .expect("valid ops");
         let _ = builder.build();
-
-        // A ref names its class with no config.
-        let reference = ConfigFilter::ExtensionRef {
-            name: "custom".to_owned(),
-        };
-        let (class, config) = class_and_config(&reference).expect("no serialization");
-        assert_eq!(class, "custom");
-        assert!(config.is_null());
 
         // Invalid ops fail at configure, not per request.
         let bad = ConfigFilter::RequestHeaderModifier {

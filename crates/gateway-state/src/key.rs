@@ -59,6 +59,21 @@ impl fmt::Display for RouteKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExtensionKey(pub String);
+
+impl ExtensionKey {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl fmt::Display for ExtensionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BackendKey(pub String);
 
 impl BackendKey {

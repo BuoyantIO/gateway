@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use gateway_config::backend::{BackendProtocol, Endpoint};
 use gateway_config::bind::BindProtocol;
+use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
 use gateway_config::route::HttpMatch;
 use gateway_config::secret::TlsSecret;
 
-use crate::key::{BackendKey, BindKey, ListenerKey, RouteKey};
+use crate::key::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey};
 
 #[derive(Debug, Clone)]
 pub struct ActiveBind {
@@ -61,6 +62,17 @@ pub struct ActiveHttpRoute {
     pub matches: Vec<HttpMatch>,
     pub filters: Vec<HttpFilter>,
     pub backends: Vec<ActiveBackendRef>,
+    /// One entry per `ExtensionRef` filter, in filter order.
+    pub extensions: Vec<ActiveExtensionRef>,
+}
+
+/// One `ExtensionRef` of a route: the name from the filter, plus the
+/// object it resolved to. `None` while the named `Extension` is not
+/// registered — requests through this route answer 500.
+#[derive(Debug, Clone)]
+pub struct ActiveExtensionRef {
+    pub key: ExtensionKey,
+    pub object: Option<Arc<Extension>>,
 }
 
 #[derive(Debug, Clone)]

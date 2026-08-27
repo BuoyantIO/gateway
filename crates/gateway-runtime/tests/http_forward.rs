@@ -13,7 +13,7 @@ use bytes::Bytes;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
-use gateway_config::extension::ConfigValue;
+use gateway_config::extension::{ConfigValue, FailureMode, Limits};
 use gateway_config::filter::{
     HeaderOps, HeaderPair, HttpFilter, RedirectConfig, RedirectStatus, Scheme,
 };
@@ -1274,6 +1274,18 @@ impl Extension for Stamp {
     }
 }
 
+/// An `Extension` object instantiating `class` under the same name,
+/// with defaults everywhere else.
+fn extension_object(class: &str) -> gateway_config::extension::Extension {
+    gateway_config::extension::Extension {
+        name: class.into(),
+        class: class.into(),
+        failure_mode: FailureMode::default(),
+        limits: Limits::default(),
+        config: ConfigValue::Null,
+    }
+}
+
 fn extension_ref_config(bind_port: u16, upstream_port: u16, class: &str) -> GatewayConfig {
     let filter = HttpFilter::ExtensionRef { name: class.into() };
     GatewayConfig {
@@ -1291,7 +1303,7 @@ fn extension_ref_config(bind_port: u16, upstream_port: u16, class: &str) -> Gate
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![extension_object(class)],
     }
 }
 
@@ -1396,6 +1408,61 @@ async fn members_configure_once_per_route_revision() {
         2,
         "a rebuilt route configures its instances again"
     );
+
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
+/// The Extension object lifecycle, end to end: referenced before it
+/// exists (500), upserted (recovers with no route re-apply), removed
+/// (500 again).
+#[tokio::test]
+async fn extension_object_lifecycle_drives_the_route() {
+    let upstream_port = spawn_http_echo().await;
+    let bind_port = free_port().await;
+    let mut cfg = extension_ref_config(bind_port, upstream_port, "stamp");
+    cfg.extensions.clear(); // referenced, not yet registered
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let mut registry = Registry::new();
+    registry
+        .register_builder("stamp", Arc::new(StampBuilder))
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store.clone()).with_classes(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let url: hyper::Uri = format!("http://127.0.0.1:{bind_port}/").parse().unwrap();
+
+    let resp = client.get(url.clone()).await.expect("request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "missing Extension object must not serve"
+    );
+
+    // The upsert alone recovers the route — no route re-apply.
+    store.upsert_extension(extension_object("stamp"));
+    let resp = client.get(url.clone()).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-stamped")
+            .and_then(|v| v.to_str().ok()),
+        Some("by-extension"),
+    );
+
+    // Removal returns the route to 500.
+    store.remove_extension(&gateway_state::ExtensionKey::new("stamp"));
+    let resp = client.get(url).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     drop(stop);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)
@@ -2215,7 +2282,7 @@ fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
         }],
         backends: vec![static_backend("be-a", be_a), static_backend("be-b", be_b)],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![extension_object("picker")],
     }
 }
 
@@ -2440,7 +2507,10 @@ async fn two_selectors_on_one_rule_fail_the_request() {
         }],
         backends: vec![static_backend("be-a", be)],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![
+            extension_object("picker-one"),
+            extension_object("picker-two"),
+        ],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);

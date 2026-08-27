@@ -9,6 +9,9 @@ use std::sync::Arc;
 use gateway_state::{ActiveHttpRoute, RouteKey};
 use parking_lot::RwLock;
 
+use gateway_config::extension::FailureMode;
+use gateway_config::filter::HttpFilter;
+
 use crate::extension::builtin::class_and_config;
 use crate::extension::{Declarations, ExtensionBuilder, Registry};
 
@@ -16,7 +19,18 @@ use crate::extension::{Declarations, ExtensionBuilder, Registry};
 /// declarations.
 pub(crate) struct ResolvedExtension {
     pub decl: Declarations,
+    pub failure_mode: FailureMode,
     pub builder: Arc<dyn ExtensionBuilder>,
+}
+
+// Hand-written: the builder is not `Debug`.
+impl std::fmt::Debug for ResolvedExtension {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedExtension")
+            .field("decl", &self.decl)
+            .field("failure_mode", &self.failure_mode)
+            .finish_non_exhaustive()
+    }
 }
 
 type Resolved = Arc<Vec<ResolvedExtension>>;
@@ -69,26 +83,195 @@ impl ExtensionCache {
     }
 }
 
-/// Configure every filter of `route`, in order.
+/// Configure every filter of `route`, in order. An `ExtensionRef`
+/// resolves through the route's `Extension` objects (the ride-along
+/// the store attaches); inline filters go through their reserved
+/// classes.
 fn resolve(registry: &Registry, route: &ActiveHttpRoute) -> ResolveResult {
-    let mut instances = Vec::with_capacity(route.filters.len());
+    let mut extensions = Vec::with_capacity(route.filters.len());
     for (i, filter) in route.filters.iter().enumerate() {
-        let (class, config) =
-            class_and_config(filter).map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
-        let class_impl = registry.get(class).ok_or_else(|| {
-            Arc::<str>::from(format!(
-                "filter {i}: no extension class registered under `{class}`"
-            ))
-        })?;
-        let builder = class_impl.configure(&config).map_err(|e| {
-            Arc::<str>::from(format!(
-                "filter {i}: class `{class}` rejected the config: {e}"
-            ))
-        })?;
-        instances.push(ResolvedExtension {
-            decl: builder.declares(),
-            builder,
-        });
+        let resolved = if let HttpFilter::ExtensionRef { name } = filter {
+            let object = route
+                .extensions
+                .iter()
+                .find(|e| e.key.0 == *name)
+                .and_then(|e| e.object.as_ref())
+                .ok_or_else(|| {
+                    Arc::<str>::from(format!("filter {i}: extension `{name}` is not registered"))
+                })?;
+            let configured = registry
+                .configure(object)
+                .map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
+            ResolvedExtension {
+                decl: configured.decl,
+                failure_mode: configured.failure_mode,
+                builder: configured.builder,
+            }
+        } else {
+            let (class, config) = class_and_config(filter)
+                .map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
+            let class_impl = registry.get(class).ok_or_else(|| {
+                Arc::<str>::from(format!(
+                    "filter {i}: no extension class registered under `{class}`"
+                ))
+            })?;
+            let builder = class_impl.configure(&config).map_err(|e| {
+                Arc::<str>::from(format!(
+                    "filter {i}: class `{class}` rejected the config: {e}"
+                ))
+            })?;
+            ResolvedExtension {
+                decl: builder.declares(),
+                failure_mode: FailureMode::Closed,
+                builder,
+            }
+        };
+        extensions.push(resolved);
     }
-    Ok(Arc::new(instances))
+
+    // At most one selector per rule: checked here so the failure is
+    // cached with the resolution; the request path keeps a defensive
+    // check.
+    let selectors: Vec<&str> = route
+        .filters
+        .iter()
+        .zip(&extensions)
+        .filter(|(_, e)| e.decl.selects_targets)
+        .map(|(f, _)| f.name())
+        .collect();
+    if selectors.len() > 1 {
+        return Err(Arc::from(format!(
+            "route declares more than one selecting extension: {selectors:?}"
+        )));
+    }
+
+    Ok(Arc::new(extensions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use gateway_config::extension::{ConfigValue, Extension as ExtensionObject, Limits};
+    use gateway_config::filter::HttpFilter;
+    use gateway_state::{ActiveExtensionRef, BindKey, ExtensionKey, ListenerKey};
+
+    use crate::extension::{
+        BodyMode, Declarations, Error, Extension as ExtensionInstance, ExtensionClass,
+    };
+
+    struct FixedClass {
+        declares: Declarations,
+    }
+
+    impl ExtensionClass for FixedClass {
+        fn configure(&self, _config: &ConfigValue) -> Result<Arc<dyn ExtensionBuilder>, Error> {
+            Ok(Arc::new(FixedBuilder {
+                declares: self.declares,
+            }))
+        }
+    }
+
+    struct FixedBuilder {
+        declares: Declarations,
+    }
+
+    impl ExtensionBuilder for FixedBuilder {
+        fn declares(&self) -> Declarations {
+            self.declares
+        }
+
+        fn build(&self) -> Box<dyn ExtensionInstance> {
+            unreachable!("resolution never builds instances")
+        }
+    }
+
+    fn selector_registry() -> Registry {
+        let mut registry = Registry::new();
+        registry
+            .register(
+                "selector",
+                Arc::new(FixedClass {
+                    declares: Declarations {
+                        request_body: BodyMode::Stream,
+                        selects_targets: true,
+                        ..Default::default()
+                    },
+                }),
+            )
+            .unwrap();
+        registry
+    }
+
+    fn object(name: &str, limits: Limits) -> Arc<ExtensionObject> {
+        Arc::new(ExtensionObject {
+            name: name.into(),
+            class: "selector".into(),
+            failure_mode: FailureMode::default(),
+            limits,
+            config: ConfigValue::Null,
+        })
+    }
+
+    fn route_with_refs(refs: &[(&str, Option<Arc<ExtensionObject>>)]) -> ActiveHttpRoute {
+        ActiveHttpRoute {
+            key: gateway_state::RouteKey::new(ListenerKey::new(BindKey::new("b"), "l"), "r"),
+            revision: 1,
+            matches: vec![],
+            filters: refs
+                .iter()
+                .map(|(name, _)| HttpFilter::ExtensionRef {
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+            backends: vec![],
+            extensions: refs
+                .iter()
+                .map(|(name, object)| ActiveExtensionRef {
+                    key: ExtensionKey::new(*name),
+                    object: object.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_missing_object_fails_resolution() {
+        let cache = ExtensionCache::default();
+        let route = route_with_refs(&[("ghost", None)]);
+        let err = cache.for_route(&selector_registry(), &route).unwrap_err();
+        assert!(err.contains("extension `ghost` is not registered"), "{err}");
+    }
+
+    #[test]
+    fn two_selectors_fail_resolution_naming_both() {
+        let cache = ExtensionCache::default();
+        let route = route_with_refs(&[
+            ("one", Some(object("one", Limits::default()))),
+            ("two", Some(object("two", Limits::default()))),
+        ]);
+        let err = cache.for_route(&selector_registry(), &route).unwrap_err();
+        assert!(err.contains("one") && err.contains("two"), "{err}");
+    }
+
+    #[test]
+    fn an_object_over_its_ceiling_fails_resolution() {
+        let cache = ExtensionCache::default();
+        let limits = Limits {
+            request_body: Some(gateway_config::extension::RequestBodyLimit::None),
+            max_buffer_bytes: None,
+        };
+        let route = route_with_refs(&[("clamped", Some(object("clamped", limits)))]);
+        let err = cache.for_route(&selector_registry(), &route).unwrap_err();
+        assert!(err.contains("ceiling"), "{err}");
+    }
+
+    #[test]
+    fn a_resolved_object_carries_its_declarations() {
+        let cache = ExtensionCache::default();
+        let route = route_with_refs(&[("ok", Some(object("ok", Limits::default())))]);
+        let resolved = cache.for_route(&selector_registry(), &route).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].decl.selects_targets);
+    }
 }
