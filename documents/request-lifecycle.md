@@ -133,7 +133,13 @@ Each instance returns an `Action`:
   response verbatim; no upstream is contacted. Reason `ok`: an
   extension answering directly (a redirect, a shed) is the route
   working as configured, not an error.
-- An error stops the pass and fails the request with 500 (`internal`).
+- An error acts per the extension's `failureMode`: `Closed` stops
+  the pass and fails the request with 500 (`internal`); `Open` logs
+  and continues to the next instance. The same rule applies in the
+  body pass, per chunk — an `Open` instance that errors stays in the
+  list for later chunks. Selection is exempt: a selector that cannot
+  decide has no continue path, so `select` errors always fail the
+  request.
 
 Both early exits still deliver `on_response_end` to instances that
 declared it.

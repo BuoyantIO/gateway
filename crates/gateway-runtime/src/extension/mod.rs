@@ -112,7 +112,9 @@ pub trait Extension: Send {
     /// # Errors
     /// An error fails the request. There is no fallback to the
     /// default load balancer: a selector that cannot decide is a
-    /// failed request, not a differently routed one.
+    /// failed request, not a differently routed one. Selection is
+    /// always fail-closed — `failureMode: Open` has no continue path
+    /// here and does not apply.
     async fn select(&mut self, _held: Held<'_>, _cx: &mut Cx) -> Result<Selected, Error> {
         Err("extension declared selects_targets but does not implement select".into())
     }

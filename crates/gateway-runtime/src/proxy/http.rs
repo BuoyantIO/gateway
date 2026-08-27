@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use gateway_config::backend::{BackendProtocol, Endpoint};
+use gateway_config::extension::FailureMode;
 use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
@@ -718,6 +719,11 @@ async fn run_request_hooks(
         match instance.ext.on_request_start(parts, cx).await {
             Ok(Action::Continue) => {}
             Ok(Action::Respond(resp)) => return RequestPhase::Respond(resp),
+            // Open swallows the error and moves on; Closed fails the
+            // request.
+            Err(e) if instance.failure_mode == FailureMode::Open => {
+                tracing::warn!(error = %e, "request hook failed; failureMode Open continues");
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to apply request filter");
                 return RequestPhase::Failed;
