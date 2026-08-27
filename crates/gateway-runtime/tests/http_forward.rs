@@ -1553,7 +1553,7 @@ async fn failure_mode_decides_what_a_hook_error_does() {
 async fn an_open_selector_that_fails_still_fails_the_request() {
     let (be, _hits) = spawn_port_echo().await;
     let bind_port = free_port().await;
-    let mut cfg = selection_config(bind_port, be, be);
+    let mut cfg = selection_config(bind_port, be, static_backend("be-b", be));
     cfg.extensions[0].failure_mode = FailureMode::Open;
     let store = Store::new();
     let _ = store.apply(&cfg);
