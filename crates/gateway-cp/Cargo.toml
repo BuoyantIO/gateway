@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+gateway-config = { path = "../gateway-config" }
 gateway-cp-proto = { path = "../gateway-cp-proto" }
 gateway-drain = { path = "../gateway-drain" }
 gateway-state = { path = "../gateway-state" }

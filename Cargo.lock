@@ -693,6 +693,7 @@ dependencies = [
  "clap",
  "futures",
  "gateway-api",
+ "gateway-config",
  "gateway-cp-proto",
  "gateway-drain",
  "gateway-state",
@@ -780,6 +781,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-extension"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "gateway-config",
+ "gateway-state",
+ "http",
+ "http-body-util",
+ "thiserror",
+]
+
+[[package]]
+name = "gateway-extension-impls"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "gateway-config",
+ "gateway-extension",
+ "http",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "gateway-runtime"
 version = "0.0.0"
 dependencies = [
@@ -789,6 +815,8 @@ dependencies = [
  "futures",
  "gateway-config",
  "gateway-drain",
+ "gateway-extension",
+ "gateway-extension-impls",
  "gateway-state",
  "h2",
  "http",
@@ -828,6 +856,7 @@ dependencies = [
  "clap",
  "gateway-config",
  "gateway-cp-client",
+ "gateway-extension-impls",
  "gateway-runtime",
  "gateway-state",
  "http-body-util",

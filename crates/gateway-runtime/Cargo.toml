@@ -14,6 +14,7 @@ bytes = "1"
 form_urlencoded = "1"
 gateway-config = { path = "../gateway-config" }
 gateway-drain = { path = "../gateway-drain" }
+gateway-extension = { path = "../gateway-extension" }
 gateway-state = { path = "../gateway-state" }
 http = "1"
 http-body = "1"
@@ -33,6 +34,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 futures = "0.3"
+gateway-extension-impls = { path = "../gateway-extension-impls" }
 h2 = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }

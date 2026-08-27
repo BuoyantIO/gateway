@@ -4,6 +4,8 @@ members = [
   "crates/gateway-config",
   "crates/gateway-state",
   "crates/gateway-drain",
+  "crates/gateway-extension",
+  "crates/gateway-extension-impls",
   "crates/gateway-runtime",
   "crates/gatewayd",
   "crates/gateway-cp-proto",
