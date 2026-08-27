@@ -52,8 +52,7 @@ impl Registry {
     }
 
     /// Registers a pre-built builder under `name`, as a class that
-    /// ignores config. The bridge for code-registered extensions
-    /// while `ExtensionRef` names classes directly.
+    /// ignores config — a test bridge.
     ///
     /// # Errors
     /// [`RegistryError::Duplicate`] when the name is taken.
@@ -112,7 +111,8 @@ pub enum RegistryError {
 }
 
 /// A class that ignores config and hands out one pre-built builder,
-/// shared by every caller.
+/// shared by every caller. A test bridge: production extensions are
+/// configured `Extension` objects.
 pub struct PreConfigured(pub Arc<dyn ExtensionBuilder>);
 
 impl ExtensionClass for PreConfigured {

@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
+use gateway_config::extension::FailureMode;
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
 
@@ -212,14 +213,20 @@ pub struct LocalResponse {
 /// build time — the builder is not consulted again.
 pub struct Instance {
     pub decl: Declarations,
+    /// The `Extension` object's failure mode; `Closed` for inline
+    /// filters.
+    pub failure_mode: FailureMode,
     pub ext: Box<dyn Extension>,
 }
 
 impl Instance {
     /// Build one instance and record what its builder declared.
+    /// Fail-closed; instances built from an `Extension` object carry
+    /// the object's mode instead.
     pub fn from_builder(builder: &dyn ExtensionBuilder) -> Self {
         Self {
             decl: builder.declares(),
+            failure_mode: FailureMode::Closed,
             ext: builder.build(),
         }
     }

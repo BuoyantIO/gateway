@@ -87,11 +87,15 @@ drawn winner. Selector rules validate against the whole list.
 ## Extension instances
 
 Every filter resolves through an extension class. An inline core
-filter serializes its typed config and names its reserved class; an
-`ExtensionRef` names a registered class with no config
-(`class_and_config` is the one funnel). The class configures a
+filter serializes its typed config and names its reserved class
+(`class_and_config` is their funnel). An `ExtensionRef` resolves
+through the route's `Extension` objects: the store rides each
+referenced object along on the route (`ActiveExtensionRef`, like a
+backend ref — resolved or not), and the object names the class and
+carries its config, failure mode, and limits. The class configures a
 builder once per route revision — the store stamps
-`ActiveHttpRoute.revision` on every rebuild — and the runtime caches
+`ActiveHttpRoute.revision` on every rebuild, and an `Extension`
+upsert rebuilds every route referencing it — and the runtime caches
 the result (`ExtensionCache`). Config parsing and validation happen
 there, never per request.
 
@@ -101,10 +105,12 @@ Per request, each cached builder constructs one extension instance
 declarations drive everything downstream — the body tier, response
 wrapping, `on_response_end` delivery.
 
-Resolution can fail: a filter naming a class the registry does not
-hold, or config the class rejects. The failure is cached for the
-route's revision and logged once; requests matching the route answer
-500 (reason `internal`) until the config changes. Two instances on
+Resolution can fail: a ref naming an `Extension` object that is not
+registered, a filter naming a class the registry does not hold,
+config the class rejects, or a declaration over the object's limits.
+The failure is cached for the route's revision and logged once;
+requests matching the route answer 500 (reason `internal`) until the
+config changes. Two instances on
 one route declaring `selects_targets` is checked per request as a
 defensive backstop (500, log names the filters) — proper enforcement
 is at config apply, before a route can receive traffic. A route never

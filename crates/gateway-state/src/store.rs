@@ -8,17 +8,21 @@ use tokio::sync::broadcast;
 use gateway_config::GatewayConfig;
 use gateway_config::backend::{Backend, BackendRef};
 use gateway_config::bind::{Bind, BindProtocol};
+use gateway_config::extension::Extension;
+use gateway_config::filter::HttpFilter;
 use gateway_config::listener::{Listener, TlsMode};
 use gateway_config::route::HttpRoute;
 use gateway_config::secret::TlsSecret;
 
 use crate::active::{
     ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveBind, ActiveDialable,
-    ActiveEndpointSet, ActiveHttpRoute, ActiveListener, ActiveTls,
+    ActiveEndpointSet, ActiveExtensionRef, ActiveHttpRoute, ActiveListener, ActiveTls,
 };
 use crate::error::{ApplyReport, StoreError};
 use crate::event::BindEvent;
-use crate::key::{BackendKey, BindKey, ListenerKey, RegisteredKeys, RouteKey, SecretKey};
+use crate::key::{
+    BackendKey, BindKey, ExtensionKey, ListenerKey, RegisteredKeys, RouteKey, SecretKey,
+};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -69,6 +73,10 @@ struct Inner {
     /// Registered TLS secrets. Like backends, these have no
     /// preconditions — always active when registered.
     secrets: HashMap<SecretKey, Arc<TlsSecret>>,
+    /// Registered `Extension` objects — raw config; like backends,
+    /// always active when registered. Configuring them is the
+    /// runtime's business.
+    extensions: HashMap<ExtensionKey, Arc<Extension>>,
 
     /// Listeners whose preconditions are NOT currently met.
     pending_listeners: HashMap<ListenerKey, PendingListener>,
@@ -93,8 +101,18 @@ struct Inner {
     routes_by_parent: HashMap<ListenerKey, HashSet<RouteKey>>,
     /// Index: routes naming a given backend in their `backend_refs`.
     routes_by_backend: HashMap<BackendKey, HashSet<RouteKey>>,
+    /// Index: routes naming a given extension in an `ExtensionRef`.
+    routes_by_extension: HashMap<ExtensionKey, HashSet<RouteKey>>,
     /// Index: listeners naming a given secret in their `cert_refs`.
     listeners_by_secret: HashMap<SecretKey, HashSet<ListenerKey>>,
+}
+
+/// The `ExtensionRef` names among `filters`, in filter order.
+fn extension_ref_names(filters: &[HttpFilter]) -> impl Iterator<Item = &str> {
+    filters.iter().filter_map(|f| match f {
+        HttpFilter::ExtensionRef { name } => Some(name.as_str()),
+        _ => None,
+    })
 }
 
 /// A listener as held by the store, before resolution. Routes are
@@ -204,6 +222,16 @@ impl Store {
         self.dispatch(events);
     }
 
+    pub fn upsert_extension(&self, ext: Extension) {
+        let events = self.inner.write().upsert_extension(ext);
+        self.dispatch(events);
+    }
+
+    pub fn remove_extension(&self, key: &ExtensionKey) {
+        let events = self.inner.write().remove_extension(key);
+        self.dispatch(events);
+    }
+
     pub fn upsert_secret(&self, secret: TlsSecret) {
         let events = self.inner.write().upsert_secret(secret);
         self.dispatch(events);
@@ -281,6 +309,10 @@ impl StoreRead<'_> {
 
     pub fn backend(&self, key: &BackendKey) -> Option<Arc<ActiveBackend>> {
         self.guard.backends.get(key).cloned()
+    }
+
+    pub fn extension(&self, key: &ExtensionKey) -> Option<Arc<Extension>> {
+        self.guard.extensions.get(key).cloned()
     }
 
     pub fn secret(&self, key: &SecretKey) -> Option<Arc<TlsSecret>> {
@@ -537,6 +569,7 @@ impl Inner {
         let rkey = RouteKey::new(parent.clone(), route.name.clone());
 
         self.clear_route_backend_index(&rkey);
+        self.clear_route_extension_index(&rkey);
         let _ = self.pending_routes.remove(&rkey);
         let _ = self.active_routes.remove(&rkey);
 
@@ -551,6 +584,12 @@ impl Inner {
                 .or_default()
                 .insert(rkey.clone());
         }
+        for name in extension_ref_names(&route.filters) {
+            self.routes_by_extension
+                .entry(ExtensionKey::new(name))
+                .or_default()
+                .insert(rkey.clone());
+        }
         self.place_route(route, &rkey);
     }
 
@@ -561,17 +600,8 @@ impl Inner {
         if let Some(set) = self.routes_by_parent.get_mut(&key.listener) {
             set.remove(key);
         }
-        let backend_keys: Vec<BackendKey> = self
-            .routes_by_backend
-            .iter()
-            .filter(|(_, set)| set.contains(key))
-            .map(|(bk, _)| bk.clone())
-            .collect();
-        for bk in backend_keys {
-            if let Some(set) = self.routes_by_backend.get_mut(&bk) {
-                set.remove(key);
-            }
-        }
+        self.clear_route_backend_index(key);
+        self.clear_route_extension_index(key);
         self.patch_listener_route(&key.listener, key);
         if self.bind_meta.contains_key(&key.listener.bind) {
             self.rebuild_bind(&key.listener.bind);
@@ -606,6 +636,22 @@ impl Inner {
             return Vec::new();
         }
         self.cascade_routes_by_backend(key)
+    }
+
+    fn upsert_extension(&mut self, ext: Extension) -> Vec<BindEvent> {
+        let key = ExtensionKey::new(ext.name.clone());
+        self.extensions.insert(key.clone(), Arc::new(ext));
+        self.cascade_routes_by_extension(&key)
+    }
+
+    /// Removal leaves `routes_by_extension` populated, like the
+    /// backend index: routes re-resolve to an unresolved ref and
+    /// recover if the extension returns.
+    fn remove_extension(&mut self, key: &ExtensionKey) -> Vec<BindEvent> {
+        if self.extensions.remove(key).is_none() {
+            return Vec::new();
+        }
+        self.cascade_routes_by_extension(key)
     }
 
     // A `TlsSecret` is valid by construction (parsed on the way in),
@@ -653,9 +699,27 @@ impl Inner {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        self.cascade_routes(&rkeys)
+    }
+
+    fn cascade_routes_by_extension(&mut self, key: &ExtensionKey) -> Vec<BindEvent> {
+        let rkeys: Vec<RouteKey> = self
+            .routes_by_extension
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        self.cascade_routes(&rkeys)
+    }
+
+    /// Re-resolve `rkeys` and everything above them: their listeners,
+    /// then the binds those hang off. Every rebuilt route gets a
+    /// fresh revision.
+    fn cascade_routes(&mut self, rkeys: &[RouteKey]) -> Vec<BindEvent> {
         let affected_listeners: HashSet<ListenerKey> =
             rkeys.iter().map(|rk| rk.listener.clone()).collect();
-        for rkey in &rkeys {
+        for rkey in rkeys {
             self.re_resolve_route(rkey);
         }
         let mut affected_binds: HashSet<BindKey> = HashSet::new();
@@ -700,6 +764,11 @@ impl Inner {
             report.applied += 1;
             events.append(&mut e);
         }
+        for ext in &cfg.extensions {
+            let mut e = self.upsert_extension(ext.clone());
+            report.applied += 1;
+            events.append(&mut e);
+        }
 
         let new_keys: HashSet<BindKey> = self.bind_meta.keys().cloned().collect();
         for k in prev_keys.difference(&new_keys) {
@@ -713,6 +782,7 @@ impl Inner {
         self.bind_meta.clear();
         self.backends.clear();
         self.secrets.clear();
+        self.extensions.clear();
         self.pending_listeners.clear();
         self.pending_routes.clear();
         self.binds.clear();
@@ -721,6 +791,7 @@ impl Inner {
         self.listeners_by_parent.clear();
         self.routes_by_parent.clear();
         self.routes_by_backend.clear();
+        self.routes_by_extension.clear();
         self.listeners_by_secret.clear();
     }
 
@@ -740,6 +811,20 @@ impl Inner {
             .collect();
         for bk in backend_keys {
             if let Some(set) = self.routes_by_backend.get_mut(&bk) {
+                set.remove(key);
+            }
+        }
+    }
+
+    fn clear_route_extension_index(&mut self, key: &RouteKey) {
+        let ext_keys: Vec<ExtensionKey> = self
+            .routes_by_extension
+            .iter()
+            .filter(|(_, set)| set.contains(key))
+            .map(|(ek, _)| ek.clone())
+            .collect();
+        for ek in ext_keys {
+            if let Some(set) = self.routes_by_extension.get_mut(&ek) {
                 set.remove(key);
             }
         }
@@ -842,6 +927,13 @@ impl Inner {
                 }
             })
             .collect();
+        let extensions = extension_ref_names(&route.filters)
+            .map(|name| {
+                let ekey = ExtensionKey::new(name);
+                let object = self.extensions.get(&ekey).map(Arc::clone);
+                ActiveExtensionRef { key: ekey, object }
+            })
+            .collect();
         self.route_revision += 1;
         let active = Arc::new(ActiveHttpRoute {
             key: key.clone(),
@@ -849,6 +941,7 @@ impl Inner {
             matches: route.matches,
             filters: route.filters,
             backends: resolved,
+            extensions,
         });
         self.active_routes.insert(key.clone(), active);
     }
@@ -1089,6 +1182,7 @@ mod tests {
         Backend, BackendProtocol, BackendRef, DialableBackend, Endpoint, StaticBackend,
     };
     use gateway_config::bind::{Bind, BindProtocol};
+    use gateway_config::extension::{FailureMode, Limits};
     use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
     use gateway_config::listener::{
         CertRef, HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
@@ -2206,6 +2300,104 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
     // v0 terminates only — a passthrough HTTPS listener is rejected,
     // not accepted and then mis-gated on secrets.
+    fn extension_object(name: &str) -> Extension {
+        Extension {
+            name: name.into(),
+            class: "some_class".into(),
+            failure_mode: FailureMode::default(),
+            limits: Limits::default(),
+            config: gateway_config::extension::ConfigValue::Null,
+        }
+    }
+
+    fn http_route_with_ref(name: &str, ext: &str) -> HttpRoute {
+        let mut r = http_route(name, "/", &["be"]);
+        r.filters
+            .push(HttpFilter::ExtensionRef { name: ext.into() });
+        r
+    }
+
+    #[test]
+    fn extension_rides_along_on_referencing_routes() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route_with_ref("r", "picker"));
+
+        let route_ref = |store: &Store| {
+            store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0]
+                .extensions
+                .first()
+                .cloned()
+                .expect("one ExtensionRef filter")
+        };
+
+        // Referenced before it arrives: present, unresolved.
+        let unresolved = route_ref(&store);
+        assert_eq!(unresolved.key.0, "picker");
+        assert!(unresolved.object.is_none());
+        let revision_before =
+            store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
+
+        // The upsert resolves it and rebuilds the route.
+        store.upsert_extension(extension_object("picker"));
+        let resolved = route_ref(&store);
+        assert!(resolved.object.is_some());
+        let revision_after = store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
+        assert!(revision_after > revision_before);
+        assert!(
+            store
+                .read()
+                .extension(&ExtensionKey::new("picker"))
+                .is_some()
+        );
+
+        // Removal un-resolves it and rebuilds again.
+        store.remove_extension(&ExtensionKey::new("picker"));
+        let removed = route_ref(&store);
+        assert!(removed.object.is_none());
+        let revision_final = store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
+        assert!(revision_final > revision_after);
+    }
+
+    // Removing a route must not leave it behind in the extension
+    // index (white-box: the index is internal).
+    #[test]
+    fn removing_route_cleans_extension_index() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route_with_ref("r", "picker"));
+        let ekey = ExtensionKey::new("picker");
+        assert!(store.inner.read().routes_by_extension[&ekey].contains(&rkey("b", "l", "r")));
+        store.remove_http_route(&rkey("b", "l", "r"));
+        assert!(!store.inner.read().routes_by_extension[&ekey].contains(&rkey("b", "l", "r")));
+    }
+
+    #[test]
+    fn apply_reads_the_extensions_block() {
+        let store = Store::new();
+        let cfg = GatewayConfig {
+            name: "t".into(),
+            binds: vec![],
+            backends: vec![],
+            secrets: vec![],
+            extensions: vec![extension_object("picker")],
+        };
+        let report = store.apply(&cfg);
+        assert_eq!(report.applied, 1);
+        assert!(
+            store
+                .read()
+                .extension(&ExtensionKey::new("picker"))
+                .is_some()
+        );
+    }
+
     #[test]
     fn route_revision_changes_on_every_rebuild() {
         let store = Store::new();

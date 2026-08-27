@@ -363,6 +363,7 @@ mod tests {
                 request_body: mode,
                 ..Default::default()
             },
+            failure_mode: gateway_config::extension::FailureMode::Closed,
             ext: Box::new(Handle(std::sync::Arc::clone(&rec))),
         };
         (instance, rec)
