@@ -1,14 +1,14 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use gateway_config::backend::{BackendProtocol, Endpoint};
+use gateway_config::backend::{AlpnProtocol, BackendProtocol, Endpoint};
 use gateway_config::bind::BindProtocol;
 use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
 use gateway_config::route::HttpMatch;
 use gateway_config::secret::TlsSecret;
 
-use crate::key::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey};
+use crate::key::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 
 #[derive(Debug, Clone)]
 pub struct ActiveBind {
@@ -135,11 +135,74 @@ pub struct ActiveEndpointSet {
     pub protocol: BackendProtocol,
 }
 
-/// A host the gateway resolves and dials itself. TLS origination and
-/// credentials attach here once they exist.
+/// A host the gateway resolves and dials itself. Credentials attach
+/// here once they exist.
 #[derive(Debug, Clone)]
 pub struct ActiveDialable {
     pub host: String,
     pub port: u16,
     pub path_prefix: Option<String>,
+    /// `Some` originates TLS to this host; `None` dials it in the
+    /// clear.
+    pub tls: Option<Arc<ActiveBackendTls>>,
+}
+
+/// A dialable backend's TLS settings, with its trust roots resolved
+/// against the registered secrets.
+///
+/// Shared behind an `Arc` because the request path builds one client
+/// per backend from it and holds on to it: two requests reading the
+/// same `Arc` know they may reuse the same client and its connection
+/// pool.
+#[derive(Debug, Clone)]
+pub struct ActiveBackendTls {
+    pub roots: ActiveTrustRoots,
+    pub sni: Option<String>,
+    pub alpn: Vec<AlpnProtocol>,
+    pub insecure_skip_verify: bool,
+}
+
+impl ActiveBackendTls {
+    /// Would these two compile to the same client TLS config? Trust
+    /// roots compare by secret identity: the store hands out one
+    /// `Arc` per registered secret and replaces it when the secret
+    /// changes, so identity is what "same material" means here — and
+    /// it keeps a re-applied backend from pointlessly dropping its
+    /// connection pool.
+    pub fn same_config(&self, other: &Self) -> bool {
+        self.sni == other.sni
+            && self.alpn == other.alpn
+            && self.insecure_skip_verify == other.insecure_skip_verify
+            && match (&self.roots, &other.roots) {
+                (ActiveTrustRoots::System, ActiveTrustRoots::System) => true,
+                (
+                    ActiveTrustRoots::Secret { key: a, secret: sa },
+                    ActiveTrustRoots::Secret { key: b, secret: sb },
+                ) => {
+                    a == b
+                        && match (sa, sb) {
+                            (Some(sa), Some(sb)) => Arc::ptr_eq(sa, sb),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }
+                _ => false,
+            }
+    }
+}
+
+/// Where the trust roots for an upstream chain come from, resolved.
+#[derive(Debug, Clone)]
+pub enum ActiveTrustRoots {
+    /// The platform trust store.
+    System,
+    /// The CA-only secret the backend names. `secret` is `None`
+    /// while that secret is not registered: the request path fails
+    /// the dial rather than falling back to the system store, since
+    /// trusting more than the operator asked for is the one answer
+    /// that must not happen.
+    Secret {
+        key: SecretKey,
+        secret: Option<Arc<TlsSecret>>,
+    },
 }

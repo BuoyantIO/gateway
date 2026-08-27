@@ -25,7 +25,8 @@ latency estimate, eviction), which persists across requests, and the
 extension `Registry`, one `ExtensionBuilder` per plugin.
 
 The control plane does not emit a dialable backend yet; today one
-only arrives through static config.
+only arrives through static config, including the TLS block it
+originates with.
 
 Requests never observe a partially applied configuration: partial
 config, out-of-order references and resyncs are resolved at apply
@@ -311,10 +312,10 @@ source:
 Dispatch then rewrites the request for the hop: the URI targets the
 `Destination`'s authority, the wire version follows the backend's
 declared protocol (`BackendProtocol`; the client-side version does not
-constrain the upstream side), and hop-by-hop headers are stripped —
-required on H2, where a carried-over `Connection` or
-`transfer-encoding` from a downstream H1 request is illegal and would
-be rejected.
+constrain the upstream side) — except over TLS, where ALPN decides it
+— and hop-by-hop headers are stripped, required on H2, where a
+carried-over `Connection` or `transfer-encoding` from a downstream H1
+request is illegal and would be rejected.
 
 What the authority is, and what else the rewrite touches, is the one
 place the two backend kinds differ:
@@ -322,12 +323,44 @@ place the two backend kinds differ:
 | | endpoint set | dialable |
 |---|---|---|
 | authority | the chosen endpoint's `ip:port`, already resolved by the control plane | the backend's `host:port`, resolved by the client at dial time |
-| `Host` | the client's, carried through: the endpoint is one member of the service the client addressed | the backend's own, since it answers for a different origin. On H1 the header is replaced; on H2 it is dropped, because the URI's authority becomes `:authority` and a stale `Host` would contradict it. The port is left off when it is the scheme default |
+| scheme | `http` | `https` when the backend has a TLS block, `http` otherwise |
+| `Host` | the client's, carried through: the endpoint is one member of the service the client addressed | not the client's: the backend answers for a different origin. The client's header is dropped, and on H1 the client fills in the one that matches the upstream URI (default port left off); on H2 the URI's authority becomes `:authority`, which needs no `Host` beside it |
 | path | forwarded untouched | the backend's prefix joined ahead of it. Trailing slashes on the prefix are dropped and the request path supplies the separator, so `/v1` and `/v1/` both send `/chat` to `/v1/chat` and `/` to `/v1/`; a prefix of only slashes adds nothing. The query is preserved |
 | accounting | the endpoint's `EndpointInfo`, keyed by endpoint name | one logical endpoint keyed by the backend's own name |
 
 Nothing here imposes a response-header timeout: a backend that is
 slow to first byte holds the request open rather than failing it.
+
+### TLS origination
+
+A dialable backend with a TLS block is dialed by a client of its own
+(`proxy::originate`), one per backend, keyed by backend name and kept
+until that backend's settings change. The client config is compiled
+from those settings once per applied version, not per request, and the
+connections the client pools are only ever reused for that backend
+under that config.
+
+The settings are the trust roots (the platform store by default, or a
+CA-only secret whose certificates replace it), an optional SNI
+override, the ALPN list, and an insecure switch for development that
+turns verification off entirely. The name verified is the SNI override
+when there is one and the dialed host otherwise, so a backend
+addressed by an IP can still be checked against the certificate the
+provider serves.
+
+The version upstream is the server's choice: the ALPN result reaches
+hyper's pool, which then speaks h2 or http/1.1 over the same client.
+The backend's `app-protocol` field does not apply — it is what selects
+cleartext h2c for an endpoint set, where there is no handshake to
+negotiate in.
+
+A TLS block that does not compile — a CA secret the config never
+registered, an SNI that is not a server name, an unreadable platform
+trust store — answers 500, reason `backend_unresolved`. Nothing is
+dialed and nothing is counted against the destination: this is a
+configuration failure, not an upstream one, and the alternative
+(dialing with roots the operator did not ask for) is the one answer
+that must not happen.
 
 ## Upstream answer
 
@@ -342,7 +375,10 @@ does not count as load on an endpoint that has not been dialed yet.
 The dial is timed and recorded either way: success feeds the dial
 time into the destination's latency estimate, failure increments the
 counter that drives passive eviction. A failed dial answers 502,
-reason `dial_failure`. A dialable backend accumulates the same
+reason `dial_failure` — a refused connection, and equally a rejected
+certificate chain or a name the certificate does not cover, with the
+cause chain flattened onto the log line since hyper's own message says
+only that the connect failed. A dialable backend accumulates the same
 failure streak, and can be evicted by it, but the eviction is never
 consulted: dropping the only destination a backend has would fail
 every request for the eviction window, where an endpoint set in the
@@ -450,6 +486,7 @@ immediately: zero body bytes, `complete: false`, `upstream: false`.
 | ending | status | reason | `complete` | `upstream` |
 |---|---|---|---|---|
 | dial failed | 502 | `dial_failure` | true — the 502 ran to its end | false — no upstream answered |
+| the backend's TLS block does not compile | 500 | `backend_unresolved` | true — the 500 ran to its end | false — nothing was dialed |
 | response delivered | upstream's status | `ok` | true | true |
 | client disconnected mid-response | as sent | `ok` | false | true |
 | upstream body failed mid-response | as sent | `ok` | false | true |

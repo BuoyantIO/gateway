@@ -192,6 +192,7 @@ mod tests {
                 host: "api.example.com".into(),
                 port: 443,
                 path_prefix: None,
+                tls: None,
             }),
         })
     }

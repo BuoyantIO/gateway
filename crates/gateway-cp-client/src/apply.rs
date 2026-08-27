@@ -752,6 +752,25 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         );
     }
 
+    /// A secret with no `key_pem` is CA-only material: trust roots a
+    /// dialable backend verifies against, not something a listener
+    /// terminates with.
+    #[test]
+    fn secret_without_a_key_lands_as_ca_material() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(vec![secret_upsert("provider-ca", CERT_PEM, "")], vec![]),
+        )
+        .expect("apply ok");
+        let s = store
+            .read()
+            .secret(&gateway_state::SecretKey::local("provider-ca"))
+            .expect("secret present");
+        assert_eq!(s.certs.len(), 1);
+        assert!(s.key.is_none());
+    }
+
     #[test]
     fn malformed_secret_pem_rejected() {
         let store = Store::new();

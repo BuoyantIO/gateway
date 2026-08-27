@@ -3,7 +3,9 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::backend::Backend;
+use rustls_pki_types::ServerName;
+
+use crate::backend::{Backend, BackendTls, TrustRoots};
 use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::extension::{Extension, RequestBodyLimit};
@@ -43,6 +45,10 @@ pub enum RejectionReason {
     DialableBackendNoHost,
     #[error("dialable backend `port` must not be zero")]
     DialableBackendZeroPort,
+    #[error("backend TLS `ca` secret reference must have a `name`")]
+    BackendTlsCaSecretNoName,
+    #[error("backend TLS `sni` `{0}` is not a DNS name")]
+    BackendTlsSniNotDnsName(String),
     #[error("TCP listener must have exactly one route, found {0}")]
     TcpListenerRouteCount(usize),
     /// A query-param match has an empty `name`. (Header-match
@@ -363,7 +369,37 @@ fn validate_backend(key: &str, backend: &Backend, out: &mut Vec<Rejection>) {
                     reason: RejectionReason::PathNotSlash(prefix.clone()),
                 });
             }
+            if let Some(tls) = &d.tls {
+                validate_backend_tls(key, tls, out);
+            }
         }
+    }
+}
+
+/// The two ways a TLS block can be unusable on its own terms: a CA
+/// reference that names nothing, and an SNI that is not a name a
+/// handshake can carry. An IP address parses as a server name but is
+/// never sent as SNI, so it is rejected here rather than silently
+/// ignored at dial time.
+fn validate_backend_tls(key: &str, tls: &BackendTls, out: &mut Vec<Rejection>) {
+    if let TrustRoots::Secret { name, .. } = &tls.ca
+        && name.is_empty()
+    {
+        out.push(Rejection {
+            key: key.to_string(),
+            reason: RejectionReason::BackendTlsCaSecretNoName,
+        });
+    }
+    if let Some(sni) = &tls.sni
+        && !matches!(
+            ServerName::try_from(sni.as_str()),
+            Ok(ServerName::DnsName(_))
+        )
+    {
+        out.push(Rejection {
+            key: key.to_string(),
+            reason: RejectionReason::BackendTlsSniNotDnsName(sni.clone()),
+        });
     }
 }
 
@@ -849,6 +885,71 @@ gatewayConfig:
             errs.iter()
                 .any(|r| matches!(&r.reason, RejectionReason::PathNotSlash(p) if p == "v1"))
         );
+    }
+
+    #[test]
+    fn backend_tls_ca_secret_needs_a_name() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      tls:
+        ca: { type: Secret, name: '' }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::BackendTlsCaSecretNoName))
+        );
+    }
+
+    #[test]
+    fn backend_tls_sni_must_be_a_dns_name() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      tls: { sni: 10.0.0.1 }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(errs.iter().any(
+            |r| matches!(&r.reason, RejectionReason::BackendTlsSniNotDnsName(s) if s == "10.0.0.1")
+        ));
+    }
+
+    #[test]
+    fn valid_dialable_backend_tls_accepted() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      tls:
+        ca: { type: Secret, namespace: apps, name: provider-ca }
+        sni: api.example.com
+        alpn: [h2]
+",
+        );
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]

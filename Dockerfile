@@ -14,5 +14,10 @@ RUN --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
     && cp /src/target/release/gatewayd /usr/local/bin/gatewayd
 
 FROM debian:bookworm-slim
+# The platform trust store a dialable backend verifies its upstream
+# against by default.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/gatewayd /usr/local/bin/gatewayd
 ENTRYPOINT ["/usr/local/bin/gatewayd"]

@@ -109,6 +109,12 @@ fn server_config(
     // One certificate per listener for now (multiple cert refs is a
     // later change); the bind-protocol guard ensures it's a TLS listener.
     let secret = listener.tls.as_ref()?.secrets.first()?;
+    // The store only promotes a listener whose secrets carry a key,
+    // so this is belt and braces: a CA-only secret terminates nothing.
+    if secret.key.is_none() {
+        tracing::error!(bind = %bind_key, secret = %secret.name, "cert secret has no private key");
+        return None;
+    }
     match build_server_config(secret) {
         Ok(config) => Some(config),
         Err(e) => {
@@ -118,12 +124,19 @@ fn server_config(
     }
 }
 
+/// # Panics
+/// Panics if `secret` carries no private key; callers check first.
 fn build_server_config(secret: &TlsSecret) -> Result<Arc<ServerConfig>, rustls::Error> {
+    let key = secret
+        .key
+        .as_ref()
+        .expect("caller checked the secret has a key")
+        .clone_key();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
-        .with_single_cert(secret.certs.clone(), secret.key.clone_key())?;
+        .with_single_cert(secret.certs.clone(), key)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
