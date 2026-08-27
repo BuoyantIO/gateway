@@ -3,6 +3,7 @@
 //! gRPC channel.
 
 pub mod admin;
+pub mod crd;
 pub mod diff;
 pub mod infra;
 pub mod lease;

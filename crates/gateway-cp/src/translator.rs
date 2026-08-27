@@ -22,10 +22,11 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType,
 };
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
+use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 
+use crate::crd;
 use crate::resolve::{
     BackendOutcome, BackendResolution, GatewayResolution, ListenerOutcome, Resolution, RouteEdge,
     RouteResolution, resolve,
@@ -49,6 +50,7 @@ pub struct K8sState {
     pub services: Vec<Service>,
     pub endpoint_slices: Vec<EndpointSlice>,
     pub secrets: Vec<Secret>,
+    pub extensions: Vec<crate::crd::Extension>,
 }
 
 /// Build per-Gateway snapshots from a static K8s state: resolve the
@@ -83,6 +85,7 @@ pub fn translate_resolution(resolution: &Resolution<'_>) -> HashMap<GatewayId, S
                 emit_backend(snapshot, backend);
             }
         }
+        emit_route_extensions(snapshot, route);
     }
 
     slices
@@ -139,6 +142,57 @@ fn emit_gateway_listeners(snapshot: &mut Snapshot, gw: &GatewayResolution<'_>) {
                 hostname: listener.hostname.clone().unwrap_or_default(),
                 has_hostname: listener.hostname.is_some(),
                 tls,
+            },
+        );
+    }
+}
+
+/// Emit an `ExtensionUpsert` for each of the route's resolved
+/// `extensionRef`s. A missing object warns and is not emitted — the
+/// route still carries the ref, and the DP answers 500 until the
+/// object arrives.
+fn emit_route_extensions(snapshot: &mut Snapshot, route: &RouteResolution<'_>) {
+    for ext in &route.extensions {
+        let Some(object) = ext.object else {
+            tracing::warn!(namespace = %ext.namespace, name = %ext.name,
+                "extensionRef Extension not present yet");
+            continue;
+        };
+        let spec = &object.spec;
+        let config_yaml = if spec.config.is_null() {
+            String::new()
+        } else {
+            match serde_yaml::to_string(&spec.config) {
+                Ok(y) => y,
+                Err(e) => {
+                    tracing::warn!(namespace = %ext.namespace, name = %ext.name, error = %e,
+                        "Extension config cannot serialize; skipping");
+                    continue;
+                }
+            }
+        };
+        let limits = pb::ExtensionLimits {
+            request_body: match spec.limits.request_body {
+                Some(crd::RequestBodyLimit::None) => pb::RequestBodyLimit::None as i32,
+                Some(crd::RequestBodyLimit::Stream) => pb::RequestBodyLimit::Stream as i32,
+                Some(crd::RequestBodyLimit::Buffer) => pb::RequestBodyLimit::Buffer as i32,
+                None => pb::RequestBodyLimit::Unspecified as i32,
+            },
+            max_buffer_bytes: spec.limits.max_buffer_bytes.unwrap_or(0),
+        };
+        // HashMap insert dedups an Extension referenced by several routes.
+        snapshot.extensions.insert(
+            ExtensionKey::new(ext.namespace.clone(), ext.name.clone()),
+            pb::ExtensionUpsert {
+                namespace: ext.namespace.clone(),
+                name: ext.name.clone(),
+                class: spec.class.clone(),
+                failure_mode: match spec.failure_mode {
+                    crd::FailureMode::Closed => pb::FailureMode::Closed as i32,
+                    crd::FailureMode::Open => pb::FailureMode::Open as i32,
+                },
+                limits: Some(limits),
+                config_yaml,
             },
         );
     }
@@ -242,7 +296,7 @@ fn emit_routes_under_edge(
             .as_deref()
             .unwrap_or(&[])
             .iter()
-            .filter_map(translate_filter)
+            .filter_map(|f| translate_filter(f, route.route_ns))
             .collect();
 
         snapshot.routes.insert(
@@ -457,7 +511,7 @@ fn translate_query_param_matches(
     out
 }
 
-fn translate_filter(f: &HttpRouteRulesFilters) -> Option<pb::HttpFilter> {
+fn translate_filter(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<pb::HttpFilter> {
     if let Some(rhm) = f.request_header_modifier.as_ref() {
         let (add, set, remove) = translate_header_ops(
             rhm.add
@@ -550,8 +604,27 @@ fn translate_filter(f: &HttpRouteRulesFilters) -> Option<pb::HttpFilter> {
             )),
         });
     }
+    if let Some(filter) = translate_extension_ref(f, route_ns) {
+        return Some(filter);
+    }
+
     tracing::warn!(?f.r#type, "skipping unsupported HTTPRoute filter");
     None
+}
+
+/// The `extensionRef` arm: only our `Extension` kind translates; a
+/// foreign group/kind falls through to the unsupported-filter warn.
+fn translate_extension_ref(f: &HttpRouteRulesFilters, route_ns: &str) -> Option<pb::HttpFilter> {
+    let er = f.extension_ref.as_ref()?;
+    if er.group != "gateway.linkerd.io" || er.kind != "Extension" {
+        return None;
+    }
+    Some(pb::HttpFilter {
+        kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
+            name: er.name.clone(),
+            namespace: route_ns.to_string(),
+        })),
+    })
 }
 
 /// Shared add/set/remove translator for the request- and
@@ -1043,6 +1116,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1108,6 +1182,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1157,6 +1232,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1203,6 +1279,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
 
         let out = translate(&state, OURS);
@@ -1238,6 +1315,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1282,6 +1360,7 @@ mod tests {
             services: vec![service("other-ns", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1312,6 +1391,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("None"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1339,6 +1419,7 @@ mod tests {
             services: vec![],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1402,6 +1483,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices,
             secrets: vec![],
+            extensions: vec![],
         }
     }
 
@@ -1487,6 +1569,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1517,6 +1600,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1566,7 +1650,7 @@ mod tests {
             extension_ref: None,
         };
 
-        let out = translate_filter(&filter).expect("redirect translated");
+        let out = translate_filter(&filter, "ns").expect("redirect translated");
         match out.kind.expect("kind set") {
             pb::http_filter::Kind::RequestRedirect(rr) => {
                 assert_eq!(rr.scheme, pb::RedirectScheme::Https as i32);
@@ -1709,6 +1793,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1746,6 +1831,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1776,6 +1862,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1807,6 +1894,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1848,6 +1936,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1896,6 +1985,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -1996,6 +2086,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         }
     }
 
@@ -2134,6 +2225,7 @@ mod tests {
             )],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -2474,6 +2566,7 @@ mod tests {
             )],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -2511,6 +2604,7 @@ mod tests {
             services: vec![service("demo", "svc", Some("10.0.0.1"))],
             endpoint_slices: vec![],
             secrets: vec![],
+            extensions: vec![],
         };
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
@@ -2523,5 +2617,163 @@ mod tests {
         let path = m.path.as_ref().expect("path set");
         assert_eq!(path.kind, pb::PathMatchKind::PathPrefix as i32);
         assert_eq!(path.value, "/");
+    }
+
+    fn extension_ref_filter(group: &str, kind: &str, name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type:
+                gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersType::ExtensionRef,
+            request_header_modifier: None,
+            response_header_modifier: None,
+            request_redirect: None,
+            url_rewrite: None,
+            request_mirror: None,
+            extension_ref: Some(
+                gateway_api::apis::standard::httproutes::HttpRouteRulesFiltersExtensionRef {
+                    group: group.into(),
+                    kind: kind.into(),
+                    name: name.into(),
+                },
+            ),
+            cors: None,
+        }
+    }
+
+    fn extension_object(ns: &str, name: &str) -> crate::crd::Extension {
+        let spec = crate::crd::ExtensionSpec {
+            class: "request_header_modifier".into(),
+            failure_mode: crate::crd::FailureMode::Open,
+            limits: crate::crd::Limits {
+                request_body: Some(crate::crd::RequestBodyLimit::Stream),
+                max_buffer_bytes: None,
+            },
+            config: serde_json::json!({ "add": [ { "name": "x-a", "value": "1" } ] }),
+        };
+        let mut ext = crate::crd::Extension::new(name, spec);
+        ext.metadata.namespace = Some(ns.into());
+        ext
+    }
+
+    #[test]
+    fn extension_ref_translates_and_emits_the_object() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![],
+                    vec![extension_ref_filter(
+                        "gateway.linkerd.io",
+                        "Extension",
+                        "picker",
+                    )],
+                )],
+            )],
+            services: vec![],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![extension_object("demo", "picker")],
+        };
+        let out = translate(&state, OURS);
+        let snapshot = out.values().next().expect("one gateway");
+
+        // The route carries the ref, namespaced to the route.
+        let route = snapshot.routes.values().next().expect("one route");
+        let filter = route.filters.first().expect("one filter");
+        let Some(pb::http_filter::Kind::ExtensionRef(er)) = &filter.kind else {
+            panic!("expected an ExtensionRef filter");
+        };
+        assert_eq!(er.name, "picker");
+        assert_eq!(er.namespace, "demo");
+
+        // The object is emitted, enums and config mapped.
+        let upsert = snapshot
+            .extensions
+            .get(&ExtensionKey::new("demo", "picker"))
+            .expect("extension emitted");
+        assert_eq!(upsert.class, "request_header_modifier");
+        assert_eq!(upsert.failure_mode, pb::FailureMode::Open as i32);
+        assert_eq!(
+            upsert.limits.as_ref().unwrap().request_body,
+            pb::RequestBodyLimit::Stream as i32
+        );
+        assert!(upsert.config_yaml.contains("x-a"));
+    }
+
+    #[test]
+    fn missing_extension_object_keeps_the_ref_and_emits_nothing() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![],
+                    vec![extension_ref_filter(
+                        "gateway.linkerd.io",
+                        "Extension",
+                        "ghost",
+                    )],
+                )],
+            )],
+            services: vec![],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![],
+        };
+        let out = translate(&state, OURS);
+        let snapshot = out.values().next().expect("one gateway");
+        let route = snapshot.routes.values().next().expect("one route");
+        assert_eq!(route.filters.len(), 1, "the ref survives translation");
+        assert!(snapshot.extensions.is_empty(), "nothing to emit yet");
+    }
+
+    #[test]
+    fn foreign_extension_ref_is_dropped() {
+        let state = K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(
+                    Some("/"),
+                    vec![],
+                    vec![extension_ref_filter("other.io", "Widget", "w")],
+                )],
+            )],
+            services: vec![],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![],
+        };
+        let out = translate(&state, OURS);
+        let snapshot = out.values().next().expect("one gateway");
+        let route = snapshot.routes.values().next().expect("one route");
+        assert!(route.filters.is_empty(), "foreign refs drop with a warn");
+        assert!(snapshot.extensions.is_empty());
     }
 }

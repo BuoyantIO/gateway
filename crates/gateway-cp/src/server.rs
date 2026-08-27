@@ -233,13 +233,15 @@ fn parse_client_id(s: &str) -> Result<GatewayId, Status> {
 }
 
 /// Flatten a `Snapshot` into a single bootstrap `ConfigUpdate`.
-/// Order: Bind → Backend → Secret → Listener → `HttpRoute` —
+/// Order: Bind → Backend → Secret → Extension → Listener →
+/// `HttpRoute` —
 /// convention only; the Store handles ordering via its stashing model.
 fn snapshot_to_bootstrap(snap: &Snapshot) -> pb::ConfigUpdate {
     let mut upserts = Vec::with_capacity(
         snap.binds.len()
             + snap.backends.len()
             + snap.secrets.len()
+            + snap.extensions.len()
             + snap.listeners.len()
             + snap.routes.len(),
     );
@@ -256,6 +258,11 @@ fn snapshot_to_bootstrap(snap: &Snapshot) -> pb::ConfigUpdate {
     for s in snap.secrets.values() {
         upserts.push(pb::Upsert {
             body: Some(pb::upsert::Body::Secret(s.clone())),
+        });
+    }
+    for e in snap.extensions.values() {
+        upserts.push(pb::Upsert {
+            body: Some(pb::upsert::Body::Extension(e.clone())),
         });
     }
     for l in snap.listeners.values() {

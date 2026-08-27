@@ -7,6 +7,7 @@
 mod backend_protocol;
 mod drain;
 mod endpoints;
+mod extensions;
 mod filters;
 mod grpc;
 mod ha;

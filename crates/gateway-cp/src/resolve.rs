@@ -129,6 +129,19 @@ pub struct RouteResolution<'a> {
     pub edges: Vec<RouteEdge<'a>>,
     /// Backend resolution per rule, in rule order, refs in spec order.
     pub rule_backends: Vec<Vec<BackendResolution<'a>>>,
+    /// The route's `extensionRef` filters, resolved. Refs are
+    /// route-local; deduped by identity across rules.
+    pub extensions: Vec<ExtRef<'a>>,
+}
+
+/// One `extensionRef` of a route, resolved against the watched
+/// `Extension` objects. `object` is `None` while the named object
+/// does not exist — the ref is still emitted and the DP answers 500
+/// until it arrives.
+pub struct ExtRef<'a> {
+    pub namespace: String,
+    pub name: String,
+    pub object: Option<&'a crate::crd::Extension>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +231,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
 
     let services_by_id = index_by_id(&state.services, |s| &s.metadata);
     let secrets_by_id = index_by_id(&state.secrets, |s| &s.metadata);
+    let extensions_by_id = index_by_id(&state.extensions, |e| &e.metadata);
     let slices_by_service = index_slices(&state.endpoint_slices);
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
@@ -273,6 +287,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
                 &mut counted,
                 &services_by_id,
                 &slices_by_service,
+                &extensions_by_id,
             ));
         }
     }
@@ -441,8 +456,10 @@ fn resolve_route_parent<'a>(
     counted: &mut std::collections::HashSet<(usize, usize)>,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
+    extensions_by_id: &HashMap<(&str, &str), &'a crate::crd::Extension>,
 ) -> RouteResolution<'a> {
     let rule_backends = resolve_rule_backends(hr, route_ns, services_by_id, slices_by_service);
+    let extensions = resolve_route_extensions(hr, route_ns, extensions_by_id);
 
     let Some((gw_idx, gateway)) = gateway else {
         return RouteResolution {
@@ -454,6 +471,7 @@ fn resolve_route_parent<'a>(
             outcome: RouteParentOutcome::NoMatchingParent,
             edges: Vec::new(),
             rule_backends,
+            extensions,
         };
     };
 
@@ -520,7 +538,40 @@ fn resolve_route_parent<'a>(
         outcome,
         edges,
         rule_backends,
+        extensions,
     }
+}
+
+/// Collect the route's `extensionRef` filters that name our
+/// `Extension` kind, deduped by identity, resolved against the
+/// watched objects. Refs are route-local: the namespace is the
+/// route's own.
+fn resolve_route_extensions<'a>(
+    hr: &'a HTTPRoute,
+    route_ns: &str,
+    extensions_by_id: &HashMap<(&str, &str), &'a crate::crd::Extension>,
+) -> Vec<ExtRef<'a>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut refs = Vec::new();
+    for rule in hr.spec.rules.as_deref().unwrap_or(&[]) {
+        for f in rule.filters.as_deref().unwrap_or(&[]) {
+            let Some(er) = f.extension_ref.as_ref() else {
+                continue;
+            };
+            if er.group != "gateway.linkerd.io" || er.kind != "Extension" {
+                continue; // foreign refs drop at translation, with a warn
+            }
+            if !seen.insert(er.name.clone()) {
+                continue;
+            }
+            refs.push(ExtRef {
+                namespace: route_ns.to_string(),
+                name: er.name.clone(),
+                object: extensions_by_id.get(&(route_ns, er.name.as_str())).copied(),
+            });
+        }
+    }
+    refs
 }
 
 fn resolve_rule_backends<'a>(

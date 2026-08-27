@@ -23,6 +23,7 @@ path = "src/bin/grpc_echo.rs"
 anyhow = "1"
 bytes = "1"
 gateway-api = "0.21"
+gateway-cp = { path = "../crates/gateway-cp" }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
