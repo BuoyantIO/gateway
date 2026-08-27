@@ -12,6 +12,7 @@
 //! `extension::builtin::instance_for`, executing request hooks in
 //! route order and response hooks in reverse.
 
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,7 +26,8 @@ use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
 use gateway_state::{
-    ActiveBackend, ActiveBackendRef, ActiveHttpRoute, ActiveListener, BindKey, Store,
+    ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveDialable, ActiveHttpRoute,
+    ActiveListener, BindKey, Store,
 };
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
@@ -43,7 +45,7 @@ use crate::extension::{
     Action, BodyMode, Cx, Held, Instance, LocalResponse, Selected, Target, TargetBackend, Targets,
 };
 use crate::gateway::ProxyCtx;
-use crate::lb::EndpointInfo;
+use crate::lb::{EndpointInfo, LoadBalancer};
 use crate::metrics::Reason;
 use crate::proxy::access::{Access, RequestOutcome};
 use crate::proxy::body::{BoxError, HeldBody, UpstreamBody, apply_body_source};
@@ -102,6 +104,92 @@ impl Default for HttpClient {
 impl std::fmt::Debug for HttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpClient").finish_non_exhaustive()
+    }
+}
+
+/// Where one request goes on the wire, and the runtime state its
+/// timing and failures account against.
+///
+/// An endpoint set contributes one of its endpoints; a dialable
+/// backend contributes itself, as one logical endpoint keyed by the
+/// backend's name. Either way the accounting is the same, and so is
+/// it whether the destination came from the balanced pick or from a
+/// selector.
+struct Destination {
+    /// The authority dialed: `ip:port` for an endpoint, `host:port`
+    /// for a dialable backend, where the host is resolved at dial
+    /// time. Also the `endpoint` label the access log and metrics
+    /// carry.
+    authority: String,
+    /// `Host` to send upstream; `None` keeps the client's. An
+    /// endpoint is one member of the service the client addressed,
+    /// so the client's host stands. A dialable backend is a
+    /// different origin and has to be addressed as itself.
+    host: Option<String>,
+    /// Joined ahead of the request path. `None` for an endpoint,
+    /// which forwards the path untouched.
+    path_prefix: Option<String>,
+    protocol: BackendProtocol,
+    /// In-flight count, latency estimate and eviction state.
+    info: Arc<EndpointInfo>,
+}
+
+/// Default port for the scheme upstream requests are dialed with. A
+/// `Host` carrying the default port is legal but unusual, so it is
+/// left off; TLS origination will bring the second default with it.
+const DEFAULT_PORT: u16 = 80;
+
+impl Destination {
+    /// Where a request to `backend` goes: the balanced pick over an
+    /// endpoint set, or the dialable backend itself. `None` only
+    /// when an endpoint set has nothing to pick, which the caller
+    /// answers with 503.
+    fn for_backend(backend: &Arc<ActiveBackend>, lb: &LoadBalancer) -> Option<Self> {
+        match &backend.kind {
+            ActiveBackendKind::Endpoints(_) => {
+                let (endpoint, info) = lb.pick_endpoint(backend)?;
+                Some(Self::at_endpoint(&endpoint, backend.protocol(), info))
+            }
+            ActiveBackendKind::Dialable(dialable) => Some(Self::at_host(
+                dialable,
+                backend.protocol(),
+                lb.dialable_state(backend),
+            )),
+        }
+    }
+
+    fn at_endpoint(
+        endpoint: &Endpoint,
+        protocol: BackendProtocol,
+        info: Arc<EndpointInfo>,
+    ) -> Self {
+        Self {
+            authority: format!("{}:{}", endpoint.address, endpoint.port),
+            host: None,
+            path_prefix: None,
+            protocol,
+            info,
+        }
+    }
+
+    fn at_host(
+        dialable: &ActiveDialable,
+        protocol: BackendProtocol,
+        info: Arc<EndpointInfo>,
+    ) -> Self {
+        let authority = format!("{}:{}", dialable.host, dialable.port);
+        let host = if dialable.port == DEFAULT_PORT {
+            dialable.host.clone()
+        } else {
+            authority.clone()
+        };
+        Self {
+            authority,
+            host: Some(host),
+            path_prefix: dialable.path_prefix.clone(),
+            protocol,
+            info,
+        }
     }
 }
 
@@ -386,7 +474,7 @@ async fn dispatch(
     };
     let req = Request::from_parts(parts, upstream_body);
 
-    let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
+    let Some(dest) = Destination::for_backend(backend, &ctx.lb) else {
         return short_circuit(
             &mut instances,
             &mut cx,
@@ -394,16 +482,14 @@ async fn dispatch(
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
         );
     };
-    let _active = info.acquire();
-    let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
+    let _active = dest.info.acquire();
 
-    let (upstream, reason, dial_ms) =
-        forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info).await;
+    let (upstream, reason, dial_ms) = forward(&ctx.http_client, req, &dest).await;
     let outcome = RequestOutcome {
         listener: listener.map(str::to_owned),
         route: route.map(str::to_owned),
         reason,
-        endpoint: Some(endpoint_authority),
+        endpoint: Some(dest.authority),
         dial_ms,
     };
     finish_response(instances, cx, upstream, outcome)
@@ -422,7 +508,7 @@ async fn serve_streamed(
     backend: &Arc<ActiveBackend>,
     (listener, route): (Option<&str>, Option<&str>),
 ) -> (Response<ResponseBody>, RequestOutcome) {
-    let Some((endpoint, info)) = ctx.lb.pick_endpoint(backend) else {
+    let Some(dest) = Destination::for_backend(backend, &ctx.lb) else {
         return short_circuit(
             &mut instances,
             &mut cx,
@@ -430,15 +516,14 @@ async fn serve_streamed(
             RequestOutcome::short_circuit(listener, route, Reason::NoEndpoint),
         );
     };
-    let _active = info.acquire();
-    let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
+    let _active = dest.info.acquire();
 
     let (tx, rx) = mpsc::channel(gate::BODY_PIPE_CAPACITY);
     let req = Request::from_parts(
         parts,
         UpstreamBody::Stream(StreamBody::new(ReceiverStream::new(rx))),
     );
-    let forward_fut = forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info);
+    let forward_fut = forward(&ctx.http_client, req, &dest);
     let pump_fut = gate::pump(&mut instances, body, tx, &mut cx);
     let ((upstream, reason, dial_ms), pump) = tokio::join!(forward_fut, pump_fut);
 
@@ -453,7 +538,7 @@ async fn serve_streamed(
         listener: listener.map(str::to_owned),
         route: route.map(str::to_owned),
         reason,
-        endpoint: Some(endpoint_authority),
+        endpoint: Some(dest.authority),
         dial_ms,
     };
     finish_response(instances, cx, upstream, outcome)
@@ -513,7 +598,7 @@ async fn serve_selected(
         }
     };
 
-    let Some((backend, endpoint, info)) = validate_target(&selection.target, route, &ctx.lb) else {
+    let Some(dest) = validate_target(&selection.target, route, &ctx.lb) else {
         return short_circuit(
             &mut instances,
             &mut cx,
@@ -521,8 +606,7 @@ async fn serve_selected(
             RequestOutcome::short_circuit(listener, route_name, Reason::Internal),
         );
     };
-    let _active = info.acquire();
-    let endpoint_authority = format!("{}:{}", endpoint.address, endpoint.port);
+    let _active = dest.info.acquire();
 
     let upstream_body = match apply_body_source(selection.body, &mut parts, held_body) {
         Ok(body) => body,
@@ -538,13 +622,12 @@ async fn serve_selected(
     };
     let req = Request::from_parts(parts, upstream_body);
 
-    let (upstream, reason, dial_ms) =
-        forward(&ctx.http_client, backend.protocol(), req, &endpoint, &info).await;
+    let (upstream, reason, dial_ms) = forward(&ctx.http_client, req, &dest).await;
     let outcome = RequestOutcome {
         listener: listener.map(str::to_owned),
         route: route_name.map(str::to_owned),
         reason,
-        endpoint: Some(endpoint_authority),
+        endpoint: Some(dest.authority),
         dial_ms,
     };
     finish_response(instances, cx, upstream, outcome)
@@ -593,39 +676,56 @@ fn targets_from_route(route: &Arc<ActiveHttpRoute>) -> Targets {
 }
 
 /// A selection is valid only within the rule's backendRefs, and only
-/// at an address the named backend actually lists. Everything else
+/// as the kind the named backend actually is: an address an endpoint
+/// set lists, or the host of a dialable backend. Everything else
 /// fails the request — with better information than the picker, we
 /// would still rather fail than route somewhere the route never
 /// allowed.
 fn validate_target(
     target: &Target,
     route: &Arc<ActiveHttpRoute>,
-    lb: &crate::lb::LoadBalancer,
-) -> Option<(Arc<ActiveBackend>, Endpoint, Arc<EndpointInfo>)> {
+    lb: &LoadBalancer,
+) -> Option<Destination> {
     match target {
         Target::Endpoint { backend, addr } => {
-            let Some(br) = route.backends.iter().find(|br| br.key.0 == *backend) else {
-                tracing::warn!(%backend, "selector named a backend outside the rule's refs");
-                return None;
-            };
-            let Some(active) = &br.backend else {
-                tracing::warn!(%backend, "selector named a ref whose backend is not registered");
-                return None;
-            };
+            let active = named_backend(route, backend)?;
             let Some((endpoint, info)) = lb.endpoint_by_addr(active, *addr) else {
                 tracing::warn!(%backend, %addr, "selector named an address the backend does not list");
                 return None;
             };
-            Some((Arc::clone(active), endpoint, info))
+            Some(Destination::at_endpoint(&endpoint, active.protocol(), info))
         }
-        // State can hold a dialable backend, but nothing dials one
-        // yet; a variant that silently misroutes would be worse than
-        // one that fails.
         Target::Backend { name } => {
-            tracing::warn!(%name, "selector targeted a dialable backend, which is not supported");
-            None
+            let active = named_backend(route, name)?;
+            let ActiveBackendKind::Dialable(dialable) = &active.kind else {
+                tracing::warn!(%name, "selector targeted an endpoint-set backend as dialable");
+                return None;
+            };
+            Some(Destination::at_host(
+                dialable,
+                active.protocol(),
+                lb.dialable_state(active),
+            ))
         }
     }
+}
+
+/// The backend one of the rule's refs names, or `None` with the
+/// reason logged: a target may only name a ref the route carries,
+/// and only one that currently resolves.
+fn named_backend<'a>(
+    route: &'a Arc<ActiveHttpRoute>,
+    name: &str,
+) -> Option<&'a Arc<ActiveBackend>> {
+    let Some(br) = route.backends.iter().find(|br| br.key.0 == *name) else {
+        tracing::warn!(%name, "selector named a backend outside the rule's refs");
+        return None;
+    };
+    let Some(active) = &br.backend else {
+        tracing::warn!(%name, "selector named a ref whose backend is not registered");
+        return None;
+    };
+    Some(active)
 }
 
 /// Response hooks run in **reverse** order per Area 03
@@ -1168,30 +1268,45 @@ fn strip_hop_by_hop_headers(headers: &mut http::HeaderMap) {
 
 // =================== upstream forward ===================
 
-/// Rewrite `req` to target `endpoint`, set the server-side wire
-/// version from the backend's `protocol`, strip hop-by-hop headers,
-/// and forward via the matching client. On dial failure the
-/// endpoint's failure counter is incremented and a 502 is returned.
+/// The path sent upstream: a dialable backend's prefix joined ahead
+/// of the request's path and query. Trailing slashes on the prefix
+/// are dropped and the request path supplies the separator, so `/v1`
+/// and `/v1/` both send `/chat` to `/v1/chat` and `/` to `/v1/`. A
+/// prefix that is only slashes contributes nothing, and an endpoint
+/// — which has no prefix — forwards the path untouched.
+fn upstream_path<'a>(prefix: Option<&str>, path_and_query: &'a str) -> Cow<'a, str> {
+    let prefix = prefix.map_or("", |p| p.trim_end_matches('/'));
+    if prefix.is_empty() {
+        return Cow::Borrowed(path_and_query);
+    }
+    Cow::Owned(format!("{prefix}{path_and_query}"))
+}
+
+/// Rewrite `req` for `dest` — authority, path, and the `Host` a
+/// dialable backend is addressed by — set the server-side wire
+/// version from the destination's protocol, strip hop-by-hop
+/// headers, and forward via the matching client. The dial is timed
+/// either way: a success feeds the destination's latency estimate, a
+/// failure increments the counter that drives passive eviction and
+/// answers 502.
 ///
 /// The server-side protocol is fully independent of the client-side
 /// version the gateway served: an `Http2` backend gets h2c
 /// origination whether the client spoke H1 or H2.
 async fn forward(
     client: &HttpClient,
-    protocol: BackendProtocol,
     mut req: Request<UpstreamBody>,
-    endpoint: &Endpoint,
-    info: &Arc<EndpointInfo>,
+    dest: &Destination,
 ) -> (Response<ResponseBody>, Reason, Option<f64>) {
-    let authority = format!("{}:{}", endpoint.address, endpoint.port);
     let pq = req
         .uri()
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str);
+    let path = upstream_path(dest.path_prefix.as_deref(), pq);
     let upstream_uri = match Uri::builder()
         .scheme(http::uri::Scheme::HTTP)
-        .authority(authority)
-        .path_and_query(pq)
+        .authority(dest.authority.as_str())
+        .path_and_query(path.as_ref())
         .build()
     {
         Ok(u) => u,
@@ -1209,7 +1324,7 @@ async fn forward(
     // Pick the client + wire version for this backend's protocol. The
     // client-side version (which may be H2 when the downstream codec
     // was H2) does not constrain the server side.
-    let (upstream_client, version) = client.select(protocol);
+    let (upstream_client, version) = client.select(dest.protocol);
     *req.version_mut() = version;
 
     // Strip hop-by-hop headers before crossing the proxy hop. This is
@@ -1218,15 +1333,36 @@ async fn forward(
     // upstream and would be rejected.
     strip_hop_by_hop_headers(req.headers_mut());
 
+    // A dialable backend answers for itself, not for the host the
+    // client addressed, so the client's `Host` is replaced rather
+    // than carried (hyper only fills one in when it is absent). On
+    // H2 the URI's authority becomes `:authority` and is the
+    // authoritative form, so a leftover `Host` — which would
+    // contradict it — is dropped instead of rewritten.
+    if let Some(host) = &dest.host {
+        req.headers_mut().remove(http::header::HOST);
+        if version == http::Version::HTTP_11 {
+            let Ok(value) = http::HeaderValue::from_str(host) else {
+                tracing::warn!(%host, "backend host is not a valid Host header");
+                return (
+                    synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                    Reason::Internal,
+                    None,
+                );
+            };
+            req.headers_mut().insert(http::header::HOST, value);
+        }
+    }
+
     let dial_start = Instant::now();
     let (upstream_resp, dial_ms) = match upstream_client.request(req).await {
         Ok(r) => {
             let dial_ms = dial_start.elapsed().as_secs_f64() * 1000.0;
-            info.record_success(dial_ms);
+            dest.info.record_success(dial_ms);
             (r, dial_ms)
         }
         Err(e) => {
-            info.record_failure();
+            dest.info.record_failure();
             tracing::warn!(error = %e, "upstream dial failed");
             // The elapsed time still reaches the log: how long the
             // dial waited before the 502.
@@ -1309,7 +1445,9 @@ fn synthesize_status(status: StatusCode) -> Response<ResponseBody> {
 mod tests {
     use super::*;
 
-    use gateway_state::{ActiveBackendKind, ActiveEndpointSet};
+    use std::time::Duration;
+
+    use gateway_state::ActiveEndpointSet;
 
     fn pm(v: &str) -> PathMatch {
         PathMatch::PathPrefix { value: v.into() }
@@ -2098,6 +2236,64 @@ mod tests {
             }),
             weight,
         }
+    }
+
+    // ----- upstream destination -----
+
+    fn info() -> Arc<EndpointInfo> {
+        Arc::new(EndpointInfo::new(0.5, 1, Duration::from_secs(1)))
+    }
+
+    fn dialable(port: u16, path_prefix: Option<&str>) -> ActiveDialable {
+        ActiveDialable {
+            host: "api.example.com".into(),
+            port,
+            path_prefix: path_prefix.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn endpoint_destination_keeps_the_client_host_and_path() {
+        let endpoint = Endpoint {
+            name: "e0".into(),
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 8080,
+        };
+        let dest = Destination::at_endpoint(&endpoint, BackendProtocol::Http1, info());
+        assert_eq!(dest.authority, "127.0.0.1:8080");
+        assert!(dest.host.is_none());
+        assert!(dest.path_prefix.is_none());
+    }
+
+    #[test]
+    fn dialable_destination_addresses_the_target() {
+        let dest =
+            Destination::at_host(&dialable(8443, Some("/v1")), BackendProtocol::Http1, info());
+        assert_eq!(dest.authority, "api.example.com:8443");
+        assert_eq!(dest.host.as_deref(), Some("api.example.com:8443"));
+        assert_eq!(dest.path_prefix.as_deref(), Some("/v1"));
+    }
+
+    #[test]
+    fn dialable_host_drops_the_default_port() {
+        let dest = Destination::at_host(&dialable(80, None), BackendProtocol::Http1, info());
+        assert_eq!(dest.authority, "api.example.com:80");
+        assert_eq!(dest.host.as_deref(), Some("api.example.com"));
+    }
+
+    #[test]
+    fn upstream_path_without_a_prefix_is_untouched() {
+        assert_eq!(upstream_path(None, "/chat?a=1"), "/chat?a=1");
+        assert_eq!(upstream_path(Some("/"), "/chat"), "/chat");
+        assert_eq!(upstream_path(Some("//"), "/chat"), "/chat");
+    }
+
+    #[test]
+    fn upstream_path_joins_the_prefix() {
+        assert_eq!(upstream_path(Some("/v1"), "/chat"), "/v1/chat");
+        assert_eq!(upstream_path(Some("/v1"), "/chat?a=1"), "/v1/chat?a=1");
+        assert_eq!(upstream_path(Some("/v1/"), "/chat"), "/v1/chat");
+        assert_eq!(upstream_path(Some("/v1"), "/"), "/v1/");
     }
 
     #[test]

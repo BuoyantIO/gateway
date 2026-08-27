@@ -17,14 +17,15 @@ Names in this document are API names you can grep for.
 The `Store` holds the active configuration: binds, listeners, routes
 (matches, filters, backendRefs), and backends. A backend is one of
 two kinds (`ActiveBackendKind`): a set of endpoints the request path
-balances over, or a dialable host. Everything below describes the
-endpoint set — the dialable kind is not constructed by the control
-plane and no path reaches it, so a route ref naming one resolves but
-offers no endpoint, and the pick answers 503 `no_endpoint`. Two
-things live beside it: per-endpoint runtime state (`EndpointInfo`:
-in-flight count, latency estimate, eviction), which persists across
-requests, and the extension `Registry`, one `ExtensionBuilder` per
-plugin.
+balances over, or a dialable host the gateway resolves and dials
+itself. Both are reachable through the same weighted refs, and both
+reduce to one `Destination` per request. Two things live beside the
+config: per-endpoint runtime state (`EndpointInfo`: in-flight count,
+latency estimate, eviction), which persists across requests, and the
+extension `Registry`, one `ExtensionBuilder` per plugin.
+
+The control plane does not emit a dialable backend yet; today one
+only arrives through static config.
 
 Requests never observe a partially applied configuration: partial
 config, out-of-order references and resyncs are resolved at apply
@@ -267,15 +268,18 @@ may forward the original unchanged or return a `Replace`.
 `select` returns `Selected`:
 
 - `Selected::Target(Selection)` — a target plus the body source to
-  forward. The target must name one of the rule's refs
-  (`Target::Endpoint { backend, addr }`), and the address must be one
-  the named backend lists. Lookup goes through
+  forward. The target must name one of the rule's refs, as the kind
+  that ref actually is. `Target::Endpoint { backend, addr }` names an
+  address the backend lists; lookup goes through
   `LoadBalancer::endpoint_by_addr`, which returns the same
   `EndpointInfo` the weighted path uses — selected requests share
   in-flight and latency accounting with balanced ones. Eviction is
   not consulted: a selector may pick an endpoint that passive health
   tracking evicted, on the grounds that its information (live worker
   metrics) supersedes dial-failure counters.
+  `Target::Backend { name }` names a dialable backend, and produces
+  the same `Destination` the weighted pick would: same host, same
+  path prefix, same accounting entry.
 - `Selected::Respond(LocalResponse)` — the client receives the
   response; no upstream is contacted. Reason `ok`, as in the request
   pass: shedding is the route working as configured.
@@ -285,9 +289,8 @@ line: the selector returned an error (there is no fallback to the
 weighted draw — a re-route would send traffic somewhere the selector
 was configured to decide against); the target names a backend outside
 the rule's refs, or a ref whose backend is not registered, or an
-address the backend does not list; the target is a dialable backend
-(`Target::Backend`), which nothing dials yet; the body source cannot
-be honored.
+address the backend does not list; the target names an endpoint-set
+backend as dialable; the body source cannot be honored.
 
 ## Framing and dispatch
 
@@ -306,28 +309,44 @@ source:
 | `BodySource::Stream` without a total | removed; the request goes chunked |
 
 Dispatch then rewrites the request for the hop: the URI targets the
-chosen endpoint's address, the wire version follows the backend's
+`Destination`'s authority, the wire version follows the backend's
 declared protocol (`BackendProtocol`; the client-side version does not
 constrain the upstream side), and hop-by-hop headers are stripped —
 required on H2, where a carried-over `Connection` or
 `transfer-encoding` from a downstream H1 request is illegal and would
 be rejected.
 
+What the authority is, and what else the rewrite touches, is the one
+place the two backend kinds differ:
+
+| | endpoint set | dialable |
+|---|---|---|
+| authority | the chosen endpoint's `ip:port`, already resolved by the control plane | the backend's `host:port`, resolved by the client at dial time |
+| `Host` | the client's, carried through: the endpoint is one member of the service the client addressed | the backend's own, since it answers for a different origin. On H1 the header is replaced; on H2 it is dropped, because the URI's authority becomes `:authority` and a stale `Host` would contradict it. The port is left off when it is the scheme default |
+| path | forwarded untouched | the backend's prefix joined ahead of it. Trailing slashes on the prefix are dropped and the request path supplies the separator, so `/v1` and `/v1/` both send `/chat` to `/v1/chat` and `/` to `/v1/`; a prefix of only slashes adds nothing. The query is preserved |
+| accounting | the endpoint's `EndpointInfo`, keyed by endpoint name | one logical endpoint keyed by the backend's own name |
+
+Nothing here imposes a response-header timeout: a backend that is
+slow to first byte holds the request open rather than failing it.
+
 ## Upstream answer
 
-A pick that finds no endpoints answers 503, reason `no_endpoint` —
-an endpoint set whose members are all gone, or a dialable backend,
-which has no endpoints by construction. An
-in-flight guard (`ActiveHandle`) is held on the chosen endpoint's
-`EndpointInfo` from the pick until the request handler returns. The
-count it maintains is an input to the balanced pick; acquiring it
-after the body phase means a slow upload does not count as load on an
-endpoint that has not been dialed yet.
+A pick that finds no endpoints answers 503, reason `no_endpoint`;
+only an endpoint set can land there, since a dialable backend is
+always its own destination. An in-flight guard (`ActiveHandle`) is
+held on the destination's `EndpointInfo` from the pick until the
+request handler returns. The count it maintains is an input to the
+balanced pick; acquiring it after the body phase means a slow upload
+does not count as load on an endpoint that has not been dialed yet.
 
 The dial is timed and recorded either way: success feeds the dial
-time into the endpoint's latency estimate, failure increments the
+time into the destination's latency estimate, failure increments the
 counter that drives passive eviction. A failed dial answers 502,
-reason `dial_failure`.
+reason `dial_failure`. A dialable backend accumulates the same
+failure streak, and can be evicted by it, but the eviction is never
+consulted: dropping the only destination a backend has would fail
+every request for the eviction window, where an endpoint set in the
+same position fails open over its evicted members.
 
 The upstream's response headers are taken as-is; hop-by-hop stripping
 is deferred until after the response pass, so extensions observe the
