@@ -11,6 +11,8 @@ use http_body::{Body, Frame};
 use http_body_util::{BodyExt, Full};
 use tokio::sync::mpsc;
 
+use gateway_config::extension::FailureMode;
+
 use crate::extension::{Action, BodyMode, Cx, Instance, LocalResponse};
 use crate::proxy::body::{BoxError, UpstreamBody};
 
@@ -268,6 +270,12 @@ async fn deliver(
         {
             Ok(Action::Continue) => {}
             Ok(Action::Respond(resp)) => return Delivery::Respond(resp),
+            // Open skips this instance for this chunk and moves on;
+            // it stays in the list for later chunks. Closed fails
+            // the request.
+            Err(e) if instance.failure_mode == FailureMode::Open => {
+                tracing::warn!(error = %e, "body hook failed; failureMode Open continues");
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "request body hook failed");
                 return Delivery::Failed;
@@ -323,6 +331,7 @@ mod tests {
         calls: Vec<(Vec<u8>, bool)>,
         buffer_seen: Vec<Option<usize>>,
         respond_at: Option<usize>,
+        error_at: Option<usize>,
     }
 
     struct Handle(std::sync::Arc<std::sync::Mutex<Recorder>>);
@@ -338,6 +347,9 @@ mod tests {
             let mut rec = self.0.lock().unwrap();
             rec.calls.push((chunk.to_vec(), end_of_stream));
             rec.buffer_seen.push(cx.request_buffer().map(<[u8]>::len));
+            if rec.error_at == Some(rec.calls.len() - 1) {
+                return Err("hook failed".into());
+            }
             if rec.respond_at == Some(rec.calls.len() - 1) {
                 return Ok(Action::Respond(LocalResponse {
                     status: http::StatusCode::TOO_MANY_REQUESTS,
@@ -357,6 +369,7 @@ mod tests {
             calls: Vec::new(),
             buffer_seen: Vec::new(),
             respond_at,
+            error_at: None,
         }));
         let instance = Instance {
             decl: crate::extension::Declarations {
@@ -366,6 +379,17 @@ mod tests {
             failure_mode: gateway_config::extension::FailureMode::Closed,
             ext: Box::new(Handle(std::sync::Arc::clone(&rec))),
         };
+        (instance, rec)
+    }
+
+    fn failing_instance(
+        mode: BodyMode,
+        error_at: usize,
+        failure_mode: FailureMode,
+    ) -> (Instance, std::sync::Arc<std::sync::Mutex<Recorder>>) {
+        let (mut instance, rec) = self::instance(mode, None);
+        rec.lock().unwrap().error_at = Some(error_at);
+        instance.failure_mode = failure_mode;
         (instance, rec)
     }
 
@@ -595,5 +619,43 @@ mod tests {
         // The pipe carries the injected error, so hyper resets the
         // upstream instead of half-closing a truncated body.
         assert!(rx.recv().await.unwrap().is_err());
+    }
+
+    /// An `Open` instance's hook error is logged and skipped — the
+    /// drain finishes, the other instances see every chunk, and the
+    /// erroring instance stays in the list for later chunks. `Closed`
+    /// halts as before.
+    #[tokio::test]
+    async fn open_instance_errors_do_not_halt_the_drain() {
+        let (failing, rec_failing) = failing_instance(BodyMode::Buffer, 0, FailureMode::Open);
+        let (recorder, rec_ok) = instance(BodyMode::Buffer, None);
+        let mut instances = [failing, recorder];
+        let mut cx = Cx::new();
+        let out = run(
+            &mut instances,
+            &parts(),
+            chunked(&[b"a", b"b"]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
+        assert!(matches!(out, GateOutcome::Forward(_)));
+        // Both instances saw all three calls; the error was one
+        // chunk's answer, not a removal.
+        assert_eq!(rec_failing.lock().unwrap().calls.len(), 3);
+        assert_eq!(rec_ok.lock().unwrap().calls.len(), 3);
+
+        let (failing, _) = failing_instance(BodyMode::Buffer, 0, FailureMode::Closed);
+        let mut instances = [failing];
+        let mut cx = Cx::new();
+        let out = run(
+            &mut instances,
+            &parts(),
+            chunked(&[b"a", b"b"]),
+            &mut cx,
+            DrainMode::ForwardBuffered,
+        )
+        .await;
+        assert!(matches!(out, GateOutcome::Halt(Halt::Failed)));
     }
 }

@@ -1416,6 +1416,143 @@ async fn members_configure_once_per_route_revision() {
         .unwrap();
 }
 
+/// `failureMode` decides what a request-hook error does: `Open` logs
+/// and continues through the remaining filters, `Closed` fails the
+/// request.
+#[tokio::test]
+async fn failure_mode_decides_what_a_hook_error_does() {
+    struct FlakyBuilder;
+    struct Flaky;
+
+    impl ExtensionBuilder for FlakyBuilder {
+        fn build(&self) -> Box<dyn Extension> {
+            Box::new(Flaky)
+        }
+    }
+
+    #[async_trait]
+    impl Extension for Flaky {
+        async fn on_request_start(
+            &mut self,
+            _head: &mut http::request::Parts,
+            _cx: &mut Cx,
+        ) -> Result<Action, ExtensionError> {
+            Err("flaky hook".into())
+        }
+    }
+
+    for (mode, expected) in [
+        (FailureMode::Open, StatusCode::OK),
+        (FailureMode::Closed, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let upstream_port = spawn_http_echo().await;
+        let bind_port = free_port().await;
+
+        let mut route = http_route("r", "/", "be");
+        route.filters.push(HttpFilter::ExtensionRef {
+            name: "flaky".into(),
+        });
+        route.filters.push(HttpFilter::ExtensionRef {
+            name: "stamp".into(),
+        });
+        let mut flaky_object = extension_object("flaky");
+        flaky_object.failure_mode = mode;
+        let cfg = GatewayConfig {
+            name: "test".into(),
+            binds: vec![Bind {
+                name: "b".into(),
+                address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: bind_port,
+                bind_protocol: BindProtocol::Http,
+                listeners: vec![http_listener("l", None, vec![route])],
+            }],
+            backends: vec![static_backend("be", upstream_port)],
+            secrets: vec![],
+            extensions: vec![flaky_object, extension_object("stamp")],
+        };
+        let store = Store::new();
+        let _ = store.apply(&cfg);
+
+        let mut registry = Registry::new();
+        registry
+            .register_builder("flaky", Arc::new(FlakyBuilder))
+            .unwrap();
+        registry
+            .register_builder("stamp", Arc::new(StampBuilder))
+            .unwrap();
+
+        let (stop, watch) = drain::channel();
+        let gw = Gateway::new(store).with_classes(registry);
+        let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+        wait_for_listening(bind_port).await;
+
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let resp = client
+            .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), expected, "failureMode {mode:?}");
+        if expected == StatusCode::OK {
+            // The pass continued: the filter after the flaky one ran.
+            assert_eq!(
+                resp.headers()
+                    .get("x-stamped")
+                    .and_then(|v| v.to_str().ok()),
+                Some("by-extension"),
+            );
+        }
+
+        drop(stop);
+        tokio::time::timeout(Duration::from_secs(2), gw_handle)
+            .await
+            .expect("gateway did not shut down")
+            .unwrap();
+    }
+}
+
+/// `failureMode: Open` has no continue path in selection: a failing
+/// selector still fails the request.
+#[tokio::test]
+async fn an_open_selector_that_fails_still_fails_the_request() {
+    let (be, _hits) = spawn_port_echo().await;
+    let bind_port = free_port().await;
+    let mut cfg = selection_config(bind_port, be, be);
+    cfg.extensions[0].failure_mode = FailureMode::Open;
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+
+    let mut registry = Registry::new();
+    registry
+        .register_builder(
+            "picker",
+            Arc::new(PickerBuilder {
+                mode: BodyMode::None,
+                plan: Arc::new(PickPlan::Fail),
+                backend: "be-b",
+                buffer_at_select: Arc::new(StdMutex::new(HeldSeen::NotCalled)),
+            }),
+        )
+        .unwrap();
+
+    let (stop, watch) = drain::channel();
+    let gw = Gateway::new(store).with_classes(registry);
+    let gw_handle = tokio::spawn(async move { gw.run(watch).await.unwrap() });
+    wait_for_listening(bind_port).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bind_port}/").parse().unwrap())
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(2), gw_handle)
+        .await
+        .expect("gateway did not shut down")
+        .unwrap();
+}
+
 /// The Extension object lifecycle, end to end: referenced before it
 /// exists (500), upserted (recovers with no route re-apply), removed
 /// (500 again).
