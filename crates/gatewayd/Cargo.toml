@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 gateway-config = { path = "../gateway-config" }
 gateway-cp-client = { path = "../gateway-cp-client" }
+gateway-extension-impls = { path = "../gateway-extension-impls" }
 gateway-runtime = { path = "../gateway-runtime" }
 gateway-state = { path = "../gateway-state" }
 anyhow = "1"

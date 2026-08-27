@@ -4,7 +4,6 @@
 
 mod accept;
 mod error;
-pub mod extension;
 mod gateway;
 pub mod lb;
 pub mod metrics;
@@ -13,5 +12,6 @@ mod proxy;
 pub use error::RuntimeError;
 pub use gateway::Gateway;
 pub use gateway_drain as drain;
+pub use gateway_extension as extension;
 pub use metrics::Metrics;
 pub use proxy::http::HttpClient;

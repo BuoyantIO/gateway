@@ -11,7 +11,6 @@ use crate::accept;
 use crate::drain;
 use crate::error::RuntimeError;
 use crate::extension::Registry;
-use crate::extension::builtin::register_builtins;
 use crate::lb::{EndpointStateConfig, LoadBalancer, P2cEwma};
 use crate::metrics::Metrics;
 use crate::proxy::extensions::ExtensionCache;
@@ -36,8 +35,8 @@ pub struct Gateway {
     /// Metric families the request path records into. Detached
     /// (never scraped) unless the caller registered them.
     pub(crate) metrics: Arc<Metrics>,
-    /// Extension classes a route's filters resolve against. Always
-    /// holds the built-ins; `with_classes` adds the caller's.
+    /// Extension classes a route's filters resolve against. Empty
+    /// unless the caller installs a registry via `with_classes`.
     pub(crate) classes: Arc<Registry>,
     /// The routes' resolved extensions, cached per route revision.
     pub(crate) extensions: Arc<ExtensionCache>,
@@ -68,14 +67,12 @@ impl Gateway {
 
     /// Custom load balancer (caller-constructed picker + state policy).
     pub fn with_lb(store: Store, lb: LoadBalancer) -> Self {
-        let mut registry = Registry::new();
-        register_builtins(&mut registry);
         Self {
             store,
             lb: Arc::new(lb),
             http_client: HttpClient::default(),
             metrics: Metrics::new(),
-            classes: Arc::new(registry),
+            classes: Arc::new(Registry::new()),
             extensions: Arc::new(ExtensionCache::default()),
         }
     }
@@ -92,11 +89,10 @@ impl Gateway {
     /// Extensions routes may reference by name. Consuming builder
     /// rather than another constructor: lb, metrics and registry are
     /// independent, and a constructor per combination does not scale.
-    /// The built-ins are registered on top; their reserved names are
-    /// not available to callers.
+    /// The registry is taken as-is — callers register the built-ins
+    /// (`gateway-extension-impls`) alongside their own classes.
     #[must_use]
-    pub fn with_classes(mut self, mut registry: Registry) -> Self {
-        register_builtins(&mut registry);
+    pub fn with_classes(mut self, registry: Registry) -> Self {
         self.classes = Arc::new(registry);
         self
     }
