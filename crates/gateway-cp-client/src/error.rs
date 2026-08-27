@@ -14,6 +14,13 @@ pub enum Error {
     #[error("unsupported {kind} enum value: {value}")]
     UnsupportedEnum { kind: &'static str, value: i32 },
 
+    #[error("invalid extension `{name}` config: {source}")]
+    InvalidExtension {
+        name: String,
+        #[source]
+        source: serde_yaml::Error,
+    },
+
     #[error("invalid header name `{name}`: {source}")]
     InvalidHeaderName {
         name: String,

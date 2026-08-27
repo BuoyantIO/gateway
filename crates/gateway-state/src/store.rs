@@ -107,10 +107,12 @@ struct Inner {
     listeners_by_secret: HashMap<SecretKey, HashSet<ListenerKey>>,
 }
 
-/// The `ExtensionRef` names among `filters`, in filter order.
-fn extension_ref_names(filters: &[HttpFilter]) -> impl Iterator<Item = &str> {
+/// The `ExtensionRef` identities among `filters`, in filter order.
+fn extension_refs(filters: &[HttpFilter]) -> impl Iterator<Item = ExtensionKey> {
     filters.iter().filter_map(|f| match f {
-        HttpFilter::ExtensionRef { name } => Some(name.as_str()),
+        HttpFilter::ExtensionRef { name, namespace } => {
+            Some(ExtensionKey::new(namespace.clone(), name.clone()))
+        }
         _ => None,
     })
 }
@@ -250,7 +252,14 @@ impl Store {
 
     /// Drop every registered key not in `keep`.
     pub fn retain(&self, keep: &RegisteredKeys) {
-        let (stale_routes, stale_backends, stale_listeners, stale_binds, stale_secrets) = {
+        let (
+            stale_routes,
+            stale_backends,
+            stale_extensions,
+            stale_listeners,
+            stale_binds,
+            stale_secrets,
+        ) = {
             let read = self.read();
             (
                 read.registered_route_keys()
@@ -258,6 +267,9 @@ impl Store {
                     .collect::<Vec<_>>(),
                 read.registered_backend_keys()
                     .filter(|k| !keep.backends.contains(k))
+                    .collect::<Vec<_>>(),
+                read.registered_extension_keys()
+                    .filter(|k| !keep.extensions.contains(k))
                     .collect::<Vec<_>>(),
                 read.registered_listener_keys()
                     .filter(|k| !keep.listeners.contains(k))
@@ -275,6 +287,9 @@ impl Store {
         }
         for k in &stale_backends {
             self.remove_backend(k);
+        }
+        for k in &stale_extensions {
+            self.remove_extension(k);
         }
         for k in &stale_listeners {
             self.remove_listener(k);
@@ -363,6 +378,10 @@ impl StoreRead<'_> {
     /// Every secret currently upserted.
     pub fn registered_secret_keys(&self) -> impl Iterator<Item = SecretKey> + '_ {
         self.guard.secrets.keys().cloned()
+    }
+
+    pub fn registered_extension_keys(&self) -> impl Iterator<Item = ExtensionKey> + '_ {
+        self.guard.extensions.keys().cloned()
     }
 }
 
@@ -584,9 +603,9 @@ impl Inner {
                 .or_default()
                 .insert(rkey.clone());
         }
-        for name in extension_ref_names(&route.filters) {
+        for ekey in extension_refs(&route.filters) {
             self.routes_by_extension
-                .entry(ExtensionKey::new(name))
+                .entry(ekey)
                 .or_default()
                 .insert(rkey.clone());
         }
@@ -639,7 +658,7 @@ impl Inner {
     }
 
     fn upsert_extension(&mut self, ext: Extension) -> Vec<BindEvent> {
-        let key = ExtensionKey::new(ext.name.clone());
+        let key = ExtensionKey::new(ext.namespace.clone(), ext.name.clone());
         self.extensions.insert(key.clone(), Arc::new(ext));
         self.cascade_routes_by_extension(&key)
     }
@@ -927,9 +946,8 @@ impl Inner {
                 }
             })
             .collect();
-        let extensions = extension_ref_names(&route.filters)
-            .map(|name| {
-                let ekey = ExtensionKey::new(name);
+        let extensions = extension_refs(&route.filters)
+            .map(|ekey| {
                 let object = self.extensions.get(&ekey).map(Arc::clone);
                 ActiveExtensionRef { key: ekey, object }
             })
@@ -2106,6 +2124,7 @@ gatewayConfig:
             routes: [rkey("b", "l", "r")].into_iter().collect(),
             backends: [backendkey("be")].into_iter().collect(),
             secrets: HashSet::default(),
+            extensions: HashSet::new(),
         };
         store.retain(&keep);
 
@@ -2130,6 +2149,7 @@ gatewayConfig:
             routes: [rkey("b", "l", "r")].into_iter().collect(),
             backends: HashSet::default(),
             secrets: HashSet::default(),
+            extensions: HashSet::new(),
         };
         store.retain(&keep);
 
@@ -2183,6 +2203,32 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         store.upsert_secret(tls_secret("app-tls"));
         store.remove_secret(&secretkey("app-tls"));
         assert!(store.read().secret(&secretkey("app-tls")).is_none());
+    }
+
+    #[test]
+    fn retain_keeps_listed_extension_drops_unlisted() {
+        let store = Store::new();
+        store.upsert_extension(extension_object("keep"));
+        store.upsert_extension(extension_object("drop"));
+
+        let keep = RegisteredKeys {
+            extensions: [ExtensionKey::local("keep")].into_iter().collect(),
+            ..Default::default()
+        };
+        store.retain(&keep);
+
+        assert!(
+            store
+                .read()
+                .extension(&ExtensionKey::local("keep"))
+                .is_some()
+        );
+        assert!(
+            store
+                .read()
+                .extension(&ExtensionKey::local("drop"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2302,6 +2348,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     // not accepted and then mis-gated on secrets.
     fn extension_object(name: &str) -> Extension {
         Extension {
+            namespace: String::new(),
             name: name.into(),
             class: "some_class".into(),
             failure_mode: FailureMode::default(),
@@ -2312,8 +2359,10 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
     fn http_route_with_ref(name: &str, ext: &str) -> HttpRoute {
         let mut r = http_route(name, "/", &["be"]);
-        r.filters
-            .push(HttpFilter::ExtensionRef { name: ext.into() });
+        r.filters.push(HttpFilter::ExtensionRef {
+            name: ext.into(),
+            namespace: String::new(),
+        });
         r
     }
 
@@ -2336,7 +2385,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
         // Referenced before it arrives: present, unresolved.
         let unresolved = route_ref(&store);
-        assert_eq!(unresolved.key.0, "picker");
+        assert_eq!(unresolved.key.name, "picker");
         assert!(unresolved.object.is_none());
         let revision_before =
             store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
@@ -2350,12 +2399,12 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         assert!(
             store
                 .read()
-                .extension(&ExtensionKey::new("picker"))
+                .extension(&ExtensionKey::local("picker"))
                 .is_some()
         );
 
         // Removal un-resolves it and rebuilds again.
-        store.remove_extension(&ExtensionKey::new("picker"));
+        store.remove_extension(&ExtensionKey::local("picker"));
         let removed = route_ref(&store);
         assert!(removed.object.is_none());
         let revision_final = store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
@@ -2372,7 +2421,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             .upsert_listener(&bkey("b"), http_listener("l"))
             .unwrap();
         store.upsert_http_route(&lkey("b", "l"), http_route_with_ref("r", "picker"));
-        let ekey = ExtensionKey::new("picker");
+        let ekey = ExtensionKey::local("picker");
         assert!(store.inner.read().routes_by_extension[&ekey].contains(&rkey("b", "l", "r")));
         store.remove_http_route(&rkey("b", "l", "r"));
         assert!(!store.inner.read().routes_by_extension[&ekey].contains(&rkey("b", "l", "r")));
@@ -2393,7 +2442,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         assert!(
             store
                 .read()
-                .extension(&ExtensionKey::new("picker"))
+                .extension(&ExtensionKey::local("picker"))
                 .is_some()
         );
     }

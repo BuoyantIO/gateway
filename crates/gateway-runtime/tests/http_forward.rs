@@ -1278,6 +1278,7 @@ impl Extension for Stamp {
 /// with defaults everywhere else.
 fn extension_object(class: &str) -> gateway_config::extension::Extension {
     gateway_config::extension::Extension {
+        namespace: String::new(),
         name: class.into(),
         class: class.into(),
         failure_mode: FailureMode::default(),
@@ -1287,7 +1288,10 @@ fn extension_object(class: &str) -> gateway_config::extension::Extension {
 }
 
 fn extension_ref_config(bind_port: u16, upstream_port: u16, class: &str) -> GatewayConfig {
-    let filter = HttpFilter::ExtensionRef { name: class.into() };
+    let filter = HttpFilter::ExtensionRef {
+        name: class.into(),
+        namespace: String::new(),
+    };
     GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -1451,9 +1455,11 @@ async fn failure_mode_decides_what_a_hook_error_does() {
         let mut route = http_route("r", "/", "be");
         route.filters.push(HttpFilter::ExtensionRef {
             name: "flaky".into(),
+            namespace: String::new(),
         });
         route.filters.push(HttpFilter::ExtensionRef {
             name: "stamp".into(),
+            namespace: String::new(),
         });
         let mut flaky_object = extension_object("flaky");
         flaky_object.failure_mode = mode;
@@ -1597,7 +1603,7 @@ async fn extension_object_lifecycle_drives_the_route() {
     );
 
     // Removal returns the route to 500.
-    store.remove_extension(&gateway_state::ExtensionKey::new("stamp"));
+    store.remove_extension(&gateway_state::ExtensionKey::local("stamp"));
     let resp = client.get(url).await.expect("request failed");
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -2407,6 +2413,7 @@ fn selection_config(bind_port: u16, be_a: u16, be_b: u16) -> GatewayConfig {
     });
     route.filters.push(HttpFilter::ExtensionRef {
         name: "picker".into(),
+        namespace: String::new(),
     });
     GatewayConfig {
         name: "test".into(),
@@ -2629,9 +2636,11 @@ async fn two_selectors_on_one_rule_fail_the_request() {
     let mut route = http_route("doubled", "/", "be-a");
     route.filters.push(HttpFilter::ExtensionRef {
         name: "picker-one".into(),
+        namespace: String::new(),
     });
     route.filters.push(HttpFilter::ExtensionRef {
         name: "picker-two".into(),
+        namespace: String::new(),
     });
     let cfg = GatewayConfig {
         name: "test".into(),

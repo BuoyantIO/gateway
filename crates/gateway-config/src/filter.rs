@@ -24,7 +24,12 @@ pub enum HttpFilter {
     /// given extension at most once.
 
     #[serde(rename_all = "camelCase")]
-    ExtensionRef { name: String },
+    ExtensionRef {
+        name: String,
+        /// Empty for a flat local config, which has no namespaces.
+        #[serde(default)]
+        namespace: String,
+    },
 }
 
 /// A redirect's settings — the `RequestRedirect` class's config
@@ -155,7 +160,7 @@ impl HttpFilter {
             Self::RequestHeaderModifier { name, .. }
             | Self::ResponseHeaderModifier { name, .. }
             | Self::RequestRedirect { name, .. }
-            | Self::ExtensionRef { name } => name,
+            | Self::ExtensionRef { name, .. } => name,
         }
     }
 }

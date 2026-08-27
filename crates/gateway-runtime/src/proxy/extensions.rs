@@ -90,11 +90,11 @@ impl ExtensionCache {
 fn resolve(registry: &Registry, route: &ActiveHttpRoute) -> ResolveResult {
     let mut extensions = Vec::with_capacity(route.filters.len());
     for (i, filter) in route.filters.iter().enumerate() {
-        let resolved = if let HttpFilter::ExtensionRef { name } = filter {
+        let resolved = if let HttpFilter::ExtensionRef { name, namespace } = filter {
             let object = route
                 .extensions
                 .iter()
-                .find(|e| e.key.0 == *name)
+                .find(|e| e.key.name == *name && e.key.namespace == *namespace)
                 .and_then(|e| e.object.as_ref())
                 .ok_or_else(|| {
                     Arc::<str>::from(format!("filter {i}: extension `{name}` is not registered"))
@@ -205,6 +205,7 @@ mod tests {
 
     fn object(name: &str, limits: Limits) -> Arc<ExtensionObject> {
         Arc::new(ExtensionObject {
+            namespace: String::new(),
             name: name.into(),
             class: "selector".into(),
             failure_mode: FailureMode::default(),
@@ -222,13 +223,14 @@ mod tests {
                 .iter()
                 .map(|(name, _)| HttpFilter::ExtensionRef {
                     name: (*name).to_owned(),
+                    namespace: String::new(),
                 })
                 .collect(),
             backends: vec![],
             extensions: refs
                 .iter()
                 .map(|(name, object)| ActiveExtensionRef {
-                    key: ExtensionKey::new(*name),
+                    key: ExtensionKey::local(*name),
                     object: object.clone(),
                 })
                 .collect(),

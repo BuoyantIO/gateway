@@ -51,6 +51,7 @@ message Upsert {
     HttpRouteUpsert http_route = 12;
     BackendUpsert   backend    = 13;
     SecretUpsert    secret     = 14;
+    ExtensionUpsert extension  = 15;
   }
 }
 
@@ -61,6 +62,7 @@ message Remove {
     RouteKey    http_route = 12;
     BackendKey  backend    = 13;
     SecretKey   secret     = 14;
+    ExtensionKey extension  = 15;
   }
 }
 
@@ -71,6 +73,7 @@ message ListenerKey { string bind = 1; string name = 2; }
 message RouteKey    { string bind = 1; string listener = 2; string name = 3; }
 message BackendKey  { string name = 1; }
 message SecretKey   { string namespace = 1; string name = 2; }
+message ExtensionKey { string namespace = 1; string name = 2; }
 
 // -------- Bind --------
 
@@ -114,6 +117,38 @@ message SecretUpsert {
   string name      = 2;
   string cert_pem  = 3;
   string key_pem   = 4;
+}
+
+// -------- Extension --------
+
+enum FailureMode {
+  FAILURE_MODE_UNSPECIFIED = 0;  // Closed (the default)
+  FAILURE_MODE_CLOSED      = 1;
+  FAILURE_MODE_OPEN        = 2;
+}
+
+enum RequestBodyLimit {
+  REQUEST_BODY_LIMIT_UNSPECIFIED = 0;  // no ceiling
+  REQUEST_BODY_LIMIT_NONE        = 1;
+  REQUEST_BODY_LIMIT_STREAM      = 2;
+  REQUEST_BODY_LIMIT_BUFFER      = 3;
+}
+
+message ExtensionLimits {
+  RequestBodyLimit request_body     = 1;
+  uint64           max_buffer_bytes = 2;  // 0 = no cap
+}
+
+message ExtensionUpsert {
+  string          namespace    = 1;
+  string          name         = 2;
+  string          class        = 3;
+  FailureMode     failure_mode = 4;
+  ExtensionLimits limits       = 5;
+  // The class's opaque config, as YAML. A string rather than a
+  // structured value: the gateway never reads a key inside it, and
+  // YAML keeps integers exact where a JSON-model Struct cannot.
+  string          config_yaml  = 6;
 }
 
 // -------- HttpRoute --------
@@ -186,7 +221,15 @@ message HttpFilter {
     RequestHeaderModifier  request_header_modifier  = 1;
     ResponseHeaderModifier response_header_modifier = 2;
     RequestRedirect        request_redirect         = 3;
+    ExtensionRef           extension_ref            = 4;
   }
+}
+
+// Runs the Extension object it names. The name is also the filter's
+// identity within the rule.
+message ExtensionRef {
+  string name      = 1;
+  string namespace = 2;  // "" = the route's own scope
 }
 
 message RequestHeaderModifier {
