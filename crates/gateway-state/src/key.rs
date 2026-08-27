@@ -59,17 +59,32 @@ impl fmt::Display for RouteKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExtensionKey(pub String);
+pub struct ExtensionKey {
+    pub namespace: String,
+    pub name: String,
+}
 
 impl ExtensionKey {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+
+    /// A key with no namespace — a flat local config.
+    pub fn local(name: impl Into<String>) -> Self {
+        Self::new("", name)
     }
 }
 
 impl fmt::Display for ExtensionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        if self.namespace.is_empty() {
+            f.write_str(&self.name)
+        } else {
+            write!(f, "{}/{}", self.namespace, self.name)
+        }
     }
 }
 
@@ -128,4 +143,5 @@ pub struct RegisteredKeys {
     pub routes: HashSet<RouteKey>,
     pub backends: HashSet<BackendKey>,
     pub secrets: HashSet<SecretKey>,
+    pub extensions: HashSet<ExtensionKey>,
 }

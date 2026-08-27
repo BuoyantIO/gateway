@@ -48,6 +48,33 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // sanity test that constructs every variant
     fn config_update_with_upserts_and_removes_constructs() {
+        let extension_upsert = v1::ExtensionUpsert {
+            namespace: "inference".into(),
+            name: "picker".into(),
+            class: "bllmp_selector".into(),
+            failure_mode: v1::FailureMode::Closed as i32,
+            limits: Some(v1::ExtensionLimits {
+                request_body: v1::RequestBodyLimit::Stream as i32,
+                max_buffer_bytes: 1_048_576,
+            }),
+            config_yaml: "service: bllmp.svc:50051".into(),
+        };
+        let _ = v1::Upsert {
+            body: Some(v1::upsert::Body::Extension(extension_upsert)),
+        };
+        let _ = v1::Remove {
+            key: Some(v1::remove::Key::Extension(v1::ExtensionKey {
+                namespace: "inference".into(),
+                name: "picker".into(),
+            })),
+        };
+        let _ = v1::HttpFilter {
+            kind: Some(v1::http_filter::Kind::ExtensionRef(v1::ExtensionRef {
+                name: "picker".into(),
+                namespace: "inference".into(),
+            })),
+        };
+
         let bind_upsert = v1::BindUpsert {
             name: "demo/api-gw/http".into(),
             address: "0.0.0.0".into(),

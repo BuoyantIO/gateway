@@ -2,7 +2,7 @@
 //! translation; no caching, no network.
 
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey, Store};
+use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey, Store};
 
 use crate::convert;
 use crate::error::Error;
@@ -22,6 +22,7 @@ pub struct Affected {
     pub routes: Vec<RouteKey>,
     pub backends: Vec<BackendKey>,
     pub secrets: Vec<SecretKey>,
+    pub extensions: Vec<ExtensionKey>,
 }
 
 /// Apply one batched `ConfigUpdate`. Upserts first, then removes.
@@ -73,6 +74,12 @@ fn apply_upsert(store: &Store, upsert: pb::Upsert, out: &mut Affected) -> Result
             store.upsert_secret(secret);
             out.secrets.push(key);
         }
+        pb::upsert::Body::Extension(e) => {
+            let ext = convert::extension(e)?;
+            let key = ExtensionKey::new(ext.namespace.clone(), ext.name.clone());
+            store.upsert_extension(ext);
+            out.extensions.push(key);
+        }
     }
     Ok(())
 }
@@ -107,6 +114,11 @@ fn apply_remove(store: &Store, remove: pb::Remove, out: &mut Affected) {
             let k = convert::secret_key(k);
             store.remove_secret(&k);
             out.secrets.push(k);
+        }
+        pb::remove::Key::Extension(k) => {
+            let k = convert::extension_key(k);
+            store.remove_extension(&k);
+            out.extensions.push(k);
         }
     }
 }
@@ -577,6 +589,120 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         let bind = store.read().bind(&BindKey::new("b")).unwrap();
         let r = &bind.listeners[0].routes[0];
         assert!(r.filters.is_empty());
+    }
+
+    // ----- extensions -----
+
+    fn extension_upsert(name: &str, config_yaml: &str) -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Extension(pb::ExtensionUpsert {
+                namespace: "ns".into(),
+                name: name.into(),
+                class: "bllmp_selector".into(),
+                failure_mode: pb::FailureMode::Open as i32,
+                limits: Some(pb::ExtensionLimits {
+                    request_body: pb::RequestBodyLimit::Stream as i32,
+                    max_buffer_bytes: 0,
+                }),
+                config_yaml: config_yaml.into(),
+            })),
+        }
+    }
+
+    #[test]
+    fn extension_upsert_lands_in_store() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(
+                vec![extension_upsert(
+                    "picker",
+                    "service: bllmp.svc:50051\npool: { namespace: inference, name: p }\n",
+                )],
+                vec![],
+            ),
+        )
+        .expect("apply ok");
+        let ext = store
+            .read()
+            .extension(&gateway_state::ExtensionKey::new("ns", "picker"))
+            .expect("extension present");
+        assert_eq!(ext.class, "bllmp_selector");
+        assert_eq!(
+            ext.failure_mode,
+            gateway_config::extension::FailureMode::Open
+        );
+        assert_eq!(
+            ext.limits.request_body,
+            Some(gateway_config::extension::RequestBodyLimit::Stream)
+        );
+        assert!(ext.limits.max_buffer_bytes.is_none());
+        // The opaque config parsed into a value, nested keys intact.
+        assert_eq!(ext.config["service"], "bllmp.svc:50051");
+        assert_eq!(ext.config["pool"]["namespace"], "inference");
+    }
+
+    #[test]
+    fn extension_defaults_map_to_closed_and_no_limits() {
+        let store = Store::new();
+        let upsert = pb::Upsert {
+            body: Some(pb::upsert::Body::Extension(pb::ExtensionUpsert {
+                namespace: String::new(),
+                name: "x".into(),
+                class: "c".into(),
+                failure_mode: pb::FailureMode::Unspecified as i32,
+                limits: None,
+                config_yaml: String::new(),
+            })),
+        };
+        apply_update(&store, batch(vec![upsert], vec![])).expect("apply ok");
+        let ext = store
+            .read()
+            .extension(&gateway_state::ExtensionKey::local("x"))
+            .expect("extension present");
+        assert_eq!(
+            ext.failure_mode,
+            gateway_config::extension::FailureMode::Closed
+        );
+        assert!(ext.limits.request_body.is_none());
+        assert!(ext.config.is_null());
+    }
+
+    #[test]
+    fn invalid_extension_config_yaml_is_rejected() {
+        let store = Store::new();
+        let err = apply_update(
+            &store,
+            batch(vec![extension_upsert("bad", ": not yaml : [")], vec![]),
+        )
+        .expect_err("bad yaml must fail");
+        assert!(err.to_string().contains("invalid extension"), "{err}");
+    }
+
+    #[test]
+    fn remove_extension_evicts() {
+        let store = Store::new();
+        apply_update(&store, batch(vec![extension_upsert("picker", "")], vec![])).unwrap();
+        apply_update(
+            &store,
+            pb::ConfigUpdate {
+                upserts: vec![],
+                removes: vec![pb::Remove {
+                    key: Some(pb::remove::Key::Extension(pb::ExtensionKey {
+                        namespace: "ns".into(),
+                        name: "picker".into(),
+                    })),
+                }],
+                sync_complete: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            store
+                .read()
+                .extension(&gateway_state::ExtensionKey::new("ns", "picker"))
+                .is_none()
+        );
     }
 
     // ----- secrets -----

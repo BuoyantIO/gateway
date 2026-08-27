@@ -208,6 +208,7 @@ mod tests {
 
     fn object(name: &str, class: &str, limits: Limits) -> Extension {
         Extension {
+            namespace: String::new(),
             name: name.into(),
             class: class.into(),
             failure_mode: FailureMode::default(),

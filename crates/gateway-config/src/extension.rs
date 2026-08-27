@@ -29,6 +29,9 @@ pub fn from_value<T: serde::de::DeserializeOwned>(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Extension {
+    /// Empty for a flat local config, which has no namespaces.
+    #[serde(default)]
+    pub namespace: String,
     /// Identity routes reference.
     pub name: String,
     /// The registered class that interprets `config` — e.g. the

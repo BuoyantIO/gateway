@@ -724,6 +724,7 @@ dependencies = [
  "http",
  "rand 0.9.4",
  "regex",
+ "serde_yaml",
  "thiserror",
  "tokio",
  "tokio-stream",

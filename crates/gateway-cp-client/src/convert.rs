@@ -11,6 +11,7 @@ use std::net::IpAddr;
 
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
+use gateway_config::extension::{ConfigValue, Extension, FailureMode, Limits, RequestBodyLimit};
 use gateway_config::filter::{
     HeaderOps, HeaderPair, HttpFilter, RedirectConfig, RedirectPath, RedirectStatus, Scheme,
 };
@@ -23,7 +24,7 @@ use gateway_config::route::{
 };
 use gateway_config::secret::TlsSecret;
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
+use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 
 use crate::error::Error;
 
@@ -144,6 +145,50 @@ pub fn secret(msg: pb::SecretUpsert) -> Result<TlsSecret, Error> {
         .map_err(|source| Error::InvalidSecret { name, source })
 }
 
+/// # Errors
+/// Returns [`Error::InvalidExtension`] if `config_yaml` is not valid
+/// YAML (parsed up front so a bad object is rejected here rather than
+/// at resolution time) or an enum value is unknown.
+pub fn extension(msg: pb::ExtensionUpsert) -> Result<Extension, Error> {
+    let failure_mode = match pb::FailureMode::try_from(msg.failure_mode) {
+        Ok(pb::FailureMode::Open) => FailureMode::Open,
+        // Closed, Unspecified (unset) both default to Closed.
+        Ok(_) => FailureMode::Closed,
+        Err(_) => {
+            return Err(Error::UnsupportedEnum {
+                kind: "FailureMode",
+                value: msg.failure_mode,
+            });
+        }
+    };
+    let limits = msg.limits.map_or_else(Limits::default, |l| Limits {
+        request_body: match pb::RequestBodyLimit::try_from(l.request_body) {
+            Ok(pb::RequestBodyLimit::None) => Some(RequestBodyLimit::None),
+            Ok(pb::RequestBodyLimit::Stream) => Some(RequestBodyLimit::Stream),
+            Ok(pb::RequestBodyLimit::Buffer) => Some(RequestBodyLimit::Buffer),
+            // Unspecified or unknown: no ceiling.
+            _ => None,
+        },
+        max_buffer_bytes: (l.max_buffer_bytes != 0).then_some(l.max_buffer_bytes),
+    });
+    let config = if msg.config_yaml.is_empty() {
+        ConfigValue::Null
+    } else {
+        serde_yaml::from_str(&msg.config_yaml).map_err(|source| Error::InvalidExtension {
+            name: ExtensionKey::new(msg.namespace.clone(), msg.name.clone()).to_string(),
+            source,
+        })?
+    };
+    Ok(Extension {
+        namespace: msg.namespace,
+        name: msg.name,
+        class: msg.class,
+        failure_mode,
+        limits,
+        config,
+    })
+}
+
 // ==================== Remove keys ====================
 
 pub fn bind_key(msg: pb::BindKey) -> BindKey {
@@ -167,6 +212,10 @@ pub fn backend_key(msg: pb::BackendKey) -> BackendKey {
 
 pub fn secret_key(msg: pb::SecretKey) -> SecretKey {
     SecretKey::new(msg.namespace, msg.name)
+}
+
+pub fn extension_key(msg: pb::ExtensionKey) -> ExtensionKey {
+    ExtensionKey::new(msg.namespace, msg.name)
 }
 
 // ==================== Pieces ====================
@@ -333,6 +382,10 @@ fn http_filter(msg: pb::HttpFilter) -> Option<HttpFilter> {
                 },
             })
         }
+        pb::http_filter::Kind::ExtensionRef(er) => Some(HttpFilter::ExtensionRef {
+            name: er.name,
+            namespace: er.namespace,
+        }),
     }
 }
 
