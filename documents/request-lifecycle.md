@@ -15,7 +15,12 @@ Names in this document are API names you can grep for.
 ## Preconditions
 
 The `Store` holds the active configuration: binds, listeners, routes
-(matches, filters, backendRefs), backends and their endpoints. Two
+(matches, filters, backendRefs), and backends. A backend is one of
+two kinds (`ActiveBackendKind`): a set of endpoints the request path
+balances over, or a dialable host. Everything below describes the
+endpoint set — the dialable kind is not constructed by the control
+plane and no path reaches it, so a route ref naming one resolves but
+offers no endpoint, and the pick answers 503 `no_endpoint`. Two
 things live beside it: per-endpoint runtime state (`EndpointInfo`:
 in-flight count, latency estimate, eviction), which persists across
 requests, and the extension `Registry`, one `ExtensionBuilder` per
@@ -275,8 +280,8 @@ weighted draw — a re-route would send traffic somewhere the selector
 was configured to decide against); the target names a backend outside
 the rule's refs, or a ref whose backend is not registered, or an
 address the backend does not list; the target is a dialable backend
-(`Target::Backend`), which does not exist in state yet; the body
-source cannot be honored.
+(`Target::Backend`), which nothing dials yet; the body source cannot
+be honored.
 
 ## Framing and dispatch
 
@@ -304,7 +309,9 @@ be rejected.
 
 ## Upstream answer
 
-A pick that finds no endpoints answers 503, reason `no_endpoint`. An
+A pick that finds no endpoints answers 503, reason `no_endpoint` —
+an endpoint set whose members are all gone, or a dialable backend,
+which has no endpoints by construction. An
 in-flight guard (`ActiveHandle`) is held on the chosen endpoint's
 `EndpointInfo` from the pick until the request handler returns. The
 count it maintains is an input to the balanced pick; acquiring it

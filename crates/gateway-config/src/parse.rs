@@ -230,9 +230,53 @@ gatewayConfig:
 ",
         )
         .unwrap();
-        let Backend::Static(b) = &cfg.backends[0];
+        let Backend::Static(b) = &cfg.backends[0] else {
+            panic!("expected a static backend");
+        };
         assert_eq!(b.endpoints.len(), 3);
         assert_eq!(b.endpoints[0].port, 8080);
+    }
+
+    #[test]
+    fn dialable_backend() {
+        let cfg = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: provider
+      type: Dialable
+      host: api.example.com
+      port: 443
+      pathPrefix: /v1
+",
+        )
+        .unwrap();
+        let Backend::Dialable(b) = &cfg.backends[0] else {
+            panic!("expected a dialable backend");
+        };
+        assert_eq!(b.host, "api.example.com");
+        assert_eq!(b.port, 443);
+        assert_eq!(b.path_prefix.as_deref(), Some("/v1"));
+    }
+
+    #[test]
+    fn dialable_backend_path_prefix_is_optional() {
+        let cfg = parse_yaml(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - { name: provider, type: Dialable, host: api.example.com, port: 443 }
+",
+        )
+        .unwrap();
+        let Backend::Dialable(b) = &cfg.backends[0] else {
+            panic!("expected a dialable backend");
+        };
+        assert!(b.path_prefix.is_none());
     }
 
     #[test]
