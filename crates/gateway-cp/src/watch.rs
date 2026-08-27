@@ -47,6 +47,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use tokio::sync::watch as tokio_watch;
 
 use crate::admin::ReadyState;
+use crate::crd::Extension;
 use crate::infra::{self, InfraPublisher};
 use crate::resolve::{SERVICE_NAME_LABEL, resolve};
 use crate::server::ServerState;
@@ -55,13 +56,14 @@ use crate::translator::{K8sState, translate_resolution};
 
 /// The resource kinds the loop watches, in reflector order. Also the
 /// initial pending set for the readiness endpoint.
-pub const WATCHED_KINDS: [&str; 6] = [
+pub const WATCHED_KINDS: [&str; 7] = [
     "GatewayClass",
     "Gateway",
     "HTTPRoute",
     "Service",
     "EndpointSlice",
     "Secret",
+    "Extension",
 ];
 
 #[derive(Debug, Error)]
@@ -119,14 +121,20 @@ pub async fn run(
         reflector::reflector(es_writer, watcher::watcher(es_api, es_config)).boxed();
 
     let (sec_store, sec_writer) = reflector::store::<Secret>();
-    let sec_api: Api<Secret> = Api::all(client);
+    let sec_api: Api<Secret> = Api::all(client.clone());
     let sec_config = Config::default().fields("type=kubernetes.io/tls");
     let mut sec_stream =
         reflector::reflector(sec_writer, watcher::watcher(sec_api, sec_config)).boxed();
 
+    let (ext_store, ext_writer) = reflector::store::<Extension>();
+    let ext_api: Api<Extension> = Api::all(client);
+    let mut ext_stream =
+        reflector::reflector(ext_writer, watcher::watcher(ext_api, Config::default())).boxed();
+
     let mut gc_filter = EventFilter::generation_only();
     let mut gw_filter = EventFilter::generation_and_annotations();
     let mut hr_filter = EventFilter::generation_only();
+    let mut ext_filter = EventFilter::generation_only();
 
     let mut sync = SyncTracker::new();
 
@@ -144,13 +152,14 @@ pub async fn run(
             ev = svc_stream.next() => { sync.mark("Service", ev.as_ref()); EventFilter::always("Service", ev) }
             ev = es_stream.next() => { sync.mark("EndpointSlice", ev.as_ref()); EventFilter::always("EndpointSlice", ev) }
             ev = sec_stream.next() => { sync.mark("Secret", ev.as_ref()); EventFilter::always("Secret", ev) }
+            ev = ext_stream.next() => { sync.mark("Extension", ev.as_ref()); ext_filter.relevant("Extension", ev) }
         };
         if !relevant {
             continue;
         }
 
         let k8s = collect_state(
-            &gc_store, &gw_store, &hr_store, &svc_store, &es_store, &sec_store,
+            &gc_store, &gw_store, &hr_store, &svc_store, &es_store, &sec_store, &ext_store,
         );
         let resolution = resolve(&k8s, &controller_name);
         let world = translate_resolution(&resolution);
@@ -247,6 +256,7 @@ fn collect_state(
     svc: &ReflectorStore<Service>,
     es: &ReflectorStore<EndpointSlice>,
     sec: &ReflectorStore<Secret>,
+    ext: &ReflectorStore<Extension>,
 ) -> K8sState {
     K8sState {
         gateway_classes: gc.state().iter().map(|a| (**a).clone()).collect(),
@@ -255,6 +265,7 @@ fn collect_state(
         services: svc.state().iter().map(|a| (**a).clone()).collect(),
         endpoint_slices: es.state().iter().map(|a| (**a).clone()).collect(),
         secrets: sec.state().iter().map(|a| (**a).clone()).collect(),
+        extensions: ext.state().iter().map(|a| (**a).clone()).collect(),
     }
 }
 

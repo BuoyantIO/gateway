@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use gateway_cp_proto::v1 as pb;
-use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, SecretKey};
+use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 
 use crate::snapshot::Snapshot;
 
@@ -24,6 +24,7 @@ pub fn diff(prev: &Snapshot, next: &Snapshot) -> Option<pb::ConfigUpdate> {
     diff_binds(prev, next, &mut upserts, &mut removes);
     diff_backends(prev, next, &mut upserts, &mut removes);
     diff_secrets(prev, next, &mut upserts, &mut removes);
+    diff_extensions(prev, next, &mut upserts, &mut removes);
     diff_listeners(prev, next, &mut upserts, &mut removes);
     diff_routes(prev, next, &mut upserts, &mut removes);
 
@@ -156,6 +157,34 @@ fn diff_secrets(
     }
 }
 
+fn diff_extensions(
+    prev: &Snapshot,
+    next: &Snapshot,
+    upserts: &mut Vec<pb::Upsert>,
+    removes: &mut Vec<pb::Remove>,
+) {
+    let keys: HashSet<&ExtensionKey> = prev
+        .extensions
+        .keys()
+        .chain(next.extensions.keys())
+        .collect();
+    for k in keys {
+        match (prev.extensions.get(k), next.extensions.get(k)) {
+            (Some(p), Some(n)) if p == n => {}
+            (_, Some(n)) => upserts.push(pb::Upsert {
+                body: Some(pb::upsert::Body::Extension(n.clone())),
+            }),
+            (Some(_), None) => removes.push(pb::Remove {
+                key: Some(pb::remove::Key::Extension(pb::ExtensionKey {
+                    namespace: k.namespace.clone(),
+                    name: k.name.clone(),
+                })),
+            }),
+            (None, None) => unreachable!(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +258,45 @@ mod tests {
         // b removed, c added.
         assert_eq!(batch.upserts.len(), 1);
         assert_eq!(batch.removes.len(), 1);
+    }
+
+    fn upsert_extension(ns: &str, name: &str, class: &str) -> pb::ExtensionUpsert {
+        pb::ExtensionUpsert {
+            namespace: ns.into(),
+            name: name.into(),
+            class: class.into(),
+            failure_mode: pb::FailureMode::Closed as i32,
+            limits: None,
+            config_yaml: String::new(),
+        }
+    }
+
+    #[test]
+    fn extension_change_yields_upsert_and_delete_yields_namespaced_remove() {
+        let mut prev = Snapshot::default();
+        prev.extensions.insert(
+            ExtensionKey::new("apps", "picker"),
+            upsert_extension("apps", "picker", "a"),
+        );
+        let mut next = Snapshot::default();
+        next.extensions.insert(
+            ExtensionKey::new("apps", "picker"),
+            upsert_extension("apps", "picker", "b"),
+        );
+        let batch = diff(&prev, &next).expect("diff");
+        assert!(matches!(
+            batch.upserts[0].body,
+            Some(pb::upsert::Body::Extension(_))
+        ));
+
+        let batch = diff(&next, &Snapshot::default()).expect("diff");
+        match &batch.removes[0].key {
+            Some(pb::remove::Key::Extension(k)) => {
+                assert_eq!(k.namespace, "apps");
+                assert_eq!(k.name, "picker");
+            }
+            other => panic!("expected extension remove, got {other:?}"),
+        }
     }
 
     #[test]

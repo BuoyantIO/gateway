@@ -12,14 +12,16 @@ use gateway_api::apis::standard::gateways::{
 };
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
-    HttpRouteRulesFilters, HttpRouteRulesFiltersRequestHeaderModifier,
-    HttpRouteRulesFiltersRequestHeaderModifierAdd, HttpRouteRulesFiltersRequestRedirect,
-    HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesFiltersResponseHeaderModifier,
-    HttpRouteRulesFiltersResponseHeaderModifierAdd, HttpRouteRulesFiltersType,
-    HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType,
-    HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath, HttpRouteRulesMatchesPathType,
-    HttpRouteRulesMatchesQueryParams, HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
+    HttpRouteRulesFilters, HttpRouteRulesFiltersExtensionRef,
+    HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestHeaderModifierAdd,
+    HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectScheme,
+    HttpRouteRulesFiltersResponseHeaderModifier, HttpRouteRulesFiltersResponseHeaderModifierAdd,
+    HttpRouteRulesFiltersType, HttpRouteRulesMatches, HttpRouteRulesMatchesHeaders,
+    HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPath,
+    HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
+    HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
+use gateway_cp::crd::{Extension, ExtensionSpec, FailureMode, Limits};
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -420,6 +422,29 @@ impl HttpRouteBuilder {
         self
     }
 
+    /// Attach an `ExtensionRef` filter pointing at a same-namespace
+    /// `Extension` object.
+    pub fn filter_extension_ref(mut self, name: &str) -> Self {
+        self.pending
+            .filters
+            .get_or_insert_with(Vec::new)
+            .push(HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::ExtensionRef,
+                request_header_modifier: None,
+                response_header_modifier: None,
+                request_redirect: None,
+                url_rewrite: None,
+                request_mirror: None,
+                cors: None,
+                extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                    group: "gateway.linkerd.io".into(),
+                    kind: "Extension".into(),
+                    name: name.into(),
+                }),
+            });
+        self
+    }
+
     pub fn backend(mut self, name: &str, port: i32) -> Self {
         let br = HttpRouteRulesBackendRefs {
             name: name.into(),
@@ -748,5 +773,56 @@ pub async fn delete_http_route(client: &Client, ns: &str, name: &str) -> Result<
         .delete(name, &DeleteParams::default())
         .await
         .with_context(|| format!("deleting HTTPRoute {ns}/{name}"))?;
+    Ok(())
+}
+
+/// Build an `Extension` object with default `failureMode` / `limits`.
+/// `config` is the class-specific object, passed through verbatim.
+#[must_use]
+pub fn extension(ns: &str, name: &str, class: &str, config: serde_json::Value) -> Extension {
+    let mut ext = Extension::new(
+        name,
+        ExtensionSpec {
+            class: class.into(),
+            failure_mode: FailureMode::default(),
+            limits: Limits::default(),
+            config,
+        },
+    );
+    ext.metadata.namespace = Some(ns.into());
+    ext
+}
+
+/// Create an `Extension` object.
+///
+/// # Errors
+/// Returns an error if the create call fails.
+pub async fn apply_extension(client: &Client, ext: &Extension) -> Result<()> {
+    let ns = ext
+        .metadata
+        .namespace
+        .as_deref()
+        .context("Extension has no namespace")?;
+    Api::<Extension>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), ext)
+        .await
+        .with_context(|| {
+            format!(
+                "creating Extension {}",
+                ext.metadata.name.as_deref().unwrap_or("?")
+            )
+        })?;
+    Ok(())
+}
+
+/// Delete an `Extension` by name.
+///
+/// # Errors
+/// Returns an error if the delete call fails.
+pub async fn delete_extension(client: &Client, ns: &str, name: &str) -> Result<()> {
+    Api::<Extension>::namespaced(client.clone(), ns)
+        .delete(name, &DeleteParams::default())
+        .await
+        .with_context(|| format!("deleting Extension {ns}/{name}"))?;
     Ok(())
 }

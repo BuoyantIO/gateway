@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 
-use crate::apply::apply_update;
+use crate::apply::{Affected, apply_update};
 use crate::error::Error;
 
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
@@ -118,21 +118,7 @@ async fn run_session(
         };
 
         if let Some(seen) = bootstrap_seen.as_mut() {
-            for k in &outcome.upserted.binds {
-                seen.binds.insert(k.clone());
-            }
-            for k in &outcome.upserted.listeners {
-                seen.listeners.insert(k.clone());
-            }
-            for k in &outcome.upserted.routes {
-                seen.routes.insert(k.clone());
-            }
-            for k in &outcome.upserted.backends {
-                seen.backends.insert(k.clone());
-            }
-            for k in &outcome.upserted.secrets {
-                seen.secrets.insert(k.clone());
-            }
+            accumulate(seen, &outcome.upserted);
         }
 
         if sync_complete {
@@ -180,6 +166,30 @@ impl Backoff {
     }
 }
 
+/// Record every upserted key into the bootstrap keep-set. Every kind
+/// must be listed: a kind missing here is purged by `Store::retain`
+/// the moment the bootstrap completes.
+fn accumulate(seen: &mut RegisteredKeys, upserted: &Affected) {
+    for k in &upserted.binds {
+        seen.binds.insert(k.clone());
+    }
+    for k in &upserted.listeners {
+        seen.listeners.insert(k.clone());
+    }
+    for k in &upserted.routes {
+        seen.routes.insert(k.clone());
+    }
+    for k in &upserted.backends {
+        seen.backends.insert(k.clone());
+    }
+    for k in &upserted.secrets {
+        seen.secrets.insert(k.clone());
+    }
+    for k in &upserted.extensions {
+        seen.extensions.insert(k.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +217,30 @@ mod tests {
         b.reset();
         let d = b.next();
         assert!(d <= BACKOFF_INITIAL * 2, "{d:?} should be ~initial");
+    }
+
+    #[test]
+    fn accumulate_records_every_kind() {
+        use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
+        let upserted = Affected {
+            binds: vec![BindKey::new("b")],
+            listeners: vec![ListenerKey::new(BindKey::new("b"), "l")],
+            routes: vec![RouteKey::new(ListenerKey::new(BindKey::new("b"), "l"), "r")],
+            backends: vec![BackendKey::new("be")],
+            secrets: vec![SecretKey::local("s")],
+            extensions: vec![ExtensionKey::local("e")],
+        };
+        let mut seen = RegisteredKeys::default();
+        accumulate(&mut seen, &upserted);
+        assert_eq!(seen.binds.len(), 1);
+        assert_eq!(seen.listeners.len(), 1);
+        assert_eq!(seen.routes.len(), 1);
+        assert_eq!(seen.backends.len(), 1);
+        assert_eq!(seen.secrets.len(), 1);
+        assert_eq!(
+            seen.extensions.len(),
+            1,
+            "extensions must survive the bootstrap purge"
+        );
     }
 }

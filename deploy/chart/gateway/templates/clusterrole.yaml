@@ -19,6 +19,10 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  # Extension objects routes reference by extensionRef.
+  - apiGroups: ["gateway.linkerd.io"]
+    resources: ["extensions"]
+    verbs: ["get", "list", "watch"]
   # Per-pod backend endpoints.
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
