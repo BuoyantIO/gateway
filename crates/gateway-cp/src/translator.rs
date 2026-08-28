@@ -1635,12 +1635,10 @@ mod tests {
         let names: Vec<&str> = route
             .filters
             .iter()
-            .map(|f| match f.kind.as_ref().expect("kind set") {
-                pb::http_filter::Kind::ExtensionRef(er) => {
-                    assert_eq!(er.namespace, "demo");
-                    er.name.as_str()
-                }
-                other => panic!("expected ExtensionRef, got {other:?}"),
+            .map(|f| {
+                let pb::http_filter::Kind::ExtensionRef(er) = f.kind.as_ref().expect("kind set");
+                assert_eq!(er.namespace, "demo");
+                er.name.as_str()
             })
             .collect();
         assert_eq!(names, vec!["r~r0~f0", "r~r0~f1"]);
@@ -1697,13 +1695,9 @@ mod tests {
         let mut extensions = HashMap::new();
         let out = translate_filter(&filter, "ns", "r", 0, 0, &mut extensions)
             .expect("redirect translated");
-        match out.kind.expect("kind set") {
-            pb::http_filter::Kind::ExtensionRef(er) => {
-                assert_eq!(er.name, "r~r0~f0");
-                assert_eq!(er.namespace, "ns");
-            }
-            other => panic!("expected ExtensionRef, got {other:?}"),
-        }
+        let pb::http_filter::Kind::ExtensionRef(er) = out.kind.expect("kind set");
+        assert_eq!(er.name, "r~r0~f0");
+        assert_eq!(er.namespace, "ns");
         let upsert = &extensions[&ExtensionKey::new("ns", "r~r0~f0")];
         assert_eq!(upsert.class, "request_redirect");
         let redirect: RedirectConfig = serde_yaml::from_str(&upsert.config_yaml).expect("parses");
@@ -1773,9 +1767,9 @@ mod tests {
         let names: Vec<&str> = route
             .filters
             .iter()
-            .map(|f| match f.kind.as_ref().expect("kind set") {
-                pb::http_filter::Kind::ExtensionRef(er) => er.name.as_str(),
-                other => panic!("expected ExtensionRef, got {other:?}"),
+            .map(|f| {
+                let pb::http_filter::Kind::ExtensionRef(er) = f.kind.as_ref().expect("kind set");
+                er.name.as_str()
             })
             .collect();
         assert_eq!(names, vec!["r~r0~f0", "picker", "r~r0~f2"]);

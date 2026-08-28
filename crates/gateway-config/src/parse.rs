@@ -363,7 +363,7 @@ gatewayConfig:
     }
 
     #[test]
-    fn request_header_modifier_filter() {
+    fn extension_ref_filter() {
         let cfg = parse_yaml(
             r"
 gatewayConfig:
@@ -381,29 +381,16 @@ gatewayConfig:
               backendRefs: [{ name: be }]
               filters:
                 - name: hdr
-                  type: RequestHeaderModifier
-                  requestHeaders:
-                    add:
-                      - { name: x-add, value: a }
-                    set:
-                      - { name: x-set, value: s }
-                    remove:
-                      - x-rm
+                  type: ExtensionRef
 ",
         )
         .unwrap();
         let Listener::Http(l) = &cfg.binds[0].listeners[0] else {
             panic!()
         };
-        let HttpFilter::RequestHeaderModifier {
-            request_headers, ..
-        } = &l.routes[0].filters[0]
-        else {
-            panic!("expected RequestHeaderModifier")
-        };
-        assert_eq!(request_headers.add.len(), 1);
-        assert_eq!(request_headers.set.len(), 1);
-        assert_eq!(request_headers.remove, vec!["x-rm".to_string()]);
+        let HttpFilter::ExtensionRef { name, namespace } = &l.routes[0].filters[0];
+        assert_eq!(name, "hdr");
+        assert_eq!(namespace, "");
     }
 
     #[test]
@@ -433,7 +420,7 @@ gatewayConfig:
     }
 
     #[test]
-    fn request_header_modifier_under_tls_listener_fails() {
+    fn http_filter_under_tls_listener_fails() {
         let err = parse_yaml(
             r"
 gatewayConfig:
@@ -452,13 +439,12 @@ gatewayConfig:
               backendRefs: [{ name: be }]
               filters:
                 - name: hdr
-                  type: RequestHeaderModifier
-                  requestHeaders: { add: [{ name: x, value: y }] }
+                  type: ExtensionRef
 ",
         );
         assert!(
             err.is_err(),
-            "RequestHeaderModifier under TLS listener should fail to parse"
+            "an HTTP filter under a TLS listener should fail to parse"
         );
     }
 
@@ -589,20 +575,19 @@ gatewayConfig:
               backendRefs: [{ name: be }]
               filters:
                 - name: hdr
-                  type: RequestHeaderModifier
-                  requestHeaders: { add: [{ name: x, value: y }] }
+                  type: ExtensionRef
 ",
         );
         assert!(
             err.is_err(),
-            "RequestHeaderModifier under TCP listener should fail to parse"
+            "an HTTP filter under a TCP listener should fail to parse"
         );
     }
 
     #[test]
     fn filter_ordering_preserved() {
         let cfg = parse_yaml(
-            r#"
+            r"
 gatewayConfig:
   name: g
   binds:
@@ -617,10 +602,10 @@ gatewayConfig:
               matches: [{ path: { type: PathPrefix, value: / } }]
               backendRefs: [{ name: be }]
               filters:
-                - { name: f0, type: RequestHeaderModifier, requestHeaders: { add: [{ name: a, value: "0" }] } }
-                - { name: f1, type: RequestHeaderModifier, requestHeaders: { add: [{ name: a, value: "1" }] } }
-                - { name: f2, type: RequestHeaderModifier, requestHeaders: { add: [{ name: a, value: "2" }] } }
-"#,
+                - { name: f0, type: ExtensionRef }
+                - { name: f1, type: ExtensionRef }
+                - { name: f2, type: ExtensionRef }
+",
         )
         .unwrap();
         let Listener::Http(l) = &cfg.binds[0].listeners[0] else {

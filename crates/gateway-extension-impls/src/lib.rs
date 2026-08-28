@@ -7,14 +7,26 @@ use std::sync::Arc;
 use bytes::Bytes;
 use gateway_config::extension::{ConfigValue, from_value};
 use gateway_config::filter::{HeaderOps, HeaderPair, RedirectConfig, RedirectPath, Scheme};
-use gateway_extension::builtin::{
-    FilterError, REQUEST_HEADER_MODIFIER, REQUEST_REDIRECT, RESPONSE_HEADER_MODIFIER,
-};
 use gateway_extension::{
     Action, Cx, Error, Extension, ExtensionBuilder, ExtensionClass, LocalResponse, Registry,
     async_trait,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+
+/// Reserved class names for the built-ins — the wire contract with
+/// the CP, which synthesizes objects of these classes for Gateway
+/// API core filters.
+pub const REQUEST_HEADER_MODIFIER: &str = "request_header_modifier";
+pub const RESPONSE_HEADER_MODIFIER: &str = "response_header_modifier";
+pub const REQUEST_REDIRECT: &str = "request_redirect";
+
+#[derive(Debug, thiserror::Error)]
+pub enum FilterError {
+    #[error("invalid header name `{0}`")]
+    InvalidHeaderName(String),
+    #[error("invalid header value for `{0}`")]
+    InvalidHeaderValue(String),
+}
 
 /// `HeaderOps` with names and values parsed up front. Invalid `remove`
 /// names are dropped at parse time, matching the runtime's silent-skip
@@ -316,8 +328,7 @@ impl Extension for RequestRedirect {
 mod tests {
     use super::*;
 
-    use gateway_config::filter::{HttpFilter as ConfigFilter, RedirectStatus};
-    use gateway_extension::builtin::class_and_config;
+    use gateway_config::filter::RedirectStatus;
 
     fn ops(set: &[(&str, &str)], add: &[(&str, &str)], remove: &[&str]) -> HeaderOps {
         HeaderOps {
@@ -500,35 +511,6 @@ mod tests {
         });
         let (_, location) = run_redirect(&builder, "/foo/bar", Some("h.example"), None).await;
         assert_eq!(location, "http://h.example/foo/bar");
-    }
-
-    #[test]
-    fn class_and_config_funnels_every_filter() {
-        let mut registry = Registry::new();
-        register_builtins(&mut registry);
-
-        // An inline filter serializes its typed config and configures
-        // through its reserved class.
-        let inline = ConfigFilter::RequestHeaderModifier {
-            name: "h".to_owned(),
-            request_headers: ops(&[("x-a", "1")], &[], &[]),
-        };
-        let (class, config) = class_and_config(&inline).expect("serializes");
-        assert_eq!(class, REQUEST_HEADER_MODIFIER);
-        let builder = registry
-            .get(class)
-            .expect("built-in registered")
-            .configure(&config)
-            .expect("valid ops");
-        let _ = builder.build();
-
-        // Invalid ops fail at configure, not per request.
-        let bad = ConfigFilter::RequestHeaderModifier {
-            name: "h".to_owned(),
-            request_headers: ops(&[("bad name", "v")], &[], &[]),
-        };
-        let (class, config) = class_and_config(&bad).expect("serializes");
-        assert!(registry.get(class).unwrap().configure(&config).is_err());
     }
 
     #[test]

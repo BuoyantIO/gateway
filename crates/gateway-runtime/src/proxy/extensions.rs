@@ -12,7 +12,6 @@ use parking_lot::RwLock;
 use gateway_config::extension::FailureMode;
 use gateway_config::filter::HttpFilter;
 
-use crate::extension::builtin::class_and_config;
 use crate::extension::{Declarations, ExtensionBuilder, Registry};
 
 /// One filter of a route, configured: the builder plus its
@@ -83,50 +82,29 @@ impl ExtensionCache {
     }
 }
 
-/// Configure every filter of `route`, in order. An `ExtensionRef`
-/// resolves through the route's `Extension` objects (the ride-along
-/// the store attaches); inline filters go through their reserved
-/// classes.
+/// Configure every filter of `route`, in order. Every filter is a
+/// ref, resolving through the route's `Extension` objects (the
+/// ride-along the store attaches).
 fn resolve(registry: &Registry, route: &ActiveHttpRoute) -> ResolveResult {
     let mut extensions = Vec::with_capacity(route.filters.len());
     for (i, filter) in route.filters.iter().enumerate() {
-        let resolved = if let HttpFilter::ExtensionRef { name, namespace } = filter {
-            let object = route
-                .extensions
-                .iter()
-                .find(|e| e.key.name == *name && e.key.namespace == *namespace)
-                .and_then(|e| e.object.as_ref())
-                .ok_or_else(|| {
-                    Arc::<str>::from(format!("filter {i}: extension `{name}` is not registered"))
-                })?;
-            let configured = registry
-                .configure(object)
-                .map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
-            ResolvedExtension {
-                decl: configured.decl,
-                failure_mode: configured.failure_mode,
-                builder: configured.builder,
-            }
-        } else {
-            let (class, config) = class_and_config(filter)
-                .map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
-            let class_impl = registry.get(class).ok_or_else(|| {
-                Arc::<str>::from(format!(
-                    "filter {i}: no extension class registered under `{class}`"
-                ))
+        let HttpFilter::ExtensionRef { name, namespace } = filter;
+        let object = route
+            .extensions
+            .iter()
+            .find(|e| e.key.name == *name && e.key.namespace == *namespace)
+            .and_then(|e| e.object.as_ref())
+            .ok_or_else(|| {
+                Arc::<str>::from(format!("filter {i}: extension `{name}` is not registered"))
             })?;
-            let builder = class_impl.configure(&config).map_err(|e| {
-                Arc::<str>::from(format!(
-                    "filter {i}: class `{class}` rejected the config: {e}"
-                ))
-            })?;
-            ResolvedExtension {
-                decl: builder.declares(),
-                failure_mode: FailureMode::Closed,
-                builder,
-            }
-        };
-        extensions.push(resolved);
+        let configured = registry
+            .configure(object)
+            .map_err(|e| Arc::<str>::from(format!("filter {i}: {e}")))?;
+        extensions.push(ResolvedExtension {
+            decl: configured.decl,
+            failure_mode: configured.failure_mode,
+            builder: configured.builder,
+        });
     }
 
     // At most one selector per rule: checked here so the failure is

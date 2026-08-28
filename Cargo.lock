@@ -801,6 +801,7 @@ dependencies = [
  "gateway-config",
  "gateway-extension",
  "http",
+ "thiserror",
  "tokio",
  "tracing",
 ]

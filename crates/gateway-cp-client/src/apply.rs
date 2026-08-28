@@ -488,7 +488,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     // ----- filters -----
 
     #[test]
-    fn request_header_modifier_filter_round_trips() {
+    fn extension_ref_filter_round_trips() {
         let store = Store::new();
         let route = pb::Upsert {
             body: Some(pb::upsert::Body::HttpRoute(pb::HttpRouteUpsert {
@@ -513,19 +513,10 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
                     weight: 1,
                 }],
                 filters: vec![pb::HttpFilter {
-                    kind: Some(pb::http_filter::Kind::RequestHeaderModifier(
-                        pb::RequestHeaderModifier {
-                            name: "add-x".into(),
-                            request_headers: Some(pb::HeaderOps {
-                                add: vec![pb::HeaderPair {
-                                    name: "x-test".into(),
-                                    value: "yes".into(),
-                                }],
-                                set: vec![],
-                                remove: vec![],
-                            }),
-                        },
-                    )),
+                    kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
+                        name: "add-x".into(),
+                        namespace: "demo".into(),
+                    })),
                 }],
             })),
         };
