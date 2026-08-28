@@ -442,17 +442,17 @@ async fn request_header_modifier_applies() {
     let upstream_port = spawn_http_echo().await;
     let bind_port = free_port().await;
 
-    let filter = HttpFilter::RequestHeaderModifier {
-        name: "add-test".into(),
-        request_headers: HeaderOps {
+    let tagger = header_ops_extension(
+        "add-test",
+        "request_header_modifier",
+        &HeaderOps {
             add: vec![HeaderPair {
                 name: "x-test-added".into(),
                 value: "from-filter".into(),
             }],
-            set: vec![],
-            remove: vec![],
+            ..Default::default()
         },
-    };
+    );
     let cfg = GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -463,12 +463,12 @@ async fn request_header_modifier_applies() {
             listeners: vec![http_listener(
                 "l",
                 None,
-                vec![http_route_with_filter("r", "/", "be", filter)],
+                vec![http_route_with_filter("r", "/", "be", ext_ref("add-test"))],
             )],
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![tagger],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -528,38 +528,13 @@ async fn header_routing_picks_header_rule_over_catchall() {
                 name: "be-a".into(),
                 weight: 1,
             }],
-            filters: vec![HttpFilter::RequestHeaderModifier {
-                name: "tag-a".into(),
-                request_headers: HeaderOps {
-                    add: vec![HeaderPair {
-                        name: "x-test-served-by".into(),
-                        value: "A".into(),
-                    }],
-                    set: vec![],
-                    remove: vec![],
-                },
-            }],
+            filters: vec![ext_ref("tag-a")],
         };
         // Sanity: the helper above doesn't apply, build by hand.
         r.name = "r-header".into();
         r
     };
-    let catchall_route = http_route_with_filter(
-        "r-catchall",
-        "/",
-        "be-b",
-        HttpFilter::RequestHeaderModifier {
-            name: "tag-b".into(),
-            request_headers: HeaderOps {
-                add: vec![HeaderPair {
-                    name: "x-test-served-by".into(),
-                    value: "B".into(),
-                }],
-                set: vec![],
-                remove: vec![],
-            },
-        },
-    );
+    let catchall_route = http_route_with_filter("r-catchall", "/", "be-b", ext_ref("tag-b"));
 
     let cfg = GatewayConfig {
         name: "test".into(),
@@ -579,7 +554,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
             static_backend("be-b", upstream_b),
         ],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![tag_extension("tag-a", "A"), tag_extension("tag-b", "B")],
     };
 
     let store = Store::new();
@@ -670,35 +645,11 @@ async fn regex_path_routes_matching_request() {
             name: "be-regex".into(),
             weight: 1,
         }],
-        filters: vec![HttpFilter::RequestHeaderModifier {
-            name: "tag-regex".into(),
-            request_headers: HeaderOps {
-                add: vec![HeaderPair {
-                    name: "x-test-served-by".into(),
-                    value: "REGEX".into(),
-                }],
-                set: vec![],
-                remove: vec![],
-            },
-        }],
+        filters: vec![ext_ref("tag-regex")],
     };
     // Route B: plain `/` catchall.
-    let catchall_route = http_route_with_filter(
-        "r-catchall",
-        "/",
-        "be-catchall",
-        HttpFilter::RequestHeaderModifier {
-            name: "tag-catchall".into(),
-            request_headers: HeaderOps {
-                add: vec![HeaderPair {
-                    name: "x-test-served-by".into(),
-                    value: "CATCHALL".into(),
-                }],
-                set: vec![],
-                remove: vec![],
-            },
-        },
-    );
+    let catchall_route =
+        http_route_with_filter("r-catchall", "/", "be-catchall", ext_ref("tag-catchall"));
 
     let cfg = GatewayConfig {
         name: "test".into(),
@@ -714,7 +665,10 @@ async fn regex_path_routes_matching_request() {
             static_backend("be-catchall", upstream_catchall),
         ],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![
+            tag_extension("tag-regex", "REGEX"),
+            tag_extension("tag-catchall", "CATCHALL"),
+        ],
     };
 
     let store = Store::new();
@@ -761,8 +715,6 @@ async fn regex_path_routes_matching_request() {
 /// `request_header_modifier_applies` test on the response side.
 #[tokio::test]
 async fn response_header_modifier_applies() {
-    use gateway_config::filter::HeaderOps;
-
     let upstream_port = spawn_http_echo().await;
     let bind_port = free_port().await;
 
@@ -772,9 +724,10 @@ async fn response_header_modifier_applies() {
     //   - sets `x-test-frame-options` (no upstream collision; just
     //     present)
     //   - removes `x-server-version` (upstream-set; should disappear)
-    let filter = HttpFilter::ResponseHeaderModifier {
-        name: "rsp".into(),
-        response_headers: HeaderOps {
+    let modifier = header_ops_extension(
+        "rsp",
+        "response_header_modifier",
+        &HeaderOps {
             add: vec![HeaderPair {
                 name: "x-test-csp".into(),
                 value: "default-src 'self'".into(),
@@ -785,7 +738,7 @@ async fn response_header_modifier_applies() {
             }],
             remove: vec!["x-server-version".into()],
         },
-    };
+    );
     let cfg = GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -796,12 +749,12 @@ async fn response_header_modifier_applies() {
             listeners: vec![http_listener(
                 "l",
                 None,
-                vec![http_route_with_filter("r", "/", "be", filter)],
+                vec![http_route_with_filter("r", "/", "be", ext_ref("rsp"))],
             )],
         }],
         backends: vec![static_backend("be", upstream_port)],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![modifier],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1163,27 +1116,7 @@ async fn redirect_short_circuit_skips_response_filters() {
             query_params: vec![],
         }],
         backend_refs: vec![],
-        filters: vec![
-            HttpFilter::ResponseHeaderModifier {
-                name: "rsp".into(),
-                response_headers: HeaderOps {
-                    add: vec![HeaderPair {
-                        name: "x-test-csp".into(),
-                        value: "default-src 'self'".into(),
-                    }],
-                    set: vec![],
-                    remove: vec![],
-                },
-            },
-            HttpFilter::RequestRedirect {
-                name: "to-https".into(),
-                redirect: RedirectConfig {
-                    scheme: Some(Scheme::Https),
-                    status_code: RedirectStatus::MovedPermanently,
-                    ..Default::default()
-                },
-            },
-        ],
+        filters: vec![ext_ref("rsp"), ext_ref("to-https")],
     };
     let cfg = GatewayConfig {
         name: "test".into(),
@@ -1196,7 +1129,27 @@ async fn redirect_short_circuit_skips_response_filters() {
         }],
         backends: vec![],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![
+            header_ops_extension(
+                "rsp",
+                "response_header_modifier",
+                &HeaderOps {
+                    add: vec![HeaderPair {
+                        name: "x-test-csp".into(),
+                        value: "default-src 'self'".into(),
+                    }],
+                    ..Default::default()
+                },
+            ),
+            redirect_extension(
+                "to-https",
+                &RedirectConfig {
+                    scheme: Some(Scheme::Https),
+                    status_code: RedirectStatus::MovedPermanently,
+                    ..Default::default()
+                },
+            ),
+        ],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1237,17 +1190,17 @@ async fn invalid_filter_config_answers_500_before_dispatch() {
     let dead_port = free_port().await;
     let bind_port = free_port().await;
 
-    let filter = HttpFilter::RequestHeaderModifier {
-        name: "bad".into(),
-        request_headers: HeaderOps {
+    let bad = header_ops_extension(
+        "bad",
+        "request_header_modifier",
+        &HeaderOps {
             add: vec![HeaderPair {
                 name: "bad name".into(),
                 value: "v".into(),
             }],
-            set: vec![],
-            remove: vec![],
+            ..Default::default()
         },
-    };
+    );
     let cfg = GatewayConfig {
         name: "test".into(),
         binds: vec![Bind {
@@ -1258,12 +1211,12 @@ async fn invalid_filter_config_answers_500_before_dispatch() {
             listeners: vec![http_listener(
                 "l",
                 None,
-                vec![http_route_with_filter("r", "/", "be", filter)],
+                vec![http_route_with_filter("r", "/", "be", ext_ref("bad"))],
             )],
         }],
         backends: vec![static_backend("be", dead_port)],
         secrets: vec![],
-        extensions: vec![],
+        extensions: vec![bad],
     };
     let store = Store::new();
     let _ = store.apply(&cfg);
@@ -1316,6 +1269,62 @@ fn extension_object(class: &str) -> gateway_config::extension::Extension {
         failure_mode: FailureMode::default(),
         limits: Limits::default(),
         config: ConfigValue::Null,
+    }
+}
+
+/// A ref to the extension declared under `name`, local namespace.
+fn ext_ref(name: &str) -> HttpFilter {
+    HttpFilter::ExtensionRef {
+        name: name.into(),
+        namespace: String::new(),
+    }
+}
+
+/// An `Extension` object carrying header ops for one of the header
+/// modifier classes.
+fn header_ops_extension(
+    name: &str,
+    class: &str,
+    ops: &HeaderOps,
+) -> gateway_config::extension::Extension {
+    gateway_config::extension::Extension {
+        namespace: String::new(),
+        name: name.into(),
+        class: class.into(),
+        failure_mode: FailureMode::default(),
+        limits: Limits::default(),
+        config: gateway_config::extension::to_value(ops).expect("header ops serialize"),
+    }
+}
+
+/// A `request_header_modifier` extension tagging responses through
+/// the echo's `x-test-*` reflection.
+fn tag_extension(name: &str, value: &str) -> gateway_config::extension::Extension {
+    header_ops_extension(
+        name,
+        "request_header_modifier",
+        &HeaderOps {
+            add: vec![HeaderPair {
+                name: "x-test-served-by".into(),
+                value: value.into(),
+            }],
+            ..Default::default()
+        },
+    )
+}
+
+/// A `request_redirect` extension.
+fn redirect_extension(
+    name: &str,
+    redirect: &RedirectConfig,
+) -> gateway_config::extension::Extension {
+    gateway_config::extension::Extension {
+        namespace: String::new(),
+        name: name.into(),
+        class: "request_redirect".into(),
+        failure_mode: FailureMode::default(),
+        limits: Limits::default(),
+        config: gateway_config::extension::to_value(redirect).expect("redirect serializes"),
     }
 }
 

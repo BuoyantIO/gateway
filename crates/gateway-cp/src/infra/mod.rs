@@ -61,6 +61,10 @@ pub const DP_MEMORY_REQUEST_ANNOTATION: &str = "gateway.buoyant.io/dp-memory-req
 pub const DP_CPU_LIMIT_ANNOTATION: &str = "gateway.buoyant.io/dp-cpu-limit";
 pub const DP_MEMORY_LIMIT_ANNOTATION: &str = "gateway.buoyant.io/dp-memory-limit";
 
+/// Per-Gateway `RUST_LOG` for the provisioned data-plane container,
+/// default `info`.
+pub const DP_LOG_FILTER_ANNOTATION: &str = "gateway.buoyant.io/dp-log-filter";
+
 /// Per-Gateway reference to an operator-owned `Service` in the
 /// Gateway's own namespace. When set, the provisioner skips its own
 /// `Service` (deleting a previously provisioned one) and never

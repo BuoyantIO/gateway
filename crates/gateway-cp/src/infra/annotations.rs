@@ -16,9 +16,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::Resource;
 
 use super::{
-    DP_CPU_LIMIT_ANNOTATION, DP_CPU_REQUEST_ANNOTATION, DP_MEMORY_LIMIT_ANNOTATION,
-    DP_MEMORY_REQUEST_ANNOTATION, DP_REPLICAS_ANNOTATION, SERVICE_NAME_ANNOTATION,
-    SERVICE_TYPE_ANNOTATION,
+    DP_CPU_LIMIT_ANNOTATION, DP_CPU_REQUEST_ANNOTATION, DP_LOG_FILTER_ANNOTATION,
+    DP_MEMORY_LIMIT_ANNOTATION, DP_MEMORY_REQUEST_ANNOTATION, DP_REPLICAS_ANNOTATION,
+    SERVICE_NAME_ANNOTATION, SERVICE_TYPE_ANNOTATION,
 };
 
 /// The Service types the annotation may select. Anything else falls
@@ -56,6 +56,14 @@ pub(super) fn dp_replicas(gw: &Gateway) -> i32 {
                 1
             }
         },
+    }
+}
+
+/// The annotation verbatim, or `info`.
+pub(super) fn dp_log_filter(gw: &Gateway) -> String {
+    match annotation(gw, DP_LOG_FILTER_ANNOTATION) {
+        Some(v) if !v.is_empty() => v.to_owned(),
+        _ => "info".to_owned(),
     }
 }
 
@@ -213,6 +221,22 @@ mod tests {
         assert_eq!(
             service_name(&gw_with(&[(SERVICE_NAME_ANNOTATION, "")])),
             None
+        );
+    }
+
+    #[test]
+    fn dp_log_filter_defaults_to_info() {
+        assert_eq!(dp_log_filter(&gw_with(&[])), "info");
+        assert_eq!(
+            dp_log_filter(&gw_with(&[(
+                DP_LOG_FILTER_ANNOTATION,
+                "info,gateway_extension_impls=debug"
+            )])),
+            "info,gateway_extension_impls=debug"
+        );
+        assert_eq!(
+            dp_log_filter(&gw_with(&[(DP_LOG_FILTER_ANNOTATION, "")])),
+            "info"
         );
     }
 

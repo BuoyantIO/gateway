@@ -12,9 +12,7 @@ use std::net::IpAddr;
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::extension::{ConfigValue, Extension, FailureMode, Limits, RequestBodyLimit};
-use gateway_config::filter::{
-    HeaderOps, HeaderPair, HttpFilter, RedirectConfig, RedirectPath, RedirectStatus, Scheme,
-};
+use gateway_config::filter::HttpFilter;
 use gateway_config::listener::{
     CertRef, HttpListener, HttpsListener, Listener, TlsConfig, TlsMode,
 };
@@ -341,74 +339,16 @@ fn backend_ref(msg: pb::BackendRef) -> BackendRef {
     }
 }
 
-/// Returns `None` for unknown / future filter kinds, with a warn-level
-/// log. Mirrors the translator's behavior of dropping unsupported
-/// `HTTPRoute` filter types instead of failing the route.
+/// Returns `None` for unknown / future filter kinds, with the oneof
+/// decoded to nothing. Every known filter is a ref to an `Extension`
+/// object.
 fn http_filter(msg: pb::HttpFilter) -> Option<HttpFilter> {
     let kind = msg.kind?;
     match kind {
-        pb::http_filter::Kind::RequestHeaderModifier(rhm) => {
-            let ops = rhm.request_headers.unwrap_or_default();
-            Some(HttpFilter::RequestHeaderModifier {
-                name: rhm.name,
-                request_headers: header_ops(ops),
-            })
-        }
-        pb::http_filter::Kind::ResponseHeaderModifier(rhm) => {
-            let ops = rhm.response_headers.unwrap_or_default();
-            Some(HttpFilter::ResponseHeaderModifier {
-                name: rhm.name,
-                response_headers: header_ops(ops),
-            })
-        }
-        pb::http_filter::Kind::RequestRedirect(rr) => {
-            let path = rr.path.map(|p| match p {
-                pb::request_redirect::Path::ReplaceFullPath(s) => RedirectPath::ReplaceFullPath(s),
-                pb::request_redirect::Path::ReplacePrefixMatch(s) => {
-                    RedirectPath::ReplacePrefixMatch(s)
-                }
-            });
-            Some(HttpFilter::RequestRedirect {
-                name: rr.name,
-                redirect: RedirectConfig {
-                    scheme: match pb::RedirectScheme::try_from(rr.scheme) {
-                        Ok(pb::RedirectScheme::Http) => Some(Scheme::Http),
-                        Ok(pb::RedirectScheme::Https) => Some(Scheme::Https),
-                        // Unspecified (keep request scheme) or unknown.
-                        _ => None,
-                    },
-                    hostname: (!rr.hostname.is_empty()).then_some(rr.hostname),
-                    port: u16::try_from(rr.port).ok().filter(|p| *p != 0),
-                    status_code: match pb::RedirectStatus::try_from(rr.status_code) {
-                        Ok(pb::RedirectStatus::MovedPermanently) => {
-                            RedirectStatus::MovedPermanently
-                        }
-                        // Found, Unspecified (unset), or unknown all default to 302.
-                        _ => RedirectStatus::default(),
-                    },
-                    path,
-                },
-            })
-        }
         pb::http_filter::Kind::ExtensionRef(er) => Some(HttpFilter::ExtensionRef {
             name: er.name,
             namespace: er.namespace,
         }),
-    }
-}
-
-fn header_pair(msg: pb::HeaderPair) -> HeaderPair {
-    HeaderPair {
-        name: msg.name,
-        value: msg.value,
-    }
-}
-
-fn header_ops(msg: pb::HeaderOps) -> HeaderOps {
-    HeaderOps {
-        add: msg.add.into_iter().map(header_pair).collect(),
-        set: msg.set.into_iter().map(header_pair).collect(),
-        remove: msg.remove,
     }
 }
 
@@ -648,105 +588,6 @@ mod tests {
         };
         let err = http_route(bad).expect_err("must fail");
         assert!(matches!(err, Error::InvalidHeaderName { .. }));
-    }
-
-    #[test]
-    fn response_header_modifier_round_trips() {
-        let filter = pb::HttpFilter {
-            kind: Some(pb::http_filter::Kind::ResponseHeaderModifier(
-                pb::ResponseHeaderModifier {
-                    name: "rsp".into(),
-                    response_headers: Some(pb::HeaderOps {
-                        add: vec![pb::HeaderPair {
-                            name: "x-csp".into(),
-                            value: "default-src 'self'".into(),
-                        }],
-                        set: vec![pb::HeaderPair {
-                            name: "x-frame-options".into(),
-                            value: "sameorigin".into(),
-                        }],
-                        remove: vec!["x-server-version".into()],
-                    }),
-                },
-            )),
-        };
-        let cfg = http_filter(filter).expect("known kind");
-        match cfg {
-            HttpFilter::ResponseHeaderModifier {
-                name,
-                response_headers,
-            } => {
-                assert_eq!(name, "rsp");
-                assert_eq!(response_headers.add.len(), 1);
-                assert_eq!(response_headers.add[0].name, "x-csp");
-                assert_eq!(response_headers.set.len(), 1);
-                assert_eq!(response_headers.set[0].name, "x-frame-options");
-                assert_eq!(
-                    response_headers.remove,
-                    vec!["x-server-version".to_string()]
-                );
-            }
-            other => panic!("expected ResponseHeaderModifier, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn request_redirect_round_trips() {
-        let filter = pb::HttpFilter {
-            kind: Some(pb::http_filter::Kind::RequestRedirect(
-                pb::RequestRedirect {
-                    name: "r".into(),
-                    scheme: pb::RedirectScheme::Https as i32,
-                    hostname: String::new(),
-                    port: 0,
-                    status_code: pb::RedirectStatus::MovedPermanently as i32,
-                    path: Some(pb::request_redirect::Path::ReplacePrefixMatch(
-                        "/new".into(),
-                    )),
-                },
-            )),
-        };
-        match http_filter(filter).expect("known kind") {
-            HttpFilter::RequestRedirect { redirect, .. } => {
-                assert_eq!(redirect.scheme, Some(Scheme::Https));
-                assert_eq!(redirect.hostname, None, "empty hostname maps to None");
-                assert_eq!(redirect.port, None, "zero port maps to None");
-                assert_eq!(redirect.status_code, RedirectStatus::MovedPermanently);
-                assert_eq!(
-                    redirect.path,
-                    Some(RedirectPath::ReplacePrefixMatch("/new".into()))
-                );
-            }
-            other => panic!("expected RequestRedirect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn request_redirect_defaults_status_to_302() {
-        let filter = pb::HttpFilter {
-            kind: Some(pb::http_filter::Kind::RequestRedirect(
-                pb::RequestRedirect {
-                    name: String::new(),
-                    scheme: pb::RedirectScheme::Unspecified as i32,
-                    hostname: String::new(),
-                    port: 0,
-                    status_code: pb::RedirectStatus::Unspecified as i32,
-                    path: None,
-                },
-            )),
-        };
-        match http_filter(filter).expect("known kind") {
-            HttpFilter::RequestRedirect { redirect, .. } => {
-                assert_eq!(
-                    redirect.status_code,
-                    RedirectStatus::Found,
-                    "zero status defaults to 302"
-                );
-                assert_eq!(redirect.scheme, None);
-                assert_eq!(redirect.path, None);
-            }
-            other => panic!("expected RequestRedirect, got {other:?}"),
-        }
     }
 
     // ---- listener TLS conversion ----

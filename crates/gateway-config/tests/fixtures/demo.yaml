@@ -24,11 +24,7 @@ gatewayConfig:
                 - name: api-backend
               filters:
                 - name: add-gateway-header
-                  type: RequestHeaderModifier
-                  requestHeaders:
-                    add:
-                      - name: x-gateway
-                        value: demo
+                  type: ExtensionRef
             - name: health-route
               matches:
                 - path:
@@ -36,6 +32,13 @@ gatewayConfig:
                     value: /healthz
               backendRefs:
                 - name: health-backend
+  extensions:
+    - name: add-gateway-header
+      class: request_header_modifier
+      config:
+        add:
+          - name: x-gateway
+            value: demo
   backends:
     - name: api-backend
       type: Static

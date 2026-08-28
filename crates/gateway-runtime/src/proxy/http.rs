@@ -8,9 +8,9 @@
 //! version is invisible.
 //!
 //! Filters run as extensions (`crate::extension`): one instance per
-//! filter per request, built from the config by
-//! `extension::builtin::instance_for`, executing request hooks in
-//! route order and response hooks in reverse.
+//! filter per request, built from the route's resolved `Extension`
+//! objects, executing request hooks in route order and response
+//! hooks in reverse.
 
 use std::borrow::Cow;
 use std::convert::Infallible;

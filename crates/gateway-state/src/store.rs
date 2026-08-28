@@ -138,11 +138,9 @@ fn dedupe_bind_events(events: &mut Vec<BindEvent>) {
 
 /// The `ExtensionRef` identities among `filters`, in filter order.
 fn extension_refs(filters: &[HttpFilter]) -> impl Iterator<Item = ExtensionKey> {
-    filters.iter().filter_map(|f| match f {
-        HttpFilter::ExtensionRef { name, namespace } => {
-            Some(ExtensionKey::new(namespace.clone(), name.clone()))
-        }
-        _ => None,
+    filters.iter().map(|f| {
+        let HttpFilter::ExtensionRef { name, namespace } = f;
+        ExtensionKey::new(namespace.clone(), name.clone())
     })
 }
 
@@ -1351,7 +1349,7 @@ mod tests {
     };
     use gateway_config::bind::{Bind, BindProtocol};
     use gateway_config::extension::{FailureMode, Limits};
-    use gateway_config::filter::{HeaderOps, HeaderPair, HttpFilter};
+    use gateway_config::filter::HttpFilter;
     use gateway_config::listener::{
         CertRef, HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
     };
@@ -2012,16 +2010,9 @@ mod tests {
                 name: "be".into(),
                 weight: 1,
             }],
-            filters: vec![HttpFilter::RequestHeaderModifier {
+            filters: vec![HttpFilter::ExtensionRef {
                 name: "add-hdr".into(),
-                request_headers: HeaderOps {
-                    add: vec![HeaderPair {
-                        name: "x-test".into(),
-                        value: "yes".into(),
-                    }],
-                    set: vec![],
-                    remove: vec![],
-                },
+                namespace: String::new(),
             }],
         };
         store.upsert_http_route(&lkey("b", "l"), route);
