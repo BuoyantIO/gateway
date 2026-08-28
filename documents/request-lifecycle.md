@@ -334,11 +334,11 @@ slow to first byte holds the request open rather than failing it.
 ### TLS origination
 
 A dialable backend with a TLS block is dialed by a client of its own
-(`proxy::originate`), one per backend, keyed by backend name and kept
-until that backend's settings change. The client config is compiled
-from those settings once per applied version, not per request, and the
-connections the client pools are only ever reused for that backend
-under that config.
+(`proxy::originate`), one per backend, keyed by backend name and
+validated by `ActiveBackend.revision`. The client config is compiled
+from the backend's settings once per revision, not per request, and
+the connections the client pools are only ever reused for that
+backend under that config.
 
 The settings are the trust roots (the platform store by default, or a
 CA-only secret whose certificates replace it), an optional SNI

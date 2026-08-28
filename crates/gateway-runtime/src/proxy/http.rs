@@ -182,6 +182,7 @@ impl Destination {
             authority: format!("{}:{}", dialable.host, dialable.port),
             dialable: Some(Dialable {
                 backend: backend.key.clone(),
+                revision: backend.revision,
                 path_prefix: dialable.path_prefix.clone(),
                 tls: dialable.tls.clone(),
             }),
@@ -198,11 +199,15 @@ impl Destination {
             .and_then(|d| d.path_prefix.as_deref())
     }
 
-    /// The backend and its compiled TLS settings, for a destination
-    /// that is reached over TLS.
-    fn tls(&self) -> Option<(&BackendKey, &Arc<ActiveBackendTls>)> {
+    /// A destination reached over TLS: the backend's cache identity
+    /// (name and revision) and the settings its client is built from.
+    fn tls(&self) -> Option<(&BackendKey, u64, &ActiveBackendTls)> {
         let dialable = self.dialable.as_ref()?;
-        Some((&dialable.backend, dialable.tls.as_ref()?))
+        Some((
+            &dialable.backend,
+            dialable.revision,
+            dialable.tls.as_deref()?,
+        ))
     }
 }
 
@@ -211,6 +216,9 @@ struct Dialable {
     /// The backend's own name: what its upstream client is cached
     /// under.
     backend: BackendKey,
+    /// The applied version of the backend, which is what says whether
+    /// a cached client is still the right one.
+    revision: u64,
     path_prefix: Option<String>,
     /// `Some` originates TLS with this backend's settings.
     tls: Option<Arc<ActiveBackendTls>>,
@@ -1386,8 +1394,8 @@ async fn forward(
     // control plane already resolved; a failure here is a config
     // problem, not an upstream one, so it is not counted as a dial
     // failure against the destination.
-    let upstream = if let Some((backend, tls)) = dest.tls() {
-        match client.tls.client_for(backend, tls) {
+    let upstream = if let Some((backend, revision, tls)) = dest.tls() {
+        match client.tls.client_for(backend, revision, tls) {
             Ok(tls_client) => Upstream::Tls(Box::new(tls_client)),
             Err(e) => {
                 tracing::error!(%backend, error = %e, "cannot originate TLS to backend");
@@ -2222,6 +2230,7 @@ mod tests {
             key: key.clone(),
             backend: Some(Arc::new(ActiveBackend {
                 key,
+                revision: 0,
                 kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
                     endpoints: vec![Endpoint {
                         name: "e0".into(),
@@ -2321,6 +2330,7 @@ mod tests {
             backend: resolved.then(|| {
                 Arc::new(ActiveBackend {
                     key,
+                    revision: 0,
                     kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
                         endpoints: vec![],
                         protocol: BackendProtocol::Http1,
@@ -2350,6 +2360,7 @@ mod tests {
     fn dialable_backend(dialable: ActiveDialable) -> Arc<ActiveBackend> {
         Arc::new(ActiveBackend {
             key: BackendKey::new("provider"),
+            revision: 0,
             kind: ActiveBackendKind::Dialable(dialable),
         })
     }
@@ -2393,17 +2404,19 @@ mod tests {
         assert!(dest.tls().is_none());
     }
 
-    /// A TLS destination carries the backend's own name — the key its
-    /// client and connection pool are cached under — and the settings
-    /// that client is built from.
+    /// A TLS destination carries what identifies the client to use —
+    /// the backend's own name and the revision that says whether a
+    /// cached one is current — plus the settings to build it from.
     #[test]
     fn tls_destination_carries_the_backend_and_its_settings() {
         let mut d = dialable(443, None);
         d.tls = Some(backend_tls(Some("edge.example.com")));
-        let backend = dialable_backend(d.clone());
+        let mut backend = dialable_backend(d.clone());
+        Arc::get_mut(&mut backend).expect("sole owner").revision = 7;
         let dest = Destination::at_host(&backend, &d, info());
-        let (key, tls) = dest.tls().expect("tls settings");
+        let (key, revision, tls) = dest.tls().expect("tls settings");
         assert_eq!(key, &BackendKey::new("provider"));
+        assert_eq!(revision, 7);
         assert_eq!(tls.sni.as_deref(), Some("edge.example.com"));
     }
 

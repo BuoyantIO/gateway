@@ -8,6 +8,7 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -92,6 +93,13 @@ GkIpYyxV\n\
 /// * `/stream` answers in chunks with a gap before the first one, the
 ///   shape a streamed completion has.
 async fn spawn_tls_upstream(alpn: &[AlpnProtocol]) -> u16 {
+    spawn_counting_tls_upstream(alpn).await.0
+}
+
+/// The same upstream, plus a count of the connections it accepted:
+/// how a test sees whether the gateway reused a pooled connection or
+/// made a new one.
+async fn spawn_counting_tls_upstream(alpn: &[AlpnProtocol]) -> (u16, Arc<AtomicUsize>) {
     let secret = TlsSecret::new("", "leaf", LEAF_CERT_PEM, LEAF_KEY_PEM).expect("valid leaf");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
@@ -105,11 +113,14 @@ async fn spawn_tls_upstream(alpn: &[AlpnProtocol]) -> u16 {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            counter.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
@@ -122,7 +133,7 @@ async fn spawn_tls_upstream(alpn: &[AlpnProtocol]) -> u16 {
             });
         }
     });
-    port
+    (port, accepted)
 }
 
 async fn upstream_service(
@@ -295,6 +306,15 @@ async fn spawn_gateway(
 ) -> (drain::Signal, Arc<Metrics>, tokio::task::JoinHandle<()>) {
     let store = Store::new();
     let _ = store.apply(cfg);
+    spawn_gateway_on(store, bind_port).await
+}
+
+/// The same, on a store the caller keeps a handle to, for a test that
+/// applies more config while the gateway is running.
+async fn spawn_gateway_on(
+    store: Store,
+    bind_port: u16,
+) -> (drain::Signal, Arc<Metrics>, tokio::task::JoinHandle<()>) {
     let metrics = Metrics::new();
     let gw = Gateway::with_metrics(store, Arc::clone(&metrics));
     let (stop, watch) = drain::channel();
@@ -550,6 +570,69 @@ async fn alpn_settles_on_http1_when_that_is_all_the_server_offers() {
     assert_eq!(
         resp.headers().get("x-echo-host").unwrap(),
         &format!("localhost:{upstream}")
+    );
+
+    stop.drain().await;
+    gw.await.unwrap();
+}
+
+/// A control-plane resync re-sends every object, identical config
+/// included. The backend's revision does not move, so the client and
+/// its pooled connection survive: the upstream sees one connection
+/// across both requests. Changing the backend for real is what
+/// replaces the client, and the upstream sees a second connection.
+#[tokio::test]
+async fn identical_config_reuses_the_connection_and_a_change_replaces_it() {
+    let (upstream, accepted) = spawn_counting_tls_upstream(&[AlpnProtocol::Http11]).await;
+    let bind_port = free_port().await;
+    let cfg = tls_config(bind_port, TlsBackend::trusting_the_test_ca(upstream));
+    let store = Store::new();
+    let _ = store.apply(&cfg);
+    let (stop, _metrics, gw) = spawn_gateway_on(store.clone(), bind_port).await;
+
+    let get = || async {
+        let resp = client()
+            .get(
+                format!("http://127.0.0.1:{bind_port}/chat")
+                    .parse()
+                    .unwrap(),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the body so the connection goes back to the pool.
+        let _ = resp.into_body().collect().await.unwrap();
+    };
+
+    get().await;
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    // What a resync looks like: the same secret and the same backend,
+    // re-sent as new objects.
+    for backend in &cfg.backends {
+        store.upsert_backend(backend.clone());
+    }
+    for secret in &cfg.secrets {
+        store.upsert_secret(secret.clone());
+    }
+    get().await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "identical config must not rebuild the client"
+    );
+
+    // A real change to the TLS block does.
+    let Backend::Dialable(mut dialable) = cfg.backends[0].clone() else {
+        unreachable!("built as dialable");
+    };
+    dialable.tls.as_mut().expect("tls block").sni = Some("localhost".into());
+    store.upsert_backend(Backend::Dialable(dialable));
+    get().await;
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "changed settings must rebuild the client"
     );
 
     stop.drain().await;

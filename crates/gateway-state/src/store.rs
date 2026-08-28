@@ -95,6 +95,8 @@ struct Inner {
     active_routes: HashMap<RouteKey, Arc<ActiveHttpRoute>>,
     /// Monotonic stamp for [`ActiveHttpRoute::revision`].
     route_revision: u64,
+    /// Monotonic stamp for [`ActiveBackend::revision`].
+    backend_revision: u64,
 
     /// Index: listeners under a bind, active OR pending.
     listeners_by_parent: HashMap<BindKey, HashSet<ListenerKey>>,
@@ -674,12 +676,35 @@ impl Inner {
                 .or_default()
                 .insert(key.clone());
         }
-        let new = Arc::new(ActiveBackend {
-            key: key.clone(),
-            kind,
-        });
-        self.backends.insert(key.clone(), new);
-        self.cascade_routes_by_backend(&key)
+        self.place_backend(&key, kind)
+    }
+
+    /// Register a resolved backend under `key`, if it says anything
+    /// new.
+    ///
+    /// An identical re-apply is a no-op down to the `Arc`: the
+    /// backend keeps its revision, the routes naming it are not
+    /// rebuilt, and no event goes out. That is what makes a
+    /// control-plane resync free for whatever the request path
+    /// derived from the backend and cached against its revision (the
+    /// upstream client and its pooled connections), instead of
+    /// something that drops it and reconnects.
+    fn place_backend(&mut self, key: &BackendKey, kind: ActiveBackendKind) -> Vec<BindEvent> {
+        if let Some(current) = self.backends.get(key)
+            && current.kind == kind
+        {
+            return Vec::new();
+        }
+        self.backend_revision += 1;
+        self.backends.insert(
+            key.clone(),
+            Arc::new(ActiveBackend {
+                key: key.clone(),
+                revision: self.backend_revision,
+                kind,
+            }),
+        );
+        self.cascade_routes_by_backend(key)
     }
 
     fn remove_backend(&mut self, key: &BackendKey) -> Vec<BindEvent> {
@@ -719,9 +744,12 @@ impl Inner {
         }
     }
 
-    /// Re-resolve one backend's CA secret in place, after that secret
-    /// arrived or went away. Everything else about the backend is
-    /// already resolved and carried over untouched.
+    /// Re-resolve one backend's CA secret, after that secret arrived,
+    /// went away, or was re-sent. Everything else about the backend
+    /// is already resolved and carried over untouched.
+    ///
+    /// A secret re-sent with the same certificates resolves to the
+    /// same backend and stops here: see [`Inner::place_backend`].
     fn re_resolve_backend(&mut self, key: &BackendKey) -> Vec<BindEvent> {
         let Some(current) = self.backends.get(key) else {
             return Vec::new();
@@ -743,14 +771,7 @@ impl Inner {
             key: sk,
         };
         dialable.tls = Some(Arc::new(tls));
-        self.backends.insert(
-            key.clone(),
-            Arc::new(ActiveBackend {
-                key: key.clone(),
-                kind: ActiveBackendKind::Dialable(dialable),
-            }),
-        );
-        self.cascade_routes_by_backend(key)
+        self.place_backend(key, ActiveBackendKind::Dialable(dialable))
     }
 
     /// Strip CA-index entries for a backend key (used before
@@ -2343,6 +2364,20 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H\n\
 huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 -----END PRIVATE KEY-----\n";
 
+    // A second throwaway self-signed cert (CN=second-listener), for
+    // telling one secret's material from another's.
+    const CERT_B_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBiTCCAS+gAwIBAgIUFYI3ownf3oEEVFFQj8pA8hpuPD4wCgYIKoZIzj0EAwIw\n\
+GjEYMBYGA1UEAwwPc2Vjb25kLWxpc3RlbmVyMB4XDTI2MDYyOTEyNTAxNloXDTM2\n\
+MDYyNjEyNTAxNlowGjEYMBYGA1UEAwwPc2Vjb25kLWxpc3RlbmVyMFkwEwYHKoZI\n\
+zj0CAQYIKoZIzj0DAQcDQgAEZ90r7ZoDZDtVSfaKwdubEVIcx9yc89Q+btUYkf7b\n\
+Z1/daa1AQ0LJZPOipoZ1JmP4j98Byz9NRbH6dYL3DZZaRaNTMFEwHQYDVR0OBBYE\n\
+FHCcJHdHZnLHXupUl2eIsslQIr/dMB8GA1UdIwQYMBaAFHCcJHdHZnLHXupUl2eI\n\
+sslQIr/dMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhAMDHA+8t\n\
+VPeL5LaOAxi6qR1c9B0mIA7zMqSGUOgjHxWpAiB3x6X14G0y4v4OuV2GhSQSkwAm\n\
+abIF6YlJNVR6UhS8sg==\n\
+-----END CERTIFICATE-----\n";
+
     fn secretkey(name: &str) -> SecretKey {
         SecretKey::local(name)
     }
@@ -2370,6 +2405,14 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
     fn ca_secret(name: &str) -> TlsSecret {
         TlsSecret::ca("", name, CERT_PEM).expect("valid test CA secret")
+    }
+
+    fn backend_revision(store: &Store, name: &str) -> u64 {
+        store
+            .read()
+            .backend(&backendkey(name))
+            .expect("backend registered")
+            .revision
     }
 
     /// The TLS block of a registered dialable backend.
@@ -2497,23 +2540,98 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         assert_eq!(key, &secretkey("new-ca"));
     }
 
-    /// Re-applying the same backend compiles to the same client TLS
-    /// config, so the request path can keep the client and the
-    /// connection pool it has.
+    /// Re-applying the same backend changes nothing: same object,
+    /// same revision, so the request path keeps the client and the
+    /// connection pool it built for that revision. The route naming
+    /// it is not rebuilt either, which is what keeps a resync from
+    /// invalidating everything else derived from a route.
     #[test]
-    fn re_applied_backend_keeps_the_same_tls_config() {
+    fn re_applied_backend_is_a_no_op() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_secret(ca_secret("provider-ca"));
+        store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
+
+        let backend = store.read().backend(&backendkey("be")).unwrap();
+        let route_revision =
+            |store: &Store| store.read().bind(&bkey("b")).unwrap().listeners[0].routes[0].revision;
+        let route_before = route_revision(&store);
+
+        store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
+
+        assert!(Arc::ptr_eq(
+            &backend,
+            &store.read().backend(&backendkey("be")).unwrap()
+        ));
+        assert_eq!(route_revision(&store), route_before);
+    }
+
+    /// The control-plane resync case: reconnecting re-sends every
+    /// secret, and the same certificates arriving as a new object
+    /// must read as unchanged. Comparing the secret by identity here
+    /// would bump the revision and drop every upstream connection on
+    /// a rollover.
+    #[test]
+    fn a_ca_secret_re_sent_unchanged_does_not_bump_the_revision() {
         let store = Store::new();
         store.upsert_secret(ca_secret("provider-ca"));
         store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
-        let first = backend_tls(&store, "be");
-        store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
-        let second = backend_tls(&store, "be");
-        assert!(first.same_config(&second));
+        let revision = backend_revision(&store, "be");
+        let tls = backend_tls(&store, "be");
 
-        // A secret re-upsert is new material, so it is not the same
-        // config even though nothing else changed.
         store.upsert_secret(ca_secret("provider-ca"));
-        assert!(!second.same_config(&backend_tls(&store, "be")));
+
+        assert_eq!(backend_revision(&store, "be"), revision);
+        assert!(Arc::ptr_eq(&tls, &backend_tls(&store, "be")));
+    }
+
+    /// Different certificates under the same name are a real change.
+    #[test]
+    fn a_ca_secret_re_sent_with_other_certificates_bumps_the_revision() {
+        let store = Store::new();
+        store.upsert_secret(ca_secret("provider-ca"));
+        store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
+        let revision = backend_revision(&store, "be");
+
+        store.upsert_secret(TlsSecret::ca("", "provider-ca", CERT_B_PEM).expect("valid CA"));
+
+        assert!(backend_revision(&store, "be") > revision);
+    }
+
+    /// So is a change to the backend's own settings.
+    #[test]
+    fn changed_backend_settings_bump_the_revision() {
+        let store = Store::new();
+        store.upsert_secret(ca_secret("provider-ca"));
+        store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
+        let revision = backend_revision(&store, "be");
+
+        let Backend::Dialable(mut d) = tls_dialable_backend("be", Some("provider-ca")) else {
+            unreachable!("built as dialable");
+        };
+        d.tls.as_mut().expect("tls block").sni = Some("edge.example.com".into());
+        store.upsert_backend(Backend::Dialable(d));
+
+        assert!(backend_revision(&store, "be") > revision);
+    }
+
+    /// An endpoint set is stamped the same way, so the revision means
+    /// one thing for every backend kind.
+    #[test]
+    fn re_applied_endpoint_set_is_a_no_op_but_a_changed_one_bumps() {
+        let store = Store::new();
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        let revision = backend_revision(&store, "be");
+
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.1", 8080)]));
+        assert_eq!(backend_revision(&store, "be"), revision);
+
+        store.upsert_backend(static_backend("be", &[("e0", "10.0.0.2", 8080)]));
+        assert!(backend_revision(&store, "be") > revision);
     }
 
     /// A CA-only secret has no private key, so a listener naming it

@@ -90,6 +90,14 @@ pub struct ActiveBackendRef {
 #[derive(Debug, Clone)]
 pub struct ActiveBackend {
     pub key: BackendKey,
+    /// Monotonic stamp, fresh every time the resolved backend
+    /// changes and *only* then: a re-applied backend that says the
+    /// same thing keeps the revision it had. Anything the request
+    /// path derives from a backend and caches (the upstream client
+    /// and its connection pool) is valid for exactly one revision,
+    /// which is what lets a control-plane resync re-send identical
+    /// config without dropping upstream connections.
+    pub revision: u64,
     pub kind: ActiveBackendKind,
 }
 
@@ -120,13 +128,18 @@ impl ActiveBackend {
 
 /// What the request path has to do to reach a backend: pick one of a
 /// set of resolved endpoints, or dial a host.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is the store's "did this actually change" test, and so
+/// compares resolved material by value, down to the bytes of a CA
+/// secret's certificates. It is an apply-time comparison; nothing on
+/// the request path performs it.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActiveBackendKind {
     Endpoints(ActiveEndpointSet),
     Dialable(ActiveDialable),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveEndpointSet {
     pub endpoints: Vec<Endpoint>,
     /// Application protocol the gateway speaks to this backend
@@ -137,7 +150,7 @@ pub struct ActiveEndpointSet {
 
 /// A host the gateway resolves and dials itself. Credentials attach
 /// here once they exist.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveDialable {
     pub host: String,
     pub port: u16,
@@ -150,45 +163,16 @@ pub struct ActiveDialable {
 /// A dialable backend's TLS settings, with its trust roots resolved
 /// against the registered secrets.
 ///
-/// Shared behind an `Arc` because the request path builds one client
-/// per backend from it and holds on to it: two requests reading the
-/// same `Arc` know they may reuse the same client and its connection
-/// pool.
-#[derive(Debug, Clone)]
+/// Shared behind an `Arc` so the request path can hold on to the
+/// settings its upstream client was built from without copying them
+/// per request; whether that client is still current is the
+/// backend's revision, not this pointer.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveBackendTls {
     pub roots: ActiveTrustRoots,
     pub sni: Option<String>,
     pub alpn: Vec<AlpnProtocol>,
     pub insecure_skip_verify: bool,
-}
-
-impl ActiveBackendTls {
-    /// Would these two compile to the same client TLS config? Trust
-    /// roots compare by secret identity: the store hands out one
-    /// `Arc` per registered secret and replaces it when the secret
-    /// changes, so identity is what "same material" means here — and
-    /// it keeps a re-applied backend from pointlessly dropping its
-    /// connection pool.
-    pub fn same_config(&self, other: &Self) -> bool {
-        self.sni == other.sni
-            && self.alpn == other.alpn
-            && self.insecure_skip_verify == other.insecure_skip_verify
-            && match (&self.roots, &other.roots) {
-                (ActiveTrustRoots::System, ActiveTrustRoots::System) => true,
-                (
-                    ActiveTrustRoots::Secret { key: a, secret: sa },
-                    ActiveTrustRoots::Secret { key: b, secret: sb },
-                ) => {
-                    a == b
-                        && match (sa, sb) {
-                            (Some(sa), Some(sb)) => Arc::ptr_eq(sa, sb),
-                            (None, None) => true,
-                            _ => false,
-                        }
-                }
-                _ => false,
-            }
-    }
 }
 
 /// Where the trust roots for an upstream chain come from, resolved.
@@ -205,4 +189,36 @@ pub enum ActiveTrustRoots {
         key: SecretKey,
         secret: Option<Arc<TlsSecret>>,
     },
+}
+
+// Hand-written because a `TlsSecret` is not comparable as a whole (it
+// may carry a private key, which has no equality) and because
+// identity is the wrong test: a resync re-sends the same certificates
+// as a new object, and that must read as unchanged. Only the
+// certificates matter to a trust decision, so only those are
+// compared.
+impl PartialEq for ActiveTrustRoots {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::System, Self::System) => true,
+            (
+                Self::Secret {
+                    key: a,
+                    secret: this,
+                },
+                Self::Secret {
+                    key: b,
+                    secret: that,
+                },
+            ) => {
+                a == b
+                    && match (this, that) {
+                        (Some(this), Some(that)) => this.certs == that.certs,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
 }

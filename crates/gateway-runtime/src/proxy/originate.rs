@@ -45,13 +45,15 @@ use crate::proxy::body::UpstreamBody;
 /// The upstream client for one dialable backend.
 pub(super) type TlsClient = Client<OriginateTls, UpstreamBody>;
 
-/// The per-backend upstream clients, keyed by backend.
+/// The per-backend upstream clients, keyed by backend and validated
+/// by its revision.
 ///
-/// An entry survives until the backend's TLS settings change, so a
-/// backend keeps its pooled connections across re-applied config that
-/// says the same thing. Entries for a backend the config drops are
-/// left behind — one client struct, whose idle connections the pool
-/// closes on its own.
+/// The store stamps a fresh revision only when a backend's resolved
+/// config actually changes, so an entry survives every re-apply that
+/// says the same thing and the backend keeps its pooled connections
+/// across a control-plane resync. Entries for a backend the config
+/// drops are left behind — one client struct, whose idle connections
+/// the pool closes on its own.
 pub(super) struct TlsClients {
     clients: Mutex<HashMap<BackendKey, Cached>>,
 }
@@ -63,7 +65,8 @@ impl TlsClients {
         }
     }
 
-    /// The client for `backend`, built on first use.
+    /// The client for `backend` at `revision`, built on first use and
+    /// on the first request after the backend changed.
     ///
     /// # Errors
     /// Returns [`OriginateError`] when the backend's TLS block does
@@ -73,11 +76,12 @@ impl TlsClients {
     pub(super) fn client_for(
         &self,
         backend: &BackendKey,
-        tls: &Arc<ActiveBackendTls>,
+        revision: u64,
+        tls: &ActiveBackendTls,
     ) -> Result<TlsClient, OriginateError> {
         let mut clients = self.clients.lock();
         if let Some(cached) = clients.get(backend)
-            && cached.tls.same_config(tls)
+            && cached.revision == revision
         {
             return Ok(cached.client.clone());
         }
@@ -85,7 +89,7 @@ impl TlsClients {
         clients.insert(
             backend.clone(),
             Cached {
-                tls: Arc::clone(tls),
+                revision,
                 client: client.clone(),
             },
         );
@@ -93,10 +97,10 @@ impl TlsClients {
     }
 }
 
-/// A backend's client plus the settings it was built from, which is
-/// what says whether it can be reused.
+/// A backend's client and the revision of the backend it was built
+/// from, which is what says whether it can be reused.
 struct Cached {
-    tls: Arc<ActiveBackendTls>,
+    revision: u64,
     client: TlsClient,
 }
 

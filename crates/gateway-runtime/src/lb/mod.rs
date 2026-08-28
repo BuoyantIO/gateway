@@ -178,6 +178,7 @@ mod tests {
     fn backend(endpoints: Vec<Endpoint>) -> Arc<ActiveBackend> {
         Arc::new(ActiveBackend {
             key: BackendKey::new("be"),
+            revision: 0,
             kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
                 endpoints,
                 protocol: BackendProtocol::Http1,
@@ -188,6 +189,7 @@ mod tests {
     fn dialable_backend() -> Arc<ActiveBackend> {
         Arc::new(ActiveBackend {
             key: BackendKey::new("be"),
+            revision: 0,
             kind: ActiveBackendKind::Dialable(ActiveDialable {
                 host: "api.example.com".into(),
                 port: 443,
