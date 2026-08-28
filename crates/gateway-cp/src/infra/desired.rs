@@ -206,7 +206,7 @@ fn deployment(
                         ]),
                         env: Some(vec![EnvVar {
                             name: "RUST_LOG".into(),
-                            value: Some("info".into()),
+                            value: Some(annotations::dp_log_filter(gw)),
                             ..Default::default()
                         }]),
                         ports: Some(container_ports),
