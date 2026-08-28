@@ -667,9 +667,15 @@ impl Inner {
             }),
             Backend::Dialable(d) => ActiveBackendKind::Dialable(self.resolve_dialable(d)),
         };
-        // Re-index the CA dependency from scratch: an update may have
-        // moved the backend to another secret, or off TLS entirely.
-        self.clear_backend_secret_index(&key);
+        // Re-index the CA dependency: an update may have moved the
+        // backend to another secret, or off TLS entirely. The old
+        // dependency is the one the backend still registered carries,
+        // since nothing has replaced it yet.
+        let previous = self
+            .backends
+            .get(&key)
+            .and_then(|old| ca_secret_key(&old.kind));
+        self.unindex_backend_ca(&key, previous.as_ref());
         if let Some(sk) = ca_secret_key(&kind) {
             self.backends_by_secret
                 .entry(sk)
@@ -708,10 +714,10 @@ impl Inner {
     }
 
     fn remove_backend(&mut self, key: &BackendKey) -> Vec<BindEvent> {
-        if self.backends.remove(key).is_none() {
+        let Some(old) = self.backends.remove(key) else {
             return Vec::new();
-        }
-        self.clear_backend_secret_index(key);
+        };
+        self.unindex_backend_ca(key, ca_secret_key(&old.kind).as_ref());
         self.cascade_routes_by_backend(key)
     }
 
@@ -774,26 +780,27 @@ impl Inner {
         self.place_backend(key, ActiveBackendKind::Dialable(dialable))
     }
 
-    /// Strip CA-index entries for a backend key (used before
-    /// re-indexing on update, and on remove).
-    fn clear_backend_secret_index(&mut self, key: &BackendKey) {
-        let secret_keys: Vec<SecretKey> = self
-            .backends_by_secret
-            .iter()
-            .filter(|(_, set)| set.contains(key))
-            .map(|(sk, _)| sk.clone())
-            .collect();
-        for sk in secret_keys {
-            let empty = match self.backends_by_secret.get_mut(&sk) {
-                Some(set) => {
-                    set.remove(key);
-                    set.is_empty()
-                }
-                None => false,
-            };
-            if empty {
-                self.backends_by_secret.remove(&sk);
-            }
+    /// Drop the backend's CA-index entry, before re-indexing on
+    /// update and on remove. `secret` is the dependency it had, or
+    /// `None` for a backend that had none.
+    ///
+    /// The entry is derived rather than searched for, unlike its
+    /// listener counterpart: a backend names at most one CA, and both
+    /// this and the indexing side read it out of the resolved backend
+    /// through `ca_secret_key`, so what is indexed for a backend is
+    /// always that. (`re_resolve_backend` replaces a backend without
+    /// touching the index, which is correct: re-resolving keeps the
+    /// same CA.)
+    fn unindex_backend_ca(&mut self, key: &BackendKey, secret: Option<&SecretKey>) {
+        let Some(sk) = secret else {
+            return;
+        };
+        let Some(set) = self.backends_by_secret.get_mut(sk) else {
+            return;
+        };
+        set.remove(key);
+        if set.is_empty() {
+            self.backends_by_secret.remove(sk);
         }
     }
 
@@ -1038,6 +1045,11 @@ impl Inner {
 
     /// Strip secret-index entries for a listener key (used before
     /// re-indexing with the new `cert_refs` on update, and on remove).
+    ///
+    /// This one searches the index, where the backend side derives
+    /// its one entry: a listener may name several secrets, and the
+    /// index is the source of truth for which (see
+    /// [`Inner::cert_refs_for`], which reads them back out of it).
     fn clear_listener_secret_index(&mut self, key: &ListenerKey) {
         let secret_keys: Vec<SecretKey> = self
             .listeners_by_secret
