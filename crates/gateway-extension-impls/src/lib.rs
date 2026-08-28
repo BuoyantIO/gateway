@@ -2,6 +2,8 @@
 //! `Extension` trait. Header config is parsed once at builder
 //! construction, so the hooks are infallible.
 
+pub mod bllmp;
+
 use std::sync::Arc;
 
 use bytes::Bytes;

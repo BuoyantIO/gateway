@@ -138,6 +138,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut classes = gateway_runtime::extension::Registry::new();
     gateway_extension_impls::register_builtins(&mut classes);
+    classes
+        .register(
+            gateway_extension_impls::bllmp::BLLMP_SELECTOR,
+            std::sync::Arc::new(gateway_extension_impls::bllmp::BllmpSelectorClass),
+        )
+        .expect("bllmp_selector is not a reserved name");
     let gateway = gateway_runtime::Gateway::with_metrics(store, metrics).with_classes(classes);
     gateway.run(drain_watch).await?;
 
