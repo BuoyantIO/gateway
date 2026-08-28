@@ -7,7 +7,7 @@ use crate::backend::Backend;
 use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::extension::{Extension, RequestBodyLimit};
-use crate::filter::{HeaderOps, HttpFilter};
+use crate::filter::HttpFilter;
 use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
 use crate::route::{HttpMatch, HttpRoute, PathMatch, QueryParamMatch, TcpRoute, TlsRoute};
 
@@ -33,10 +33,6 @@ pub enum RejectionReason {
     },
     #[error("path `{0}` must start with `/`")]
     PathNotSlash(String),
-    #[error("RequestHeaderModifier filter has no add/set/remove operations")]
-    EmptyHeaderModifier,
-    #[error("header `{0}` appears in more than one RequestHeaderModifier operation")]
-    HeaderInMultipleOps(String),
     #[error("static backend must have at least one endpoint")]
     StaticBackendNoEndpoints,
     #[error("dialable backend `host` must not be empty")]
@@ -244,25 +240,13 @@ fn validate_http_route(key: &str, route: &HttpRoute, out: &mut Vec<Rejection>) {
     for (i, m) in route.matches.iter().enumerate() {
         validate_http_match(&format!("{key}/matches[{i}]"), m, out);
     }
+    // A ref's class and config are resolved by the runtime, not
+    // here — the only file-level fact about a filter is its name.
     check_unique(
         &format!("{key}/filters"),
         route.filters.iter().map(HttpFilter::name),
         out,
     );
-    for (i, f) in route.filters.iter().enumerate() {
-        let ops = match f {
-            HttpFilter::RequestHeaderModifier {
-                request_headers, ..
-            } => request_headers,
-            HttpFilter::ResponseHeaderModifier {
-                response_headers, ..
-            } => response_headers,
-            // No header ops on a redirect, and a ref's class is
-            // resolved by the runtime, not here.
-            HttpFilter::RequestRedirect { .. } | HttpFilter::ExtensionRef { .. } => continue,
-        };
-        validate_header_ops(&format!("{key}/filters[{i}]"), ops, out);
-    }
 }
 
 fn validate_http_match(key: &str, m: &HttpMatch, out: &mut Vec<Rejection>) {
@@ -296,34 +280,6 @@ fn validate_query_param_match(key: &str, q: &QueryParamMatch, out: &mut Vec<Reje
             key: format!("{key}/name"),
             reason: RejectionReason::EmptyQueryParamName,
         });
-    }
-}
-
-fn validate_header_ops(key: &str, ops: &HeaderOps, out: &mut Vec<Rejection>) {
-    if ops.add.is_empty() && ops.set.is_empty() && ops.remove.is_empty() {
-        out.push(Rejection {
-            key: key.to_string(),
-            reason: RejectionReason::EmptyHeaderModifier,
-        });
-        return;
-    }
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut report_dup = |name: &str, out: &mut Vec<Rejection>| {
-        if !seen.insert(name.to_ascii_lowercase()) {
-            out.push(Rejection {
-                key: key.to_string(),
-                reason: RejectionReason::HeaderInMultipleOps(name.to_string()),
-            });
-        }
-    };
-    for h in &ops.add {
-        report_dup(&h.name, out);
-    }
-    for h in &ops.set {
-        report_dup(&h.name, out);
-    }
-    for h in &ops.remove {
-        report_dup(h, out);
     }
 }
 
@@ -674,126 +630,6 @@ gatewayConfig:
     }
 
     #[test]
-    fn empty_header_modifier_rejected() {
-        let cfg = parse(
-            r"
-gatewayConfig:
-  name: g
-  binds:
-    - name: b
-      port: 80
-      bindProtocol: HTTP
-      listeners:
-        - name: l
-          listenerProtocol: HTTP
-          routes:
-            - name: r
-              matches: [{ path: { type: PathPrefix, value: / } }]
-              backendRefs: [{ name: be }]
-              filters:
-                - { name: hdr, type: RequestHeaderModifier, requestHeaders: {} }
-",
-        );
-        let errs = validate(&cfg).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|r| matches!(r.reason, RejectionReason::EmptyHeaderModifier))
-        );
-    }
-
-    #[test]
-    fn header_in_multiple_ops_rejected() {
-        let cfg = parse(
-            r"
-gatewayConfig:
-  name: g
-  binds:
-    - name: b
-      port: 80
-      bindProtocol: HTTP
-      listeners:
-        - name: l
-          listenerProtocol: HTTP
-          routes:
-            - name: r
-              matches: [{ path: { type: PathPrefix, value: / } }]
-              backendRefs: [{ name: be }]
-              filters:
-                - name: hdr
-                  type: RequestHeaderModifier
-                  requestHeaders:
-                    add: [{ name: x-dup, value: a }]
-                    remove: [x-dup]
-",
-        );
-        let errs = validate(&cfg).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|r| matches!(r.reason, RejectionReason::HeaderInMultipleOps(_)))
-        );
-    }
-
-    #[test]
-    fn empty_response_header_modifier_rejected() {
-        let cfg = parse(
-            r"
-gatewayConfig:
-  name: g
-  binds:
-    - name: b
-      port: 80
-      bindProtocol: HTTP
-      listeners:
-        - name: l
-          listenerProtocol: HTTP
-          routes:
-            - name: r
-              matches: [{ path: { type: PathPrefix, value: / } }]
-              backendRefs: [{ name: be }]
-              filters:
-                - { name: rsp, type: ResponseHeaderModifier, responseHeaders: {} }
-",
-        );
-        let errs = validate(&cfg).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|r| matches!(r.reason, RejectionReason::EmptyHeaderModifier))
-        );
-    }
-
-    #[test]
-    fn response_header_in_multiple_ops_rejected() {
-        let cfg = parse(
-            r"
-gatewayConfig:
-  name: g
-  binds:
-    - name: b
-      port: 80
-      bindProtocol: HTTP
-      listeners:
-        - name: l
-          listenerProtocol: HTTP
-          routes:
-            - name: r
-              matches: [{ path: { type: PathPrefix, value: / } }]
-              backendRefs: [{ name: be }]
-              filters:
-                - name: rsp
-                  type: ResponseHeaderModifier
-                  responseHeaders:
-                    add: [{ name: x-dup, value: a }]
-                    remove: [x-dup]
-",
-        );
-        let errs = validate(&cfg).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|r| matches!(r.reason, RejectionReason::HeaderInMultipleOps(_)))
-        );
-    }
-
-    #[test]
     fn empty_static_backend_rejected() {
         let cfg = parse(
             r"
@@ -1024,7 +860,7 @@ gatewayConfig:
     #[test]
     fn duplicate_filter_name_within_route_rejected() {
         let cfg = parse(
-            r#"
+            r"
 gatewayConfig:
   name: g
   binds:
@@ -1039,9 +875,9 @@ gatewayConfig:
               matches: [{ path: { type: PathPrefix, value: / } }]
               backendRefs: [{ name: be }]
               filters:
-                - { name: same, type: RequestHeaderModifier, requestHeaders: { add: [{ name: a, value: "1" }] } }
-                - { name: same, type: RequestHeaderModifier, requestHeaders: { add: [{ name: b, value: "2" }] } }
-"#,
+                - { name: same, type: ExtensionRef }
+                - { name: same, type: ExtensionRef }
+",
         );
         let errs = validate(&cfg).unwrap_err();
         assert!(

@@ -12,7 +12,6 @@ use gateway_config::extension::FailureMode;
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
 
-pub mod builtin;
 mod cx;
 mod registry;
 

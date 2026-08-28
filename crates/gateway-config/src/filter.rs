@@ -1,28 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// One config carrier: every filter a route applies is a ref to an
+/// `Extension` object, built-in classes included.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum HttpFilter {
-    #[serde(rename_all = "camelCase")]
-    RequestHeaderModifier {
-        name: String,
-        request_headers: HeaderOps,
-    },
-    #[serde(rename_all = "camelCase")]
-    ResponseHeaderModifier {
-        name: String,
-        response_headers: HeaderOps,
-    },
-    #[serde(rename_all = "camelCase")]
-    RequestRedirect {
-        name: String,
-        #[serde(flatten)]
-        redirect: RedirectConfig,
-    },
     /// Runs the extension registered under `name`. `name` is also the
     /// filter's identity within the rule, so a rule references a
     /// given extension at most once.
-
     #[serde(rename_all = "camelCase")]
     ExtensionRef {
         name: String,
@@ -32,8 +17,9 @@ pub enum HttpFilter {
     },
 }
 
-/// A redirect's settings — the `RequestRedirect` class's config
-/// type, shared with the inline filter so the two cannot drift.
+/// A redirect's settings — the `request_redirect` class's config
+/// type, shared with the CP that serializes it so the two cannot
+/// drift.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedirectConfig {
@@ -52,8 +38,8 @@ pub struct RedirectConfig {
 }
 
 /// The scheme a redirect's `Location` uses. Gateway API restricts
-/// this to `http` or `https`; an unset scheme (`None` on the filter)
-/// keeps the request's scheme.
+/// this to `http` or `https`; an unset scheme keeps the request's
+/// scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scheme {
@@ -114,8 +100,8 @@ impl TryFrom<u16> for RedirectStatus {
     }
 }
 
-/// Path modifier for a [`HttpFilter::RequestRedirect`]. At most one
-/// form applies per filter.
+/// Path modifier for a [`RedirectConfig`]. At most one form applies
+/// per redirect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RedirectPath {
@@ -138,6 +124,9 @@ pub enum TcpFilter {
     TcpConnectionLog { name: String },
 }
 
+/// The `request_header_modifier` / `response_header_modifier`
+/// classes' config type, shared with the CP that serializes it so
+/// the two cannot drift.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeaderOps {
     #[serde(default)]
@@ -157,10 +146,7 @@ pub struct HeaderPair {
 impl HttpFilter {
     pub fn name(&self) -> &str {
         match self {
-            Self::RequestHeaderModifier { name, .. }
-            | Self::ResponseHeaderModifier { name, .. }
-            | Self::RequestRedirect { name, .. }
-            | Self::ExtensionRef { name, .. } => name,
+            Self::ExtensionRef { name, .. } => name,
         }
     }
 }
@@ -186,64 +172,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_redirect_deserializes() {
+    fn redirect_config_deserializes() {
+        // `path` uses serde_yaml's enum tag — the same form
+        // `to_string` emits when the CP serializes a synthesized
+        // object's config.
         let yaml = "
-type: RequestRedirect
-name: to-https
 scheme: https
 statusCode: 301
-path:
-  replacePrefixMatch: /new
+path: !replacePrefixMatch /new
 ";
-        let f: HttpFilter = serde_yaml::from_str(yaml).expect("valid redirect filter");
-        match f {
-            HttpFilter::RequestRedirect { name, redirect } => {
-                assert_eq!(name, "to-https");
-                assert_eq!(redirect.scheme, Some(Scheme::Https));
-                assert_eq!(redirect.hostname, None);
-                assert_eq!(redirect.port, None);
-                assert_eq!(redirect.status_code, RedirectStatus::MovedPermanently);
-                assert_eq!(
-                    redirect.path,
-                    Some(RedirectPath::ReplacePrefixMatch("/new".into()))
-                );
-            }
-            other => panic!("expected RequestRedirect, got {other:?}"),
-        }
+        let redirect: RedirectConfig = serde_yaml::from_str(yaml).expect("valid redirect config");
+        assert_eq!(redirect.scheme, Some(Scheme::Https));
+        assert_eq!(redirect.hostname, None);
+        assert_eq!(redirect.port, None);
+        assert_eq!(redirect.status_code, RedirectStatus::MovedPermanently);
+        assert_eq!(
+            redirect.path,
+            Some(RedirectPath::ReplacePrefixMatch("/new".into()))
+        );
     }
 
     #[test]
-    fn request_redirect_status_defaults_to_302() {
-        let yaml = "
-type: RequestRedirect
-name: bounce
-scheme: https
-";
-        let f: HttpFilter = serde_yaml::from_str(yaml).expect("valid redirect filter");
-        let HttpFilter::RequestRedirect { redirect, .. } = f else {
-            panic!("expected RequestRedirect");
-        };
+    fn redirect_config_status_defaults_to_302() {
+        let redirect: RedirectConfig = serde_yaml::from_str("scheme: https").expect("valid");
         assert_eq!(redirect.status_code, RedirectStatus::Found);
         assert_eq!(redirect.status_code.code(), 302);
     }
 
     #[test]
-    fn request_redirect_rejects_unsupported_status() {
-        let yaml = "
-type: RequestRedirect
-name: bad
-statusCode: 307
-";
-        assert!(serde_yaml::from_str::<HttpFilter>(yaml).is_err());
+    fn redirect_config_rejects_unsupported_status() {
+        assert!(serde_yaml::from_str::<RedirectConfig>("statusCode: 307").is_err());
     }
 
     #[test]
-    fn request_redirect_rejects_unsupported_scheme() {
-        let yaml = "
-type: RequestRedirect
-name: bad
-scheme: ftp
-";
-        assert!(serde_yaml::from_str::<HttpFilter>(yaml).is_err());
+    fn redirect_config_rejects_unsupported_scheme() {
+        assert!(serde_yaml::from_str::<RedirectConfig>("scheme: ftp").is_err());
     }
 }

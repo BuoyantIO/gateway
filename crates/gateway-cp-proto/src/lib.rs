@@ -112,19 +112,10 @@ mod tests {
                 weight: 1,
             }],
             filters: vec![v1::HttpFilter {
-                kind: Some(v1::http_filter::Kind::RequestHeaderModifier(
-                    v1::RequestHeaderModifier {
-                        name: "add-gateway-header".into(),
-                        request_headers: Some(v1::HeaderOps {
-                            add: vec![v1::HeaderPair {
-                                name: "x-gateway".into(),
-                                value: "demo".into(),
-                            }],
-                            set: vec![],
-                            remove: vec![],
-                        }),
-                    },
-                )),
+                kind: Some(v1::http_filter::Kind::ExtensionRef(v1::ExtensionRef {
+                    name: "add-gateway-header".into(),
+                    namespace: "demo".into(),
+                })),
             }],
         };
         let backend_upsert = v1::BackendUpsert {
