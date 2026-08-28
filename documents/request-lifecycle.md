@@ -360,7 +360,10 @@ trust store — answers 500, reason `backend_unresolved`. Nothing is
 dialed and nothing is counted against the destination: this is a
 configuration failure, not an upstream one, and the alternative
 (dialing with roots the operator did not ask for) is the one answer
-that must not happen.
+that must not happen. The failure is cached against the revision that
+produced it and logged once, like a route's filter resolution
+failure; the per-request record is the access log's reason. A config
+fix bumps the revision, which is what retries.
 
 ## Upstream answer
 

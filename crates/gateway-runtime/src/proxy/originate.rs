@@ -31,7 +31,7 @@ use http::Uri;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -45,8 +45,10 @@ use crate::proxy::body::UpstreamBody;
 /// The upstream client for one dialable backend.
 pub(super) type TlsClient = Client<OriginateTls, UpstreamBody>;
 
-/// The per-backend upstream clients, keyed by backend and validated
-/// by its revision.
+/// What each backend is dialed with, keyed by backend and validated
+/// by its revision. A failure to build it is cached the same way, so
+/// an unusable TLS block is decided and logged once rather than per
+/// request.
 ///
 /// The store stamps a fresh revision only when a backend's resolved
 /// config actually changes, so an entry survives every re-apply that
@@ -54,54 +56,64 @@ pub(super) type TlsClient = Client<OriginateTls, UpstreamBody>;
 /// across a control-plane resync. Entries for a backend the config
 /// drops are left behind — one client struct, whose idle connections
 /// the pool closes on its own.
+#[derive(Default)]
 pub(super) struct TlsClients {
-    clients: Mutex<HashMap<BackendKey, Cached>>,
+    clients: RwLock<HashMap<BackendKey, Cached>>,
 }
 
 impl TlsClients {
-    pub(super) fn new() -> Self {
-        Self {
-            clients: Mutex::new(HashMap::new()),
-        }
-    }
-
     /// The client for `backend` at `revision`, built on first use and
     /// on the first request after the backend changed.
     ///
     /// # Errors
-    /// Returns [`OriginateError`] when the backend's TLS block does
-    /// not compile to a client config: an unregistered CA secret, an
-    /// SNI that is not a server name, an unreadable platform trust
-    /// store.
+    /// The failure to compile the backend's TLS block, already logged
+    /// once when it was cached.
     pub(super) fn client_for(
         &self,
         backend: &BackendKey,
         revision: u64,
         tls: &ActiveBackendTls,
-    ) -> Result<TlsClient, OriginateError> {
-        let mut clients = self.clients.lock();
-        if let Some(cached) = clients.get(backend)
-            && cached.revision == revision
-        {
-            return Ok(cached.client.clone());
+    ) -> ClientResult {
+        let hit = {
+            let clients = self.clients.read();
+            clients
+                .get(backend)
+                .and_then(|c| (c.revision == revision).then(|| c.result.clone()))
+        };
+        if let Some(result) = hit {
+            return result;
         }
-        let client = Client::builder(TokioExecutor::new()).build(OriginateTls::new(tls)?);
-        clients.insert(
+
+        let result = OriginateTls::new(tls)
+            .map(|connector| Client::builder(TokioExecutor::new()).build(connector))
+            .map_err(|e| {
+                tracing::error!(%backend, error = %e, "cannot originate TLS to backend");
+                Arc::<str>::from(e.to_string())
+            });
+        self.clients.write().insert(
             backend.clone(),
             Cached {
                 revision,
-                client: client.clone(),
+                result: result.clone(),
             },
         );
-        Ok(client)
+        result
     }
 }
 
-/// A backend's client and the revision of the backend it was built
-/// from, which is what says whether it can be reused.
+/// A backend's client, or why it has none.
+pub(super) type ClientResult = Result<TlsClient, Arc<str>>;
+
+/// What was decided for one backend, and the revision it was decided
+/// for.
 struct Cached {
     revision: u64,
-    client: TlsClient,
+    /// Failures cache too: a TLS block that does not compile is
+    /// logged once and answered cheaply for every request after it,
+    /// instead of rebuilt and re-logged per request. Nothing stays
+    /// stuck by this, because every cause is a config problem and
+    /// fixing the config is what bumps the revision.
+    result: ClientResult,
 }
 
 /// Connector for one dialable backend: dial the host, then hand the
@@ -368,5 +380,45 @@ impl ServerCertVerifier for VerifyNothing {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_state::SecretKey;
+
+    use super::*;
+
+    fn settings(insecure_skip_verify: bool) -> ActiveBackendTls {
+        ActiveBackendTls {
+            // A CA the config never registered: nothing to verify
+            // against, so this compiles only when verification is off.
+            roots: ActiveTrustRoots::Secret {
+                key: SecretKey::local("provider-ca"),
+                secret: None,
+            },
+            sni: None,
+            alpn: vec![],
+            insecure_skip_verify,
+        }
+    }
+
+    /// A TLS block that does not compile is decided once per
+    /// revision, failure included: the request path gets the cached
+    /// answer instead of rebuilding it, and logging it, per request.
+    /// A new revision is what retries, which is why a config fix
+    /// recovers.
+    #[test]
+    fn an_unusable_tls_block_caches_its_failure_per_revision() {
+        let clients = TlsClients::default();
+        let backend = BackendKey::new("provider");
+
+        assert!(clients.client_for(&backend, 1, &settings(false)).is_err());
+        // Same revision, settings that would compile: still the
+        // cached failure, not a second attempt.
+        assert!(clients.client_for(&backend, 1, &settings(true)).is_err());
+        // The next revision decides again.
+        assert!(clients.client_for(&backend, 2, &settings(true)).is_ok());
+        assert!(clients.client_for(&backend, 2, &settings(false)).is_ok());
     }
 }

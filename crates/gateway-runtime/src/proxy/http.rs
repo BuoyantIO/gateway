@@ -108,7 +108,7 @@ impl Default for HttpClient {
         Self {
             h1,
             h2,
-            tls: Arc::new(TlsClients::new()),
+            tls: Arc::new(TlsClients::default()),
         }
     }
 }
@@ -1393,12 +1393,13 @@ async fn forward(
     // A TLS backend's client is built on first use from settings the
     // control plane already resolved; a failure here is a config
     // problem, not an upstream one, so it is not counted as a dial
-    // failure against the destination.
+    // failure against the destination. The cache logged it once when
+    // it decided it; the per-request record is the access log's
+    // reason.
     let upstream = if let Some((backend, revision, tls)) = dest.tls() {
         match client.tls.client_for(backend, revision, tls) {
             Ok(tls_client) => Upstream::Tls(Box::new(tls_client)),
-            Err(e) => {
-                tracing::error!(%backend, error = %e, "cannot originate TLS to backend");
+            Err(_) => {
                 return (
                     synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
                     Reason::BackendUnresolved,
