@@ -112,11 +112,22 @@ message ListenerTls {
 
 // -------- Secret --------
 
+// What the material in `data` is, and therefore which data keys the
+// DP expects to find. TLS carries its chain under "tls.crt" and its
+// private key under "tls.key" (empty for a CA-only secret); opaque
+// carries credentials under operator-chosen keys, named by whatever
+// references them.
+enum SecretType {
+  SECRET_TYPE_UNSPECIFIED = 0;
+  SECRET_TYPE_TLS         = 1;
+  SECRET_TYPE_OPAQUE      = 2;
+}
+
 message SecretUpsert {
-  string namespace = 1;
-  string name      = 2;
-  string cert_pem  = 3;
-  string key_pem   = 4;
+  string             namespace = 1;
+  string             name      = 2;
+  SecretType         type      = 3;
+  map<string, bytes> data      = 4;
 }
 
 // -------- Extension --------

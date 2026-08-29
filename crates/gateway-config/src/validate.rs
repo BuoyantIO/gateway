@@ -12,6 +12,7 @@ use crate::extension::{Extension, RequestBodyLimit};
 use crate::filter::HttpFilter;
 use crate::listener::{HttpsListener, Listener, TcpListener, TlsConfig, TlsListener, TlsMode};
 use crate::route::{HttpMatch, HttpRoute, PathMatch, QueryParamMatch, TcpRoute, TlsRoute};
+use crate::secret::Secret;
 
 #[derive(Debug, Error)]
 #[error("{key}: {reason}")]
@@ -91,7 +92,7 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), Vec<Rejection>> {
     );
     check_unique(
         "secrets",
-        cfg.secrets.iter().map(|s| s.name.as_str()),
+        cfg.secrets.iter().map(Secret::name),
         &mut rejections,
     );
     check_unique(

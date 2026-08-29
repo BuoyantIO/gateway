@@ -70,7 +70,7 @@ fn apply_upsert(store: &Store, upsert: pb::Upsert, out: &mut Affected) -> Result
         }
         pb::upsert::Body::Secret(s) => {
             let secret = convert::secret(s)?;
-            let key = SecretKey::new(secret.namespace.clone(), secret.name.clone());
+            let key = SecretKey::new(secret.namespace(), secret.name());
             store.upsert_secret(secret);
             out.secrets.push(key);
         }
@@ -127,7 +127,13 @@ fn apply_remove(store: &Store, remove: pb::Remove, out: &mut Affected) {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+
+    use gateway_config::secret::{SecretValue, TLS_CERT_KEY, TLS_KEY_KEY};
     use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey};
+
+    /// Stands in for a credential; no test may print it.
+    const SENSITIVE: &str = "sk-not-a-real-key";
 
     // ----- fixture builders -----
 
@@ -222,12 +228,38 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 -----END PRIVATE KEY-----\n";
 
     fn secret_upsert(name: &str, cert_pem: &str, key_pem: &str) -> pb::Upsert {
+        upsert_secret(
+            name,
+            pb::SecretType::Tls,
+            [
+                (TLS_CERT_KEY, cert_pem.as_bytes().to_vec()),
+                (TLS_KEY_KEY, key_pem.as_bytes().to_vec()),
+            ],
+        )
+    }
+
+    fn opaque_upsert(name: &str, key: &str, value: &str) -> pb::Upsert {
         pb::Upsert {
             body: Some(pb::upsert::Body::Secret(pb::SecretUpsert {
                 namespace: String::new(),
                 name: name.into(),
-                cert_pem: cert_pem.into(),
-                key_pem: key_pem.into(),
+                r#type: pb::SecretType::Opaque as i32,
+                data: HashMap::from([(key.to_string(), value.as_bytes().to_vec())]),
+            })),
+        }
+    }
+
+    fn upsert_secret<'a>(
+        name: &str,
+        secret_type: pb::SecretType,
+        data: impl IntoIterator<Item = (&'a str, Vec<u8>)>,
+    ) -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Secret(pb::SecretUpsert {
+                namespace: String::new(),
+                name: name.into(),
+                r#type: secret_type as i32,
+                data: data.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             })),
         }
     }
@@ -710,7 +742,8 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             .read()
             .secret(&gateway_state::SecretKey::local("app-tls"))
             .expect("secret present");
-        assert_eq!(s.name, "app-tls");
+        assert_eq!(s.name(), "app-tls");
+        assert!(s.as_tls().is_some(), "TLS material");
     }
 
     #[test]
@@ -758,8 +791,78 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             .read()
             .secret(&gateway_state::SecretKey::local("provider-ca"))
             .expect("secret present");
-        assert_eq!(s.certs.len(), 1);
-        assert!(s.key.is_none());
+        let tls = s.as_tls().expect("TLS material");
+        assert_eq!(tls.certs.len(), 1);
+        assert!(tls.key.is_none());
+    }
+
+    /// The whole point of a generic carrier: a credential the
+    /// gateway never interprets survives an apply, reachable by the
+    /// data key it arrived under, and prints as nothing.
+    #[test]
+    fn opaque_secret_round_trips_and_never_prints() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(
+                vec![opaque_upsert("provider-key", "apiKey", SENSITIVE)],
+                vec![],
+            ),
+        )
+        .expect("apply ok");
+        let s = store
+            .read()
+            .secret(&gateway_state::SecretKey::local("provider-key"))
+            .expect("secret present");
+        let opaque = s.as_opaque().expect("opaque material");
+        assert_eq!(
+            opaque.get("apiKey").and_then(SecretValue::expose_str),
+            Some(SENSITIVE)
+        );
+        assert!(opaque.get("nope").is_none());
+
+        // Nothing on the way out prints the value: not the secret,
+        // not the value itself, not the whole store entry.
+        let printed = format!(
+            "{s:?} {:?} {}",
+            opaque.get("apiKey"),
+            opaque.get("apiKey").unwrap()
+        );
+        assert!(!printed.contains(SENSITIVE), "{printed}");
+        assert!(
+            printed.contains("apiKey"),
+            "data keys stay visible: {printed}"
+        );
+    }
+
+    #[test]
+    fn secret_without_a_type_rejected() {
+        let store = Store::new();
+        let err = apply_update(
+            &store,
+            batch(
+                vec![upsert_secret("typeless", pb::SecretType::Unspecified, [])],
+                vec![],
+            ),
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, Error::InvalidSecret { name, .. } if name == "typeless"));
+    }
+
+    /// A TLS secret that never carried its chain is rejected here,
+    /// not at handshake time.
+    #[test]
+    fn tls_secret_without_cert_data_rejected() {
+        let store = Store::new();
+        let err = apply_update(
+            &store,
+            batch(
+                vec![upsert_secret("no-cert", pb::SecretType::Tls, [])],
+                vec![],
+            ),
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, Error::InvalidSecret { name, .. } if name == "no-cert"));
     }
 
     #[test]
