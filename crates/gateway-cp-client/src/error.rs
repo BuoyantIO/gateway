@@ -46,7 +46,7 @@ pub enum Error {
     InvalidSecret {
         name: String,
         #[source]
-        source: gateway_config::secret::TlsSecretError,
+        source: gateway_config::secret::SecretError,
     },
 
     #[error(transparent)]

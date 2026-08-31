@@ -19,7 +19,7 @@ use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::config::GatewayConfig;
 use gateway_config::listener::{HttpListener, Listener};
 use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
-use gateway_config::secret::TlsSecret;
+use gateway_config::secret::{Secret, TlsSecret};
 use gateway_runtime::{Gateway, Metrics, drain};
 use gateway_state::Store;
 use http::{Request, StatusCode};
@@ -261,7 +261,7 @@ struct TlsBackend {
     sni: Option<&'static str>,
     alpn: Vec<AlpnProtocol>,
     insecure: bool,
-    secrets: Vec<TlsSecret>,
+    secrets: Vec<Secret>,
 }
 
 impl TlsBackend {
@@ -278,7 +278,11 @@ impl TlsBackend {
             sni: None,
             alpn: vec![AlpnProtocol::H2, AlpnProtocol::Http11],
             insecure: false,
-            secrets: vec![TlsSecret::ca("", "provider-ca", CA_PEM).expect("valid CA")],
+            secrets: vec![
+                TlsSecret::ca("", "provider-ca", CA_PEM)
+                    .expect("valid CA")
+                    .into(),
+            ],
         }
     }
 }
@@ -415,7 +419,11 @@ async fn untrusted_chain_fails_the_dial() {
     let upstream = spawn_tls_upstream(&[AlpnProtocol::Http11]).await;
     let bind_port = free_port().await;
     let mut backend = TlsBackend::trusting_the_test_ca(upstream);
-    backend.secrets = vec![TlsSecret::ca("", "provider-ca", OTHER_CA_PEM).expect("valid CA")];
+    backend.secrets = vec![
+        TlsSecret::ca("", "provider-ca", OTHER_CA_PEM)
+            .expect("valid CA")
+            .into(),
+    ];
     let cfg = tls_config(bind_port, backend);
     let (stop, metrics, gw) = spawn_gateway(&cfg, bind_port).await;
 

@@ -12,7 +12,7 @@ use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
 use gateway_config::listener::{Listener, TlsMode};
 use gateway_config::route::HttpRoute;
-use gateway_config::secret::TlsSecret;
+use gateway_config::secret::{Secret, TlsSecret};
 
 use crate::active::{
     ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls, ActiveBind,
@@ -71,9 +71,10 @@ struct Inner {
     bind_meta: HashMap<BindKey, BindMeta>,
     /// Registered backends.
     backends: HashMap<BackendKey, Arc<ActiveBackend>>,
-    /// Registered TLS secrets. Like backends, these have no
-    /// preconditions — always active when registered.
-    secrets: HashMap<SecretKey, Arc<TlsSecret>>,
+    /// Registered secrets, TLS material and credentials alike. Like
+    /// backends, these have no preconditions — always active when
+    /// registered.
+    secrets: HashMap<SecretKey, Secret>,
     /// Registered `Extension` objects — raw config; like backends,
     /// always active when registered. Configuring them is the
     /// runtime's business.
@@ -108,20 +109,29 @@ struct Inner {
     routes_by_extension: HashMap<ExtensionKey, HashSet<RouteKey>>,
     /// Index: listeners naming a given secret in their `cert_refs`.
     listeners_by_secret: HashMap<SecretKey, HashSet<ListenerKey>>,
-    /// Index: dialable backends naming a given secret as the CA they
-    /// originate TLS against.
+    /// Index: dialable backends naming a given secret — the CA they
+    /// originate TLS against, and (once they carry them) the
+    /// credentials they authenticate with.
     backends_by_secret: HashMap<SecretKey, HashSet<BackendKey>>,
 }
 
-/// The CA secret a resolved backend depends on, if any.
-fn ca_secret_key(kind: &ActiveBackendKind) -> Option<SecretKey> {
+/// Every secret a resolved backend depends on.
+///
+/// A backend may name more than one — trust roots and credentials
+/// are separate secrets — and each has to cascade, so that rotating
+/// any one of them re-resolves the backend and everything the request
+/// path derived from it.
+fn secret_deps(kind: &ActiveBackendKind) -> Vec<SecretKey> {
     let ActiveBackendKind::Dialable(d) = kind else {
-        return None;
+        return Vec::new();
     };
-    match &d.tls.as_deref()?.roots {
-        ActiveTrustRoots::System => None,
-        ActiveTrustRoots::Secret { key, .. } => Some(key.clone()),
+    let mut keys = Vec::new();
+    if let Some(tls) = d.tls.as_deref()
+        && let ActiveTrustRoots::Secret { key, .. } = &tls.roots
+    {
+        keys.push(key.clone());
     }
+    keys
 }
 
 /// Collapse repeated events for one bind: a secret both a listener
@@ -263,7 +273,7 @@ impl Store {
         self.dispatch(events);
     }
 
-    pub fn upsert_secret(&self, secret: TlsSecret) {
+    pub fn upsert_secret(&self, secret: Secret) {
         let events = self.inner.write().upsert_secret(secret);
         self.dispatch(events);
     }
@@ -359,7 +369,7 @@ impl StoreRead<'_> {
         self.guard.extensions.get(key).cloned()
     }
 
-    pub fn secret(&self, key: &SecretKey) -> Option<Arc<TlsSecret>> {
+    pub fn secret(&self, key: &SecretKey) -> Option<Secret> {
         self.guard.secrets.get(key).cloned()
     }
 
@@ -667,16 +677,17 @@ impl Inner {
             }),
             Backend::Dialable(d) => ActiveBackendKind::Dialable(self.resolve_dialable(d)),
         };
-        // Re-index the CA dependency: an update may have moved the
-        // backend to another secret, or off TLS entirely. The old
-        // dependency is the one the backend still registered carries,
-        // since nothing has replaced it yet.
+        // Re-index the secret dependencies: an update may have moved
+        // the backend to another secret, or off TLS entirely. The old
+        // dependencies are the ones the backend still registered
+        // carries, since nothing has replaced it yet.
         let previous = self
             .backends
             .get(&key)
-            .and_then(|old| ca_secret_key(&old.kind));
-        self.unindex_backend_ca(&key, previous.as_ref());
-        if let Some(sk) = ca_secret_key(&kind) {
+            .map(|old| secret_deps(&old.kind))
+            .unwrap_or_default();
+        self.unindex_backend_secrets(&key, &previous);
+        for sk in secret_deps(&kind) {
             self.backends_by_secret
                 .entry(sk)
                 .or_default()
@@ -717,7 +728,7 @@ impl Inner {
         let Some(old) = self.backends.remove(key) else {
             return Vec::new();
         };
-        self.unindex_backend_ca(key, ca_secret_key(&old.kind).as_ref());
+        self.unindex_backend_secrets(key, &secret_deps(&old.kind));
         self.cascade_routes_by_backend(key)
     }
 
@@ -738,7 +749,7 @@ impl Inner {
                         TrustRoots::System => ActiveTrustRoots::System,
                         TrustRoots::Secret { namespace, name } => {
                             let key = SecretKey::new(namespace, name);
-                            let secret = self.secrets.get(&key).cloned();
+                            let secret = self.tls_secret(&key);
                             ActiveTrustRoots::Secret { key, secret }
                         }
                     },
@@ -773,35 +784,45 @@ impl Inner {
         let mut dialable = dialable.clone();
         let mut tls = tls.clone();
         tls.roots = ActiveTrustRoots::Secret {
-            secret: self.secrets.get(&sk).cloned(),
+            secret: self.tls_secret(&sk),
             key: sk,
         };
         dialable.tls = Some(Arc::new(tls));
         self.place_backend(key, ActiveBackendKind::Dialable(dialable))
     }
 
-    /// Drop the backend's CA-index entry, before re-indexing on
-    /// update and on remove. `secret` is the dependency it had, or
-    /// `None` for a backend that had none.
+    /// Drop the backend's secret-index entries, before re-indexing on
+    /// update and on remove. `secrets` are the dependencies it had,
+    /// empty for a backend that had none.
     ///
-    /// The entry is derived rather than searched for, unlike its
-    /// listener counterpart: a backend names at most one CA, and both
-    /// this and the indexing side read it out of the resolved backend
-    /// through `ca_secret_key`, so what is indexed for a backend is
-    /// always that. (`re_resolve_backend` replaces a backend without
-    /// touching the index, which is correct: re-resolving keeps the
-    /// same CA.)
-    fn unindex_backend_ca(&mut self, key: &BackendKey, secret: Option<&SecretKey>) {
-        let Some(sk) = secret else {
-            return;
-        };
-        let Some(set) = self.backends_by_secret.get_mut(sk) else {
-            return;
-        };
-        set.remove(key);
-        if set.is_empty() {
-            self.backends_by_secret.remove(sk);
+    /// The entries are derived rather than searched for, unlike their
+    /// listener counterpart: both this and the indexing side read
+    /// them out of the resolved backend through `secret_deps`, so
+    /// what is indexed for a backend is always exactly that.
+    /// (`re_resolve_backend` replaces a backend without touching the
+    /// index, which is correct: re-resolving keeps the same secrets.)
+    fn unindex_backend_secrets(&mut self, key: &BackendKey, secrets: &[SecretKey]) {
+        for sk in secrets {
+            let Some(set) = self.backends_by_secret.get_mut(sk) else {
+                continue;
+            };
+            set.remove(key);
+            if set.is_empty() {
+                self.backends_by_secret.remove(sk);
+            }
         }
+    }
+
+    /// The TLS material registered under `key`, or `None` when the
+    /// secret is absent — or carries credentials rather than a
+    /// certificate.
+    ///
+    /// Those two are different states: one is an ordering fact that
+    /// resolves itself when the secret lands, the other a
+    /// misconfiguration that never will. `validate` rejects the
+    /// mismatch in file config.
+    fn tls_secret(&self, key: &SecretKey) -> Option<Arc<TlsSecret>> {
+        self.secrets.get(key).and_then(Secret::as_tls).cloned()
     }
 
     fn upsert_extension(&mut self, ext: Extension) -> Vec<BindEvent> {
@@ -820,12 +841,12 @@ impl Inner {
         self.cascade_routes_by_extension(key)
     }
 
-    // A `TlsSecret` is valid by construction (parsed on the way in),
-    // so this is infallible. Both a listener's `cert_refs` and a
+    // A `Secret` is valid by construction (parsed on the way in), so
+    // this is infallible. Both a listener's `cert_refs` and a
     // dialable backend's CA may name the secret, so re-resolve both.
-    fn upsert_secret(&mut self, secret: TlsSecret) -> Vec<BindEvent> {
-        let key = SecretKey::new(secret.namespace.clone(), secret.name.clone());
-        self.secrets.insert(key.clone(), Arc::new(secret));
+    fn upsert_secret(&mut self, secret: Secret) -> Vec<BindEvent> {
+        let key = SecretKey::new(secret.namespace(), secret.name());
+        self.secrets.insert(key.clone(), secret);
         self.cascade_secret_dependents(&key)
     }
 
@@ -1178,7 +1199,7 @@ impl Inner {
         let secrets_ready = self.pending_listeners[key]
             .cert_refs()
             .iter()
-            .all(|s| self.secrets.get(s).is_some_and(|sec| sec.key.is_some()));
+            .all(|s| self.tls_secret(s).is_some_and(|sec| sec.key.is_some()));
         if !secrets_ready {
             return;
         }
@@ -1208,7 +1229,7 @@ impl Inner {
         let tls = match raw.cert_refs() {
             [] => None,
             refs => Some(ActiveTls {
-                secrets: refs.iter().map(|s| Arc::clone(&self.secrets[s])).collect(),
+                secrets: refs.iter().filter_map(|s| self.tls_secret(s)).collect(),
             }),
         };
         let active = Arc::new(ActiveListener {
@@ -1374,6 +1395,7 @@ fn decompose_listener(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
 
     use gateway_config::backend::{
@@ -1387,6 +1409,7 @@ mod tests {
         CertRef, HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
     };
     use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
+    use gateway_config::secret::{OpaqueSecret, SecretValue};
 
     // --- fixture builders ---
 
@@ -2394,8 +2417,10 @@ abIF6YlJNVR6UhS8sg==\n\
         SecretKey::local(name)
     }
 
-    fn tls_secret(name: &str) -> TlsSecret {
-        TlsSecret::new("", name, CERT_PEM, KEY_PEM).expect("valid test secret")
+    fn tls_secret(name: &str) -> Secret {
+        TlsSecret::new("", name, CERT_PEM, KEY_PEM)
+            .expect("valid test secret")
+            .into()
     }
 
     #[test]
@@ -2403,8 +2428,9 @@ abIF6YlJNVR6UhS8sg==\n\
         let store = Store::new();
         store.upsert_secret(tls_secret("app-tls"));
         let s = store.read().secret(&secretkey("app-tls")).expect("present");
-        assert_eq!(s.name, "app-tls");
-        assert_eq!(s.certs.len(), 1);
+        let tls = s.as_tls().expect("TLS material");
+        assert_eq!(tls.name, "app-tls");
+        assert_eq!(tls.certs.len(), 1);
     }
 
     #[test]
@@ -2415,8 +2441,19 @@ abIF6YlJNVR6UhS8sg==\n\
         assert!(store.read().secret(&secretkey("app-tls")).is_none());
     }
 
-    fn ca_secret(name: &str) -> TlsSecret {
-        TlsSecret::ca("", name, CERT_PEM).expect("valid test CA secret")
+    fn ca_secret(name: &str) -> Secret {
+        TlsSecret::ca("", name, CERT_PEM)
+            .expect("valid test CA secret")
+            .into()
+    }
+
+    fn opaque_secret(name: &str, key: &str, value: &str) -> Secret {
+        OpaqueSecret::new(
+            "",
+            name,
+            BTreeMap::from([(key.to_string(), SecretValue::new(value))]),
+        )
+        .into()
     }
 
     fn backend_revision(store: &Store, name: &str) -> u64 {
@@ -2462,6 +2499,20 @@ abIF6YlJNVR6UhS8sg==\n\
         };
         assert_eq!(key, &secretkey("provider-ca"));
         assert_eq!(secret.as_ref().expect("resolved").certs.len(), 1);
+    }
+
+    /// Trust roots are TLS material or nothing: a CA reference that
+    /// lands on an opaque secret reads exactly like one whose secret
+    /// has not arrived, and never falls back to the system store.
+    #[test]
+    fn backend_ca_naming_an_opaque_secret_stays_unresolved() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-ca", "apiKey", "sk-not-a-real-key"));
+        store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
+
+        let ActiveTrustRoots::Secret { secret: None, .. } = &backend_tls(&store, "be").roots else {
+            panic!("an opaque secret carries no trust roots");
+        };
     }
 
     #[test]
@@ -2609,7 +2660,11 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_backend(tls_dialable_backend("be", Some("provider-ca")));
         let revision = backend_revision(&store, "be");
 
-        store.upsert_secret(TlsSecret::ca("", "provider-ca", CERT_B_PEM).expect("valid CA"));
+        store.upsert_secret(
+            TlsSecret::ca("", "provider-ca", CERT_B_PEM)
+                .expect("valid CA")
+                .into(),
+        );
 
         assert!(backend_revision(&store, "be") > revision);
     }
@@ -2666,6 +2721,46 @@ abIF6YlJNVR6UhS8sg==\n\
         // The keypair secret promotes it.
         store.upsert_secret(tls_secret("app-tls"));
         assert!(store.read().is_listener_active(&lkey("b", "l")));
+    }
+
+    /// Same gate, other shape: a credential registered under the name
+    /// a listener terminates with is not a certificate, so the
+    /// listener stays pending until the TLS material lands.
+    #[test]
+    fn listener_with_an_opaque_secret_does_not_promote() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("app-tls", "apiKey", "sk-not-a-real-key"));
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+
+        assert!(
+            !store.read().is_listener_active(&lkey("b", "l")),
+            "a listener must not terminate with a credential"
+        );
+
+        store.upsert_secret(tls_secret("app-tls"));
+        assert!(store.read().is_listener_active(&lkey("b", "l")));
+    }
+
+    /// Both shapes share one namespace, so replacing a secret with
+    /// the other shape cascades to its dependents like any other
+    /// change.
+    #[test]
+    fn replacing_tls_material_with_a_credential_demotes_the_listener() {
+        let store = Store::new();
+        store.upsert_secret(tls_secret("app-tls"));
+        store.upsert_bind(tls_bind("b", 443)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), https_listener_with_certs("l", &["app-tls"]))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        assert!(store.read().is_listener_active(&lkey("b", "l")));
+
+        store.upsert_secret(opaque_secret("app-tls", "apiKey", "sk-not-a-real-key"));
+        assert!(!store.read().is_listener_active(&lkey("b", "l")));
     }
 
     #[test]

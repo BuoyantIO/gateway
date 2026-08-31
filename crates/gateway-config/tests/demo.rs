@@ -9,7 +9,7 @@ fn demo_fixture_parses_and_validates() {
     assert_eq!(cfg.binds.len(), 1);
     assert_eq!(cfg.backends.len(), 2);
     assert_eq!(cfg.secrets.len(), 1);
-    assert_eq!(cfg.secrets[0].name, "app-tls");
+    assert_eq!(cfg.secrets[0].name(), "app-tls");
     assert_eq!(cfg.extensions.len(), 1);
     assert_eq!(cfg.extensions[0].class, "request_header_modifier");
 

@@ -24,6 +24,7 @@ use gateway_api::apis::standard::httproutes::{
 use gateway_config::filter::{
     HeaderOps, HeaderPair, RedirectConfig, RedirectPath, RedirectStatus, Scheme,
 };
+use gateway_config::secret::{TLS_CERT_KEY, TLS_KEY_KEY};
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -224,8 +225,11 @@ fn emit_gateway_secrets(snapshot: &mut Snapshot, gw: &GatewayResolution<'_>) {
                 pb::SecretUpsert {
                     namespace: cert.namespace.clone(),
                     name: cert.name.clone(),
-                    cert_pem,
-                    key_pem,
+                    r#type: pb::SecretType::Tls as i32,
+                    data: HashMap::from([
+                        (TLS_CERT_KEY.to_string(), cert_pem.into_bytes()),
+                        (TLS_KEY_KEY.to_string(), key_pem.into_bytes()),
+                    ]),
                 },
             );
         }
@@ -237,8 +241,8 @@ fn emit_gateway_secrets(snapshot: &mut Snapshot, gw: &GatewayResolution<'_>) {
 /// not valid UTF-8.
 fn tls_material(secret: &Secret) -> Option<(String, String)> {
     let data = secret.data.as_ref()?;
-    let cert = String::from_utf8(data.get("tls.crt")?.0.clone()).ok()?;
-    let key = String::from_utf8(data.get("tls.key")?.0.clone()).ok()?;
+    let cert = String::from_utf8(data.get(TLS_CERT_KEY)?.0.clone()).ok()?;
+    let key = String::from_utf8(data.get(TLS_KEY_KEY)?.0.clone()).ok()?;
     Some((cert, key))
 }
 
@@ -2502,8 +2506,9 @@ mod tests {
             .expect("secret emitted");
         assert_eq!(up.namespace, "demo");
         assert_eq!(up.name, "foo");
-        assert_eq!(up.cert_pem, "CERTPEM");
-        assert_eq!(up.key_pem, "KEYPEM");
+        assert_eq!(up.r#type, pb::SecretType::Tls as i32);
+        assert_eq!(up.data[TLS_CERT_KEY], b"CERTPEM");
+        assert_eq!(up.data[TLS_KEY_KEY], b"KEYPEM");
     }
 
     #[test]
