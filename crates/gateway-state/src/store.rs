@@ -815,8 +815,12 @@ impl Inner {
 
     /// The TLS material registered under `key`, or `None` when the
     /// secret is absent — or carries credentials rather than a
-    /// certificate, which for anything asking for TLS is the same
-    /// answer.
+    /// certificate.
+    ///
+    /// Those two are different states: one is an ordering fact that
+    /// resolves itself when the secret lands, the other a
+    /// misconfiguration that never will. `validate` rejects the
+    /// mismatch in file config.
     fn tls_secret(&self, key: &SecretKey) -> Option<Arc<TlsSecret>> {
         self.secrets.get(key).and_then(Secret::as_tls).cloned()
     }
