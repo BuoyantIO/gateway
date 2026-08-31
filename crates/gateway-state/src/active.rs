@@ -1,14 +1,14 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use gateway_config::backend::{BackendProtocol, Endpoint};
+use gateway_config::backend::{AlpnProtocol, BackendProtocol, Endpoint};
 use gateway_config::bind::BindProtocol;
 use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
 use gateway_config::route::HttpMatch;
 use gateway_config::secret::TlsSecret;
 
-use crate::key::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey};
+use crate::key::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 
 #[derive(Debug, Clone)]
 pub struct ActiveBind {
@@ -90,6 +90,14 @@ pub struct ActiveBackendRef {
 #[derive(Debug, Clone)]
 pub struct ActiveBackend {
     pub key: BackendKey,
+    /// Monotonic stamp, fresh every time the resolved backend
+    /// changes and *only* then: a re-applied backend that says the
+    /// same thing keeps the revision it had. Anything the request
+    /// path derives from a backend and caches (the upstream client
+    /// and its connection pool) is valid for exactly one revision,
+    /// which is what lets a control-plane resync re-send identical
+    /// config without dropping upstream connections.
+    pub revision: u64,
     pub kind: ActiveBackendKind,
 }
 
@@ -120,13 +128,18 @@ impl ActiveBackend {
 
 /// What the request path has to do to reach a backend: pick one of a
 /// set of resolved endpoints, or dial a host.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is the store's "did this actually change" test, and so
+/// compares resolved material by value, down to the bytes of a CA
+/// secret's certificates. It is an apply-time comparison; nothing on
+/// the request path performs it.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActiveBackendKind {
     Endpoints(ActiveEndpointSet),
     Dialable(ActiveDialable),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveEndpointSet {
     pub endpoints: Vec<Endpoint>,
     /// Application protocol the gateway speaks to this backend
@@ -135,11 +148,77 @@ pub struct ActiveEndpointSet {
     pub protocol: BackendProtocol,
 }
 
-/// A host the gateway resolves and dials itself. TLS origination and
-/// credentials attach here once they exist.
-#[derive(Debug, Clone)]
+/// A host the gateway resolves and dials itself. Credentials attach
+/// here once they exist.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ActiveDialable {
     pub host: String,
     pub port: u16,
     pub path_prefix: Option<String>,
+    /// `Some` originates TLS to this host; `None` dials it in the
+    /// clear.
+    pub tls: Option<Arc<ActiveBackendTls>>,
+}
+
+/// A dialable backend's TLS settings, with its trust roots resolved
+/// against the registered secrets.
+///
+/// Shared behind an `Arc` so the request path can hold on to the
+/// settings its upstream client was built from without copying them
+/// per request; whether that client is still current is the
+/// backend's revision, not this pointer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveBackendTls {
+    pub roots: ActiveTrustRoots,
+    pub sni: Option<String>,
+    pub alpn: Vec<AlpnProtocol>,
+    pub insecure_skip_verify: bool,
+}
+
+/// Where the trust roots for an upstream chain come from, resolved.
+#[derive(Debug, Clone)]
+pub enum ActiveTrustRoots {
+    /// The platform trust store.
+    System,
+    /// The CA-only secret the backend names. `secret` is `None`
+    /// while that secret is not registered: the request path fails
+    /// the dial rather than falling back to the system store, since
+    /// trusting more than the operator asked for is the one answer
+    /// that must not happen.
+    Secret {
+        key: SecretKey,
+        secret: Option<Arc<TlsSecret>>,
+    },
+}
+
+// Hand-written because a `TlsSecret` is not comparable as a whole (it
+// may carry a private key, which has no equality) and because
+// identity is the wrong test: a resync re-sends the same certificates
+// as a new object, and that must read as unchanged. Only the
+// certificates matter to a trust decision, so only those are
+// compared.
+impl PartialEq for ActiveTrustRoots {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::System, Self::System) => true,
+            (
+                Self::Secret {
+                    key: a,
+                    secret: this,
+                },
+                Self::Secret {
+                    key: b,
+                    secret: that,
+                },
+            ) => {
+                a == b
+                    && match (this, that) {
+                        (Some(this), Some(that)) => this.certs == that.certs,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
 }

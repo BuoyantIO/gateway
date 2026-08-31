@@ -131,6 +131,10 @@ pub fn backend(msg: pb::BackendUpsert) -> Result<Backend, Error> {
     }))
 }
 
+/// An empty `key_pem` is a CA-only secret: certificates to verify an
+/// upstream against, with no key to serve. A keypair secret carries
+/// both.
+///
 /// # Errors
 /// Returns [`Error::InvalidSecret`] if the cert chain / private key
 /// PEM is malformed (parsed up front so a bad secret is rejected here
@@ -139,8 +143,12 @@ pub fn secret(msg: pb::SecretUpsert) -> Result<TlsSecret, Error> {
     // Namespace-qualified for the error so two same-named secrets in
     // different namespaces are distinguishable in logs.
     let name = SecretKey::new(msg.namespace.clone(), msg.name.clone()).to_string();
-    TlsSecret::new(msg.namespace, msg.name, &msg.cert_pem, &msg.key_pem)
-        .map_err(|source| Error::InvalidSecret { name, source })
+    let parsed = if msg.key_pem.is_empty() {
+        TlsSecret::ca(msg.namespace, msg.name, &msg.cert_pem)
+    } else {
+        TlsSecret::new(msg.namespace, msg.name, &msg.cert_pem, &msg.key_pem)
+    };
+    parsed.map_err(|source| Error::InvalidSecret { name, source })
 }
 
 /// # Errors

@@ -36,7 +36,7 @@ pub struct StaticBackend {
     pub protocol: BackendProtocol,
 }
 
-/// TODO: optional TLS origination and creds
+/// TODO: optional creds
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DialableBackend {
@@ -50,6 +50,82 @@ pub struct DialableBackend {
     /// forwards the path unchanged.
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// `Some` originates TLS to this host; `None` dials it in the
+    /// clear.
+    #[serde(default)]
+    pub tls: Option<BackendTls>,
+}
+
+/// Client-side TLS the gateway originates to a dialable backend.
+///
+/// The four settings are what an external provider needs: what to
+/// trust, what name to ask for, what protocols to offer, and — for
+/// development against a self-signed endpoint — nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendTls {
+    /// Certificates the upstream chain is verified against.
+    #[serde(default)]
+    pub ca: TrustRoots,
+    /// Name sent as SNI and verified against the upstream
+    /// certificate. `None` uses the backend's `host`, which is also
+    /// the only thing to go on when the host is a literal IP — one
+    /// that no certificate covers unless it carries an IP SAN.
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// Protocols offered in the TLS handshake, in preference order.
+    /// What the server picks decides the HTTP version upstream, so
+    /// the default offers both and lets the provider choose. An
+    /// explicitly empty list offers no ALPN at all, which settles on
+    /// HTTP/1.1.
+    #[serde(default = "default_alpn")]
+    pub alpn: Vec<AlpnProtocol>,
+    /// Accept any certificate, from anyone, for any name. For
+    /// development and integration testing against an endpoint whose
+    /// chain the gateway has no way to trust — never in production,
+    /// and it overrides `ca`.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// Where the trust roots for an upstream chain come from.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(tag = "type")]
+pub enum TrustRoots {
+    /// The platform trust store, which is what a public provider
+    /// chains to.
+    #[default]
+    System,
+    /// A CA-only secret: the certificates in its chain become the
+    /// only roots, replacing the system store rather than adding to
+    /// it.
+    Secret {
+        /// Namespace of the referenced Secret. Empty for a flat
+        /// local config, which has no namespaces.
+        #[serde(default)]
+        namespace: String,
+        name: String,
+    },
+}
+
+/// An ALPN protocol identifier, offered upstream and — when the
+/// server selects it — deciding the HTTP version the gateway speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum AlpnProtocol {
+    #[serde(rename = "h2")]
+    H2,
+    #[serde(rename = "http/1.1")]
+    Http11,
+}
+
+impl AlpnProtocol {
+    /// The identifier as it goes on the wire.
+    pub fn as_wire(self) -> &'static [u8] {
+        match self {
+            Self::H2 => b"h2",
+            Self::Http11 => b"http/1.1",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -78,4 +154,10 @@ pub struct BackendRef {
 
 fn default_weight() -> u32 {
     1
+}
+
+/// Offer both and let the provider choose: HTTP/2 where it is
+/// available, HTTP/1.1 everywhere else.
+fn default_alpn() -> Vec<AlpnProtocol> {
+    vec![AlpnProtocol::H2, AlpnProtocol::Http11]
 }

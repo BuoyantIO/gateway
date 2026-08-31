@@ -3,15 +3,22 @@ use std::fmt;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Deserializer};
 
-/// A TLS secret with its cert chain and private key already parsed
-/// to DER.
+/// A TLS secret with its cert chain — and, when it carries one, its
+/// private key — already parsed to DER.
+///
+/// Two shapes travel in this one type, told apart by `key`: a
+/// keypair a terminating listener serves, and a CA-only secret the
+/// gateway verifies an upstream against when it originates TLS.
 pub struct TlsSecret {
     /// Kubernetes namespace of the Secret. Empty for a flat local
     /// config, which has no namespaces.
     pub namespace: String,
     pub name: String,
     pub certs: Vec<CertificateDer<'static>>,
-    pub key: PrivateKeyDer<'static>,
+    /// `None` for a CA-only secret. A terminating listener needs a
+    /// key and is not promoted by a secret without one; trust roots
+    /// never look at it.
+    pub key: Option<PrivateKeyDer<'static>>,
 }
 
 impl Clone for TlsSecret {
@@ -20,7 +27,7 @@ impl Clone for TlsSecret {
             namespace: self.namespace.clone(),
             name: self.name.clone(),
             certs: self.certs.clone(),
-            key: self.key.clone_key(),
+            key: self.key.as_ref().map(PrivateKeyDer::clone_key),
         }
     }
 }
@@ -38,12 +45,34 @@ impl TlsSecret {
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<Self, TlsSecretError> {
-        let (certs, key) = parse_pem(cert_pem, key_pem)?;
+        let certs = parse_certs(cert_pem)?;
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .map_err(|e| TlsSecretError::Malformed(e.to_string()))?
+            .ok_or(TlsSecretError::NoPrivateKey)?;
         Ok(Self {
             namespace: namespace.into(),
             name: name.into(),
             certs,
-            key,
+            key: Some(key),
+        })
+    }
+
+    /// Parse a PEM bundle of certificates with no private key: the
+    /// trust roots a dialable backend verifies its upstream against.
+    ///
+    /// # Errors
+    /// Returns [`TlsSecretError`] if the PEM is malformed or has no
+    /// certificate.
+    pub fn ca(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        cert_pem: &str,
+    ) -> Result<Self, TlsSecretError> {
+        Ok(Self {
+            namespace: namespace.into(),
+            name: name.into(),
+            certs: parse_certs(cert_pem)?,
+            key: None,
         })
     }
 }
@@ -55,7 +84,7 @@ impl fmt::Debug for TlsSecret {
             .field("namespace", &self.namespace)
             .field("name", &self.name)
             .field("certs", &self.certs.len())
-            .field("key", &"<redacted>")
+            .field("key", &self.key.as_ref().map_or("<none>", |_| "<redacted>"))
             .finish()
     }
 }
@@ -71,12 +100,18 @@ impl<'de> Deserialize<'de> for TlsSecret {
             namespace: String,
             name: String,
             cert_pem: String,
+            /// Absent (or empty) makes this a CA-only secret.
+            #[serde(default)]
             key_pem: String,
         }
         let raw = Raw::deserialize(deserializer)?;
         let name = raw.name.clone();
-        Self::new(raw.namespace, raw.name, &raw.cert_pem, &raw.key_pem)
-            .map_err(|e| serde::de::Error::custom(format!("invalid secret `{name}`: {e}")))
+        let parsed = if raw.key_pem.is_empty() {
+            Self::ca(raw.namespace, raw.name, &raw.cert_pem)
+        } else {
+            Self::new(raw.namespace, raw.name, &raw.cert_pem, &raw.key_pem)
+        };
+        parsed.map_err(|e| serde::de::Error::custom(format!("invalid secret `{name}`: {e}")))
     }
 }
 
@@ -90,23 +125,17 @@ pub enum TlsSecretError {
     Malformed(String),
 }
 
-/// Parse a PEM cert chain + private key into DER. Used by
-/// [`TlsSecret::new`] and (later) by the data plane to build a rustls
-/// `ServerConfig`.
-fn parse_pem(
-    cert_pem: &str,
-    key_pem: &str,
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsSecretError> {
+/// Parse a PEM cert chain into DER. At least one certificate is
+/// required — a secret with none names nothing the gateway can serve
+/// or verify against.
+fn parse_certs(cert_pem: &str) -> Result<Vec<CertificateDer<'static>>, TlsSecretError> {
     let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsSecretError::Malformed(e.to_string()))?;
     if certs.is_empty() {
         return Err(TlsSecretError::NoCertificate);
     }
-    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .map_err(|e| TlsSecretError::Malformed(e.to_string()))?
-        .ok_or(TlsSecretError::NoPrivateKey)?;
-    Ok((certs, key))
+    Ok(certs)
 }
 
 #[cfg(test)]
@@ -155,6 +184,19 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     }
 
     #[test]
+    fn ca_parses_certs_without_a_key() {
+        let s = TlsSecret::ca("apps", "provider-ca", TEST_CERT_PEM).expect("valid");
+        assert_eq!(s.certs.len(), 1);
+        assert!(s.key.is_none());
+    }
+
+    #[test]
+    fn ca_rejects_missing_certificate() {
+        let err = TlsSecret::ca("", "provider-ca", "not a cert").unwrap_err();
+        assert!(matches!(err, TlsSecretError::NoCertificate));
+    }
+
+    #[test]
     fn debug_redacts_key() {
         let s = TlsSecret::new("", "app-tls", TEST_CERT_PEM, TEST_KEY_PEM).unwrap();
         let out = format!("{s:?}");
@@ -173,6 +215,15 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         );
         let secret: TlsSecret = serde_yaml::from_str(&yaml).expect("parses");
         assert_eq!(secret.name, "app-tls");
+    }
+
+    #[test]
+    fn deserialize_without_key_pem_yields_a_ca_secret() {
+        let yaml = format!("name: provider-ca\ncertPem: |\n{}", indent(TEST_CERT_PEM));
+        let secret: TlsSecret = serde_yaml::from_str(&yaml).expect("parses");
+        assert!(secret.key.is_none());
+        // Nothing to redact, and nothing claimed to be there.
+        assert!(format!("{secret:?}").contains("<none>"));
     }
 
     #[test]

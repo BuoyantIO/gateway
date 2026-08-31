@@ -830,10 +830,12 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "rustls",
+ "rustls-native-certs",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]
