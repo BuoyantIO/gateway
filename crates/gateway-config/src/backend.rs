@@ -1,6 +1,9 @@
 use std::net::IpAddr;
 
+use http::HeaderName;
 use serde::Deserialize;
+
+use crate::secret::SecretRef;
 
 /// A destination a route can name. Two kinds, distinguished by what
 /// the gateway has to do to reach them: a [`StaticBackend`] is a set
@@ -36,7 +39,6 @@ pub struct StaticBackend {
     pub protocol: BackendProtocol,
 }
 
-/// TODO: optional creds
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DialableBackend {
@@ -54,6 +56,14 @@ pub struct DialableBackend {
     /// clear.
     #[serde(default)]
     pub tls: Option<BackendTls>,
+    /// `Some` authenticates the gateway to this host: every request
+    /// it forwards carries the credential. `None` sends none, which
+    /// is every backend inside the cluster.
+    ///
+    /// Boxed to keep [`Backend`]'s two variants comparable in size;
+    /// nothing about the shape depends on it.
+    #[serde(default)]
+    pub auth: Option<Box<BackendAuth>>,
 }
 
 /// Client-side TLS the gateway originates to a dialable backend.
@@ -128,6 +138,42 @@ impl AlpnProtocol {
     }
 }
 
+/// How the gateway authenticates itself to a dialable backend.
+///
+/// Tagged with one variant today, so the scheme an operator names is
+/// part of what they wrote rather than something inferred from which
+/// fields they filled in; the next scheme is a variant beside this
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type")]
+pub enum BackendAuth {
+    ApiKey(ApiKeyAuth),
+}
+
+/// A credential the operator provisioned, sent verbatim in one
+/// header.
+///
+/// The defaults are what most providers ask for — `Authorization:
+/// Bearer <key>`. A provider that names its own header sets `header`
+/// (`x-api-key`, `api-key`), and one that wants the key with nothing
+/// in front of it sets `prefix: ""`; an absent `prefix` is the
+/// default, an empty one is a choice.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyAuth {
+    /// The secret holding the credential, and the data key inside it.
+    pub secret_ref: SecretRef,
+    /// Header the credential is sent in.
+    #[serde(
+        default = "default_auth_header",
+        with = "crate::serde_http::header_name"
+    )]
+    pub header: HeaderName,
+    /// Prepended to the credential inside the header value.
+    #[serde(default = "default_auth_prefix")]
+    pub prefix: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum BackendProtocol {
@@ -160,4 +206,12 @@ fn default_weight() -> u32 {
 /// available, HTTP/1.1 everywhere else.
 fn default_alpn() -> Vec<AlpnProtocol> {
     vec![AlpnProtocol::H2, AlpnProtocol::Http11]
+}
+
+fn default_auth_header() -> HeaderName {
+    http::header::AUTHORIZATION
+}
+
+fn default_auth_prefix() -> String {
+    "Bearer ".to_string()
 }

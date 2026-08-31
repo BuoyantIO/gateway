@@ -26,8 +26,8 @@ use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
 use gateway_state::{
-    ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls, ActiveDialable,
-    ActiveHttpRoute, ActiveListener, BackendKey, BindKey, Store,
+    ActiveBackend, ActiveBackendAuth, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls,
+    ActiveDialable, ActiveHttpRoute, ActiveListener, BackendKey, BindKey, Store,
 };
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
@@ -185,6 +185,7 @@ impl Destination {
                 revision: backend.revision,
                 path_prefix: dialable.path_prefix.clone(),
                 tls: dialable.tls.clone(),
+                auth: dialable.auth.clone(),
             }),
             protocol: backend.protocol(),
             info,
@@ -209,6 +210,13 @@ impl Destination {
             dialable.tls.as_deref()?,
         ))
     }
+
+    /// The credential this destination authenticates with. `None` for
+    /// a destination that authenticates with nothing, which is every
+    /// endpoint and every dialable backend without an auth block.
+    fn auth(&self) -> Option<&ActiveBackendAuth> {
+        self.dialable.as_ref()?.auth.as_deref()
+    }
 }
 
 /// The dialable-backend half of a destination.
@@ -222,6 +230,8 @@ struct Dialable {
     path_prefix: Option<String>,
     /// `Some` originates TLS with this backend's settings.
     tls: Option<Arc<ActiveBackendTls>>,
+    /// `Some` authenticates to this backend with this credential.
+    auth: Option<Arc<ActiveBackendAuth>>,
 }
 
 // =================== connection + request handlers ===================
@@ -1453,6 +1463,41 @@ async fn forward(
         req.headers_mut().remove(http::header::HOST);
     }
 
+    // The credential goes on last, and by replacing whatever was
+    // under its name: a client may have sent a credential of its own,
+    // and a route filter or an extension may have set the same
+    // header, so inserting rather than appending is what makes the
+    // provider see exactly one — the configured one. Nothing after
+    // this point reads it, and the value is marked sensitive, so it
+    // stays out of debug output and out of the H2 header index.
+    if let Some(auth) = dest.auth() {
+        let Some(value) = auth.value.clone() else {
+            // A credential the operator asked for that the gateway
+            // does not have: the secret has not arrived, names no
+            // such data key, or holds something no header can carry.
+            // The request fails here rather than reaching the
+            // provider unauthenticated, which is a different request
+            // than the one that was asked for, answered differently
+            // by the provider rather than visibly failing.
+            //
+            // Logged at debug, not warn: this is per-request, the
+            // store already said what it could when it decided the
+            // credential was unusable, and the access log carries the
+            // reason on every one of these. Same reasoning as the
+            // unbuildable TLS client above.
+            tracing::debug!(
+                secret = %auth.secret,
+                "backend credential is unresolved; not forwarding unauthenticated"
+            );
+            return (
+                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                Reason::CredentialUnresolved,
+                None,
+            );
+        };
+        req.headers_mut().insert(auth.header.clone(), value);
+    }
+
     let dial_start = Instant::now();
     let (upstream_resp, dial_ms) = match upstream.send(req).await {
         Ok(r) => {
@@ -2354,6 +2399,7 @@ mod tests {
             port,
             path_prefix: path_prefix.map(str::to_owned),
             tls: None,
+            auth: None,
         }
     }
 

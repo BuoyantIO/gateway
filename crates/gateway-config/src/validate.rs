@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use rustls_pki_types::ServerName;
 
-use crate::backend::{Backend, BackendTls, TrustRoots};
+use crate::backend::{Backend, BackendAuth, BackendTls, TrustRoots};
 use crate::bind::{Bind, BindProtocol};
 use crate::config::GatewayConfig;
 use crate::extension::{Extension, RequestBodyLimit};
@@ -46,11 +46,20 @@ pub enum RejectionReason {
     BackendTlsCaSecretNoName,
     #[error("backend TLS `sni` `{0}` is not a DNS name")]
     BackendTlsSniNotDnsName(String),
+    #[error("backend auth secret reference must have a `name`")]
+    BackendAuthSecretNoName,
+    #[error("backend auth secret reference must have a `key`")]
+    BackendAuthSecretNoKey,
     /// A reference that needs a certificate names a secret this
     /// config defines as credentials. Distinct from a reference to a
     /// secret that is simply absent, which is left to resolution.
     #[error("secret `{0}` carries credentials, not TLS material")]
     SecretNotTlsMaterial(String),
+    /// The mirror of [`RejectionReason::SecretNotTlsMaterial`]: a
+    /// credential reference names a secret this config defines as a
+    /// certificate.
+    #[error("secret `{0}` carries TLS material, not credentials")]
+    SecretNotCredentialMaterial(String),
     #[error("TCP listener must have exactly one route, found {0}")]
     TcpListenerRouteCount(usize),
     /// A query-param match has an empty `name`. (Header-match
@@ -80,8 +89,8 @@ impl fmt::Display for BindProtocol {
 /// a secret, backend or extension this config does not define is left
 /// alone, because absence is an ordering fact the store settles by
 /// stashing. The one cross-object check is
-/// [`check_tls_references`], which rules on a secret that IS here and
-/// has the wrong material.
+/// [`check_secret_references`], which rules on a secret that IS here
+/// and has the wrong material.
 ///
 /// # Errors
 ///
@@ -121,7 +130,7 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), Vec<Rejection>> {
     for (i, ext) in cfg.extensions.iter().enumerate() {
         validate_extension(&format!("extensions[{i}]"), ext, &mut rejections);
     }
-    check_tls_references(cfg, &mut rejections);
+    check_secret_references(cfg, &mut rejections);
 
     if rejections.is_empty() {
         Ok(())
@@ -130,9 +139,10 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), Vec<Rejection>> {
     }
 }
 
-/// Reject a reference that needs a certificate but names a secret
-/// this config declares as credentials: a listener's
-/// `certificateRefs`, and a dialable backend's trust roots.
+/// Reject a reference that names a secret this config declares with
+/// the other shape: a listener's `certificateRefs` or a dialable
+/// backend's trust roots pointing at credentials, and a backend's
+/// `auth` pointing at a certificate.
 ///
 /// This is the one place the shapes are cross-checked, and it is
 /// worth doing here because a flat config holds the secrets and their
@@ -141,18 +151,24 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), Vec<Rejection>> {
 /// error: a named secret that this config does not define is
 /// stashed by the store until it arrives, and cannot be told from one
 /// that never will.
-fn check_tls_references(cfg: &GatewayConfig, out: &mut Vec<Rejection>) {
+fn check_secret_references(cfg: &GatewayConfig, out: &mut Vec<Rejection>) {
     let by_id: HashMap<(&str, &str), &Secret> = cfg
         .secrets
         .iter()
         .map(|s| ((s.namespace(), s.name()), s))
         .collect();
     // A secret is TLS material, credentials, or not here at all; only
-    // the middle case is a rejection.
-    let mismatched = |namespace: &str, name: &str| {
+    // the wrong one of the first two is a rejection, in either
+    // direction.
+    let not_tls = |namespace: &str, name: &str| {
         by_id
             .get(&(namespace, name))
             .is_some_and(|s| s.as_tls().is_none())
+    };
+    let not_credential = |namespace: &str, name: &str| {
+        by_id
+            .get(&(namespace, name))
+            .is_some_and(|s| s.as_opaque().is_none())
     };
 
     for (i, bind) in cfg.binds.iter().enumerate() {
@@ -165,7 +181,7 @@ fn check_tls_references(cfg: &GatewayConfig, out: &mut Vec<Rejection>) {
             for (k, cert) in certificates.iter().enumerate() {
                 // Other kinds are the store's to reject; this says
                 // nothing about them.
-                if cert.kind == "Secret" && mismatched(&cert.namespace, &cert.name) {
+                if cert.kind == "Secret" && not_tls(&cert.namespace, &cert.name) {
                     out.push(Rejection {
                         key: format!("binds[{i}]/listeners[{j}]/tls/certificates[{k}]"),
                         reason: RejectionReason::SecretNotTlsMaterial(cert.name.clone()),
@@ -179,14 +195,22 @@ fn check_tls_references(cfg: &GatewayConfig, out: &mut Vec<Rejection>) {
         let Backend::Dialable(d) = backend else {
             continue;
         };
-        let Some(TrustRoots::Secret { namespace, name }) = d.tls.as_ref().map(|tls| &tls.ca) else {
-            continue;
-        };
-        if mismatched(namespace, name) {
+        if let Some(TrustRoots::Secret { namespace, name }) = d.tls.as_ref().map(|tls| &tls.ca)
+            && not_tls(namespace, name)
+        {
             out.push(Rejection {
                 key: format!("backends[{i}]/tls/ca"),
                 reason: RejectionReason::SecretNotTlsMaterial(name.clone()),
             });
+        }
+        if let Some(BackendAuth::ApiKey(api_key)) = d.auth.as_deref() {
+            let secret = &api_key.secret_ref;
+            if not_credential(&secret.namespace, &secret.name) {
+                out.push(Rejection {
+                    key: format!("backends[{i}]/auth"),
+                    reason: RejectionReason::SecretNotCredentialMaterial(secret.name.clone()),
+                });
+            }
         }
     }
 }
@@ -402,6 +426,9 @@ fn validate_backend(key: &str, backend: &Backend, out: &mut Vec<Rejection>) {
             if let Some(tls) = &d.tls {
                 validate_backend_tls(key, tls, out);
             }
+            if let Some(auth) = &d.auth {
+                validate_backend_auth(key, auth, out);
+            }
         }
     }
 }
@@ -429,6 +456,26 @@ fn validate_backend_tls(key: &str, tls: &BackendTls, out: &mut Vec<Rejection>) {
         out.push(Rejection {
             key: key.to_string(),
             reason: RejectionReason::BackendTlsSniNotDnsName(sni.clone()),
+        });
+    }
+}
+
+/// A credential reference that names nothing cannot resolve later:
+/// unlike an absent secret, there is no arrival that fixes it. The
+/// data key is as load-bearing as the name — a secret carries several
+/// — so both are required.
+fn validate_backend_auth(key: &str, auth: &BackendAuth, out: &mut Vec<Rejection>) {
+    let BackendAuth::ApiKey(api_key) = auth;
+    if api_key.secret_ref.name.is_empty() {
+        out.push(Rejection {
+            key: format!("{key}/auth"),
+            reason: RejectionReason::BackendAuthSecretNoName,
+        });
+    }
+    if api_key.secret_ref.key.is_empty() {
+        out.push(Rejection {
+            key: format!("{key}/auth"),
+            reason: RejectionReason::BackendAuthSecretNoKey,
         });
     }
 }
@@ -878,6 +925,132 @@ gatewayConfig:
             .find(|r| matches!(&r.reason, RejectionReason::SecretNotTlsMaterial(n) if n == "creds"))
             .expect("a CA naming a credential is rejected");
         assert_eq!(r.key, "backends[0]/tls/ca");
+    }
+
+    #[test]
+    fn backend_auth_naming_a_certificate_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: ApiKey
+        secretRef: { name: app-tls, key: apiKey }
+  secrets:
+    - name: app-tls
+      type: Tls
+      certPem: |
+        -----BEGIN CERTIFICATE-----
+        MIIBgjCCASmgAwIBAgIUW/OT9NoEgpMEra4i2ttY/oSsRe0wCgYIKoZIzj0EAwIw
+        FzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MB4XDTI2MDYyNjEwNTEyOFoXDTM2MDYy
+        MzEwNTEyOFowFzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MFkwEwYHKoZIzj0CAQYI
+        KoZIzj0DAQcDQgAEZoF6gHnR0OJdILhqvT75ZE5oX/NkCobjCPRKQmQAvEFeN8ku
+        f+C449e9U2Gq6S7C72DJWjcsr8gaxjiMRie0H6NTMFEwHQYDVR0OBBYEFKmMFFZT
+        6oW/R893bFKGDqRaBuoRMB8GA1UdIwQYMBaAFKmMFFZT6oW/R893bFKGDqRaBuoR
+        MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgEdjQ6EJUY9QMrNQy
+        YhAYK89fjb5J6TE0AJY4QnmcFR0CIHo7A7WYP2hT7rr6orgxEqAVx7DGbd0aCCqe
+        GkIpYyxV
+        -----END CERTIFICATE-----
+      keyPem: |
+        -----BEGIN PRIVATE KEY-----
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H
+        /hzgYBDdRqvQrz6jRyF1kz8TrcChRANCAARmgXqAedHQ4l0guGq9PvlkTmhf82QK
+        huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf
+        -----END PRIVATE KEY-----
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        let r = errs
+            .iter()
+            .find(|r| {
+                matches!(&r.reason, RejectionReason::SecretNotCredentialMaterial(n) if n == "app-tls")
+            })
+            .expect("an auth block naming a certificate is rejected");
+        assert_eq!(r.key, "backends[0]/auth");
+    }
+
+    #[test]
+    fn backend_auth_naming_a_credential_accepted() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      tls: {}
+      auth:
+        type: ApiKey
+        secretRef: { name: creds, key: apiKey }
+  secrets:
+    - name: creds
+      type: Opaque
+      data: { apiKey: sk-not-a-real-key }
+",
+        );
+        validate(&cfg).expect("a credential named where credentials belong validates");
+    }
+
+    // ---- backend auth ----
+
+    #[test]
+    fn backend_auth_secret_ref_without_name_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: ApiKey
+        secretRef: { name: '', key: apiKey }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        let r = errs
+            .iter()
+            .find(|r| matches!(r.reason, RejectionReason::BackendAuthSecretNoName))
+            .expect("an auth block naming no secret is rejected");
+        assert_eq!(r.key, "backends[0]/auth");
+    }
+
+    /// The data key is as load-bearing as the name: a secret carries
+    /// several, and an empty key names none of them.
+    #[test]
+    fn backend_auth_secret_ref_without_key_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: ApiKey
+        secretRef: { name: creds, key: '' }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::BackendAuthSecretNoKey))
+        );
     }
 
     /// Absence is not a mismatch: a reference to a secret this config

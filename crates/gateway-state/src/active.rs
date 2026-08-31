@@ -1,12 +1,14 @@
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use gateway_config::backend::{AlpnProtocol, BackendProtocol, Endpoint};
+use gateway_config::backend::{AlpnProtocol, ApiKeyAuth, BackendProtocol, Endpoint};
 use gateway_config::bind::BindProtocol;
 use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
 use gateway_config::route::HttpMatch;
-use gateway_config::secret::TlsSecret;
+use gateway_config::secret::{OpaqueSecret, SecretRef, TlsSecret};
+use http::{HeaderName, HeaderValue};
 
 use crate::key::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 
@@ -148,8 +150,7 @@ pub struct ActiveEndpointSet {
     pub protocol: BackendProtocol,
 }
 
-/// A host the gateway resolves and dials itself. Credentials attach
-/// here once they exist.
+/// A host the gateway resolves and dials itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveDialable {
     pub host: String,
@@ -158,6 +159,9 @@ pub struct ActiveDialable {
     /// `Some` originates TLS to this host; `None` dials it in the
     /// clear.
     pub tls: Option<Arc<ActiveBackendTls>>,
+    /// `Some` authenticates every request the gateway sends here,
+    /// with its credential resolved against the registered secrets.
+    pub auth: Option<Arc<ActiveBackendAuth>>,
 }
 
 /// A dialable backend's TLS settings, with its trust roots resolved
@@ -221,4 +225,154 @@ impl PartialEq for ActiveTrustRoots {
             _ => false,
         }
     }
+}
+
+/// A dialable backend's credential, resolved against the registered
+/// secrets and already shaped into the header that goes upstream.
+///
+/// The header value is built here, at apply time, rather than per
+/// request: what a credential has to be — text, valid in a header,
+/// present at all — is a property of the secret the operator
+/// provisioned, so it is settled once when the secret lands and not
+/// re-litigated on every request.
+///
+/// `value` is `None` while the credential is unusable: the secret is
+/// not registered yet, carries no such data key, or holds something
+/// no header can express. The first recovers when the secret lands,
+/// the others do not, but the request path treats all three the
+/// same and fails the request rather than reaching the provider
+/// unauthenticated — the one outcome that must not happen, since an
+/// unauthenticated call is a call the provider answers differently
+/// rather than one that visibly breaks.
+///
+/// Shared behind an `Arc` for the same reason the TLS settings are:
+/// the request path holds on to it without copying per request.
+#[derive(Clone, PartialEq)]
+pub struct ActiveBackendAuth {
+    /// The secret and data key the credential came from. Kept so
+    /// re-resolution after a rotation reads the same reference the
+    /// operator wrote, and so a failure names it.
+    pub secret: SecretRef,
+    /// Header the credential is sent in.
+    pub header: HeaderName,
+    /// Prefix the value was built with, kept for re-resolution.
+    pub prefix: String,
+    /// The complete header value, marked sensitive, or `None` when
+    /// the credential did not resolve.
+    pub value: Option<HeaderValue>,
+}
+
+impl ActiveBackendAuth {
+    /// Build the upstream header for `auth` from the secret
+    /// registered under its reference, or leave it unresolved.
+    ///
+    /// The three ways it can fail to resolve are told apart here
+    /// because they are diagnosed differently, not because the
+    /// request path distinguishes them; see [`credential_header`] for
+    /// what the material has to be.
+    pub fn resolve(auth: &ApiKeyAuth, secret: Option<&Arc<OpaqueSecret>>) -> Self {
+        Self::build(&auth.secret_ref, &auth.header, &auth.prefix, secret)
+    }
+
+    /// The same credential re-read after a secret arrived, rotated or
+    /// went away. The reference, the header and the prefix are the
+    /// operator's and carry over untouched; only the value is built
+    /// again.
+    #[must_use]
+    pub fn re_resolve(&self, secret: Option<&Arc<OpaqueSecret>>) -> Self {
+        Self::build(&self.secret, &self.header, &self.prefix, secret)
+    }
+
+    fn build(
+        secret_ref: &SecretRef,
+        header: &HeaderName,
+        prefix: &str,
+        secret: Option<&Arc<OpaqueSecret>>,
+    ) -> Self {
+        let value = match secret {
+            // Not registered yet. Silent: the reference recovers when
+            // the secret lands, exactly as an unresolved backend ref
+            // does, and saying so on every apply would be noise.
+            None => None,
+            Some(secret) => match secret.get(&secret_ref.key) {
+                None => {
+                    // A data key the operator never set. The key
+                    // names are not material, so listing them is what
+                    // makes the typo findable.
+                    tracing::warn!(
+                        secret = %secret_ref,
+                        keys = ?secret.keys().collect::<Vec<_>>(),
+                        "credential secret carries no such data key"
+                    );
+                    None
+                }
+                Some(material) => {
+                    let value = credential_header(prefix, material.expose());
+                    if value.is_none() {
+                        // Empty, or bytes no header can carry. Never
+                        // the material itself, and never its length.
+                        tracing::warn!(
+                            secret = %secret_ref,
+                            "credential is empty or not valid in a header value"
+                        );
+                    }
+                    value
+                }
+            },
+        };
+        Self {
+            secret: secret_ref.clone(),
+            header: header.clone(),
+            prefix: prefix.to_string(),
+            value,
+        }
+    }
+}
+
+// Hand-written so nothing prints the credential: a `HeaderValue`
+// decides that for itself, and this does not depend on it deciding
+// the way we asked. Whether the credential resolved is diagnostic and
+// is printed; the material never is.
+impl fmt::Debug for ActiveBackendAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActiveBackendAuth")
+            // `namespace/name#key`, the form a warning names it by.
+            .field("secret", &format_args!("{}", self.secret))
+            .field("header", &self.header)
+            .field("prefix", &self.prefix)
+            // Whether the credential resolved is the diagnostic, and
+            // is the most a reader gets; the material is not printed
+            // in any form, not even its length.
+            .field(
+                "value",
+                &self.value.as_ref().map_or("<unresolved>", |_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// The header value a credential goes upstream in: the configured
+/// prefix, then the material.
+///
+/// The material is trimmed of surrounding ASCII whitespace first,
+/// because a Secret written with `--from-file` or a heredoc carries a
+/// trailing newline that is not part of the credential and that no
+/// header may hold.
+/// What is left has to be non-empty and legal in a header value, or
+/// there is no credential here.
+///
+/// The value is marked sensitive, which keeps it out of `HeaderValue`
+/// debug output and, on HTTP/2, out of the HPACK index the connection
+/// shares with every other request on it.
+fn credential_header(prefix: &str, material: &[u8]) -> Option<HeaderValue> {
+    let material = material.trim_ascii();
+    if material.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(prefix.len() + material.len());
+    bytes.extend_from_slice(prefix.as_bytes());
+    bytes.extend_from_slice(material);
+    let mut value = HeaderValue::from_bytes(&bytes).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }

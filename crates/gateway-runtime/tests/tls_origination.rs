@@ -246,6 +246,7 @@ fn tls_config(bind_port: u16, upstream: TlsBackend) -> GatewayConfig {
                 alpn: upstream.alpn,
                 insecure_skip_verify: upstream.insecure,
             }),
+            auth: None,
         })],
         secrets: upstream.secrets,
         extensions: vec![],

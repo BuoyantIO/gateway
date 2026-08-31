@@ -195,6 +195,7 @@ mod tests {
                 port: 443,
                 path_prefix: None,
                 tls: None,
+                auth: None,
             }),
         })
     }
