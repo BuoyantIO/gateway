@@ -104,6 +104,41 @@ impl TlsClients {
 /// A backend's client, or why it has none.
 pub(super) type ClientResult = Result<TlsClient, Arc<str>>;
 
+/// The client for the calls the gateway makes on its own account,
+/// rather than on behalf of a request: today, `OAuth2` token endpoints.
+///
+/// One client for all of them, built once. What it verifies against
+/// is the platform trust store, which is what a public provider
+/// chains to and the only thing a token endpoint has in common with
+/// the backend that accepts its tokens — the two are usually
+/// different hosts, so the backend's own roots would be the wrong
+/// answer. Sharing the client is what lets two backends that draw
+/// tokens from the same endpoint share connections to it.
+///
+/// # Errors
+/// The failure to build it, already logged once when it was decided.
+pub(super) fn system_client() -> ClientResult {
+    static CLIENT: OnceLock<ClientResult> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let settings = ActiveBackendTls {
+                roots: ActiveTrustRoots::System,
+                // The name to verify is the one dialed: an endpoint
+                // the gateway reaches by its own URL has no other.
+                sni: None,
+                alpn: vec![AlpnProtocol::H2, AlpnProtocol::Http11],
+                insecure_skip_verify: false,
+            };
+            OriginateTls::new(&settings)
+                .map(|connector| Client::builder(TokioExecutor::new()).build(connector))
+                .map_err(|e| {
+                    tracing::error!(error = %e, "cannot originate TLS to a token endpoint");
+                    Arc::<str>::from(e.to_string())
+                })
+        })
+        .clone()
+}
+
 /// What was decided for one backend, and the revision it was decided
 /// for.
 struct Cached {

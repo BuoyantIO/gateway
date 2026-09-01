@@ -128,6 +128,7 @@ pub enum Reason {
     /// the request was not forwarded. Distinct from
     /// [`Reason::BackendUnresolved`]: the backend itself resolved.
     CredentialUnresolved,
+    TokenUnavailable,
     NoEndpoint,
     DialFailure,
     #[allow(dead_code)]
@@ -147,6 +148,7 @@ impl Reason {
             Reason::NoBackend => "no_backend",
             Reason::BackendUnresolved => "backend_unresolved",
             Reason::CredentialUnresolved => "credential_unresolved",
+            Reason::TokenUnavailable => "token_unavailable",
             Reason::NoEndpoint => "no_endpoint",
             Reason::DialFailure => "dial_failure",
             Reason::Draining => "draining",

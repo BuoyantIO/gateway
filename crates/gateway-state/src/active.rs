@@ -2,7 +2,9 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use gateway_config::backend::{AlpnProtocol, ApiKeyAuth, BackendProtocol, Endpoint};
+use gateway_config::backend::{
+    AlpnProtocol, ApiKeyAuth, BackendAuth, BackendProtocol, ClientAuthMethod, Endpoint, OAuth2Auth,
+};
 use gateway_config::bind::BindProtocol;
 use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
@@ -228,7 +230,58 @@ impl PartialEq for ActiveTrustRoots {
 }
 
 /// A dialable backend's credential, resolved against the registered
-/// secrets and already shaped into the header that goes upstream.
+/// secrets.
+///
+/// One variant per scheme, mirroring `BackendAuth`, and both resolve
+/// against the one secret the block names. What differs is how far
+/// resolution gets: an API key is the whole credential and is shaped
+/// into its header here, while a client secret is what the gateway
+/// spends to obtain a credential, so resolving it settles that the
+/// material is usable and leaves the token to the request path.
+///
+/// Shared behind an `Arc` for the same reason the TLS settings are:
+/// the request path holds on to it without copying per request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveBackendAuth {
+    ApiKey(ActiveApiKey),
+    OAuth2(ActiveOAuth2),
+}
+
+impl ActiveBackendAuth {
+    /// Resolve `auth` against the secret registered under the
+    /// reference it names, or leave it unresolved.
+    pub fn resolve(auth: &BackendAuth, secret: Option<&Arc<OpaqueSecret>>) -> Self {
+        match auth {
+            BackendAuth::ApiKey(api_key) => Self::ApiKey(ActiveApiKey::resolve(api_key, secret)),
+            BackendAuth::OAuth2(oauth) => Self::OAuth2(ActiveOAuth2::resolve(oauth, secret)),
+        }
+    }
+
+    /// The same credential re-read after its secret arrived, rotated
+    /// or went away. Everything the operator wrote carries over
+    /// untouched; only what was read out of the secret is built
+    /// again.
+    #[must_use]
+    pub fn re_resolve(&self, secret: Option<&Arc<OpaqueSecret>>) -> Self {
+        match self {
+            Self::ApiKey(api_key) => Self::ApiKey(api_key.re_resolve(secret)),
+            Self::OAuth2(oauth) => Self::OAuth2(oauth.re_resolve(secret)),
+        }
+    }
+
+    /// The secret this block spends, whichever scheme it is: what the
+    /// dependency index follows and what a diagnostic names it by.
+    pub fn secret(&self) -> &SecretRef {
+        match self {
+            Self::ApiKey(a) => &a.secret,
+            Self::OAuth2(a) => &a.client_secret_ref,
+        }
+    }
+}
+
+/// A credential the operator provisioned, resolved against the
+/// registered secrets and already shaped into the header that goes
+/// upstream.
 ///
 /// The header value is built here, at apply time, rather than per
 /// request: what a credential has to be — text, valid in a header,
@@ -244,11 +297,8 @@ impl PartialEq for ActiveTrustRoots {
 /// unauthenticated — the one outcome that must not happen, since an
 /// unauthenticated call is a call the provider answers differently
 /// rather than one that visibly breaks.
-///
-/// Shared behind an `Arc` for the same reason the TLS settings are:
-/// the request path holds on to it without copying per request.
 #[derive(Clone, PartialEq)]
-pub struct ActiveBackendAuth {
+pub struct ActiveApiKey {
     /// The secret and data key the credential came from. Kept so
     /// re-resolution after a rotation reads the same reference the
     /// operator wrote, and so a failure names it.
@@ -262,7 +312,7 @@ pub struct ActiveBackendAuth {
     pub value: Option<HeaderValue>,
 }
 
-impl ActiveBackendAuth {
+impl ActiveApiKey {
     /// Build the upstream header for `auth` from the secret
     /// registered under its reference, or leave it unresolved.
     ///
@@ -289,37 +339,18 @@ impl ActiveBackendAuth {
         prefix: &str,
         secret: Option<&Arc<OpaqueSecret>>,
     ) -> Self {
-        let value = match secret {
-            // Not registered yet. Silent: the reference recovers when
-            // the secret lands, exactly as an unresolved backend ref
-            // does, and saying so on every apply would be noise.
-            None => None,
-            Some(secret) => match secret.get(&secret_ref.key) {
-                None => {
-                    // A data key the operator never set. The key
-                    // names are not material, so listing them is what
-                    // makes the typo findable.
-                    tracing::warn!(
-                        secret = %secret_ref,
-                        keys = ?secret.keys().collect::<Vec<_>>(),
-                        "credential secret carries no such data key"
-                    );
-                    None
-                }
-                Some(material) => {
-                    let value = credential_header(prefix, material.expose());
-                    if value.is_none() {
-                        // Empty, or bytes no header can carry. Never
-                        // the material itself, and never its length.
-                        tracing::warn!(
-                            secret = %secret_ref,
-                            "credential is empty or not valid in a header value"
-                        );
-                    }
-                    value
-                }
-            },
-        };
+        let value = material(secret_ref, secret).and_then(|material| {
+            let value = credential_header(prefix, material);
+            if value.is_none() {
+                // Empty, or bytes no header can carry. Never the
+                // material itself, and never its length.
+                tracing::warn!(
+                    secret = %secret_ref,
+                    "credential is empty or not valid in a header value"
+                );
+            }
+            value
+        });
         Self {
             secret: secret_ref.clone(),
             header: header.clone(),
@@ -333,9 +364,9 @@ impl ActiveBackendAuth {
 // decides that for itself, and this does not depend on it deciding
 // the way we asked. Whether the credential resolved is diagnostic and
 // is printed; the material never is.
-impl fmt::Debug for ActiveBackendAuth {
+impl fmt::Debug for ActiveApiKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ActiveBackendAuth")
+        f.debug_struct("ActiveApiKey")
             // `namespace/name#key`, the form a warning names it by.
             .field("secret", &format_args!("{}", self.secret))
             .field("header", &self.header)
@@ -349,6 +380,133 @@ impl fmt::Debug for ActiveBackendAuth {
             )
             .finish()
     }
+}
+
+/// An `OAuth2` client-credentials block, with the client secret
+/// resolved against the registered secrets.
+///
+/// Resolution stops at the client secret. The credential that reaches
+/// the provider is a token from the endpoint named here, which no
+/// amount of applying config produces: it takes a call, it expires,
+/// and it is therefore the request path's to hold. What this settles
+/// is everything that call is made of, so that a token fetch is a
+/// network question and never a config one.
+///
+/// Everything an operator wrote is carried verbatim, including the
+/// token URL, which is parsed where it is dialed rather than here:
+/// `validate` has already rejected one that is not absolute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveOAuth2 {
+    /// The token endpoint, as written.
+    pub token_url: String,
+    pub client_id: String,
+    /// The secret and data key the client secret came from. Kept so
+    /// re-resolution reads the same reference, and so a failure
+    /// names it.
+    pub client_secret_ref: SecretRef,
+    pub scopes: Vec<String>,
+    pub client_auth_method: ClientAuthMethod,
+    /// The client secret, or `None` while it is unusable — the same
+    /// three states an API key has, diagnosed the same way and
+    /// answered the same way by the request path.
+    pub client_secret: Option<ClientSecret>,
+}
+
+impl ActiveOAuth2 {
+    pub fn resolve(auth: &OAuth2Auth, secret: Option<&Arc<OpaqueSecret>>) -> Self {
+        Self {
+            token_url: auth.token_url.clone(),
+            client_id: auth.client_id.clone(),
+            client_secret_ref: auth.client_secret_ref.clone(),
+            scopes: auth.scopes.clone(),
+            client_auth_method: auth.client_auth_method,
+            client_secret: ClientSecret::build(&auth.client_secret_ref, secret),
+        }
+    }
+
+    /// The same block with only its client secret re-read.
+    #[must_use]
+    pub fn re_resolve(&self, secret: Option<&Arc<OpaqueSecret>>) -> Self {
+        Self {
+            client_secret: ClientSecret::build(&self.client_secret_ref, secret),
+            ..self.clone()
+        }
+    }
+}
+
+/// A client secret the gateway presents to a token endpoint: the
+/// material, already established to be text a token request can
+/// carry.
+///
+/// Both ways of presenting it — an HTTP Basic header and a form
+/// field — are text, so a client secret that is not is unusable, and
+/// that is decided once here rather than at every token fetch. The
+/// material is reachable only through [`ClientSecret::expose`], and
+/// `Debug` redacts, so a struct holding one is safe to
+/// `derive(Debug)`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientSecret(String);
+
+impl ClientSecret {
+    /// The material, for the one place that puts it on the wire.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Read the client secret out of `secret`, or decide it is
+    /// unusable.
+    ///
+    /// Trimmed of surrounding whitespace for the same reason an API
+    /// key is: a Secret written from a file carries the newline the
+    /// file ended with, which is not part of the credential.
+    fn build(secret_ref: &SecretRef, secret: Option<&Arc<OpaqueSecret>>) -> Option<Self> {
+        let material = material(secret_ref, secret)?;
+        let Some(text) = std::str::from_utf8(material).ok().map(str::trim) else {
+            // Never the material itself, and never its length.
+            tracing::warn!(
+                secret = %secret_ref,
+                "client secret is not text and cannot be sent to a token endpoint"
+            );
+            return None;
+        };
+        if text.is_empty() {
+            tracing::warn!(secret = %secret_ref, "client secret is empty");
+            return None;
+        }
+        Some(Self(text.to_owned()))
+    }
+}
+
+impl fmt::Debug for ClientSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The material one credential reference names, or `None` when it is
+/// not there to be read.
+///
+/// The two ways that happens are told apart here because they are
+/// diagnosed differently, not because any caller distinguishes them:
+/// a secret that has not been registered is an ordering fact that
+/// resolves itself when it lands, and a data key the operator never
+/// set is a typo that will not.
+fn material<'a>(secret_ref: &SecretRef, secret: Option<&'a Arc<OpaqueSecret>>) -> Option<&'a [u8]> {
+    // Not registered yet. Silent: the reference recovers when the
+    // secret lands, exactly as an unresolved backend ref does, and
+    // saying so on every apply would be noise.
+    let secret = secret?;
+    let Some(value) = secret.get(&secret_ref.key) else {
+        // A data key the operator never set. The key names are not
+        // material, so listing them is what makes the typo findable.
+        tracing::warn!(
+            secret = %secret_ref,
+            keys = ?secret.keys().collect::<Vec<_>>(),
+            "credential secret carries no such data key"
+        );
+        return None;
+    };
+    Some(value.expose())
 }
 
 /// The header value a credential goes upstream in: the configured

@@ -50,6 +50,7 @@ use crate::metrics::Reason;
 use crate::proxy::access::{Access, RequestOutcome};
 use crate::proxy::body::{BoxError, HeldBody, UpstreamBody, apply_body_source};
 use crate::proxy::gate;
+use crate::proxy::oauth2::{TokenCaches, TokenFailure};
 use crate::proxy::originate::{TlsClient, TlsClients};
 use crate::proxy::tap;
 
@@ -80,6 +81,9 @@ pub struct HttpClient {
     h1: hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
     h2: hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
     tls: Arc<TlsClients>,
+    /// The access token each backend authenticating with `OAuth2` is
+    /// currently sending, and what it takes to fetch the next one.
+    tokens: Arc<TokenCaches>,
 }
 
 impl HttpClient {
@@ -109,6 +113,7 @@ impl Default for HttpClient {
             h1,
             h2,
             tls: Arc::new(TlsClients::default()),
+            tokens: Arc::new(TokenCaches::default()),
         }
     }
 }
@@ -211,11 +216,14 @@ impl Destination {
         ))
     }
 
-    /// The credential this destination authenticates with. `None` for
-    /// a destination that authenticates with nothing, which is every
-    /// endpoint and every dialable backend without an auth block.
-    fn auth(&self) -> Option<&ActiveBackendAuth> {
-        self.dialable.as_ref()?.auth.as_deref()
+    /// The credential this destination authenticates with, and the
+    /// backend it belongs to — which is what a token is cached
+    /// under. `None` for a destination that authenticates with
+    /// nothing, which is every endpoint and every dialable backend
+    /// without an auth block.
+    fn auth(&self) -> Option<(&BackendKey, &ActiveBackendAuth)> {
+        let dialable = self.dialable.as_ref()?;
+        Some((&dialable.backend, dialable.auth.as_deref()?))
     }
 }
 
@@ -1381,6 +1389,73 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     out
 }
 
+/// Put the backend's credential on the request, if it has one.
+///
+/// The last thing done to a request before it is dialed, and done by
+/// replacing whatever was under the credential's header name: a client
+/// may have sent a credential of its own, and a route filter or an
+/// extension may have set the same header, so inserting rather than
+/// appending is what makes the provider see exactly one — the
+/// configured one. Nothing after this point reads it, and the value is
+/// marked sensitive, so it stays out of debug output and out of the H2
+/// header index.
+///
+/// # Errors
+/// The reason the request must not be forwarded. A credential the
+/// operator asked for that the gateway does not have fails the request
+/// here rather than reaching the provider unauthenticated, which is a
+/// different request than the one that was asked for, answered
+/// differently by the provider rather than visibly failing. Both ways
+/// that happens are logged at debug, not warn: they are per-request,
+/// whoever decided the credential was unusable has already said so,
+/// and the access log carries the reason on every one of them. Same
+/// reasoning as the unbuildable TLS client in [`forward`].
+async fn attach_credential(
+    client: &HttpClient,
+    req: &mut Request<UpstreamBody>,
+    dest: &Destination,
+) -> Result<(), Reason> {
+    let Some((backend, auth)) = dest.auth() else {
+        return Ok(());
+    };
+    let (name, value) = match auth {
+        ActiveBackendAuth::ApiKey(api_key) => {
+            let Some(value) = api_key.value.clone() else {
+                // The secret has not arrived, names no such data key,
+                // or holds something no header can carry.
+                tracing::debug!(
+                    secret = %api_key.secret,
+                    "backend credential is unresolved; not forwarding unauthenticated"
+                );
+                return Err(Reason::CredentialUnresolved);
+            };
+            (api_key.header.clone(), value)
+        }
+        ActiveBackendAuth::OAuth2(oauth) => {
+            // The cached token, or a fetch. This is the one place the
+            // request path waits on the gateway's own call, and only
+            // when there is no token it could send instead; it is
+            // before the dial, so the wait is not counted against the
+            // backend's latency or its eviction state.
+            match client.tokens.header(backend, oauth).await {
+                Ok(value) => (http::header::AUTHORIZATION, value),
+                Err(failure) => {
+                    tracing::debug!(
+                        %backend,
+                        "no access token for backend; not forwarding unauthenticated"
+                    );
+                    return Err(match failure {
+                        TokenFailure::Unresolved => Reason::CredentialUnresolved,
+                        TokenFailure::Unavailable => Reason::TokenUnavailable,
+                    });
+                }
+            }
+        }
+    };
+    req.headers_mut().insert(name, value);
+    Ok(())
+}
+
 /// Rewrite `req` for `dest` — scheme, authority, path, and the
 /// `Host` a dialable backend is addressed by — set the server-side
 /// wire version, strip hop-by-hop headers, and forward via the
@@ -1470,32 +1545,12 @@ async fn forward(
     // provider see exactly one — the configured one. Nothing after
     // this point reads it, and the value is marked sensitive, so it
     // stays out of debug output and out of the H2 header index.
-    if let Some(auth) = dest.auth() {
-        let Some(value) = auth.value.clone() else {
-            // A credential the operator asked for that the gateway
-            // does not have: the secret has not arrived, names no
-            // such data key, or holds something no header can carry.
-            // The request fails here rather than reaching the
-            // provider unauthenticated, which is a different request
-            // than the one that was asked for, answered differently
-            // by the provider rather than visibly failing.
-            //
-            // Logged at debug, not warn: this is per-request, the
-            // store already said what it could when it decided the
-            // credential was unusable, and the access log carries the
-            // reason on every one of these. Same reasoning as the
-            // unbuildable TLS client above.
-            tracing::debug!(
-                secret = %auth.secret,
-                "backend credential is unresolved; not forwarding unauthenticated"
-            );
-            return (
-                synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                Reason::CredentialUnresolved,
-                None,
-            );
-        };
-        req.headers_mut().insert(auth.header.clone(), value);
+    if let Err(reason) = attach_credential(client, &mut req, dest).await {
+        return (
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            reason,
+            None,
+        );
     }
 
     let dial_start = Instant::now();
