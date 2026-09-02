@@ -6,18 +6,18 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::sync::broadcast;
 
 use gateway_config::GatewayConfig;
-use gateway_config::backend::{Backend, BackendRef, DialableBackend, TrustRoots};
+use gateway_config::backend::{Backend, BackendAuth, BackendRef, DialableBackend, TrustRoots};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
 use gateway_config::listener::{Listener, TlsMode};
 use gateway_config::route::HttpRoute;
-use gateway_config::secret::{Secret, TlsSecret};
+use gateway_config::secret::{OpaqueSecret, Secret, TlsSecret};
 
 use crate::active::{
-    ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls, ActiveBind,
-    ActiveDialable, ActiveEndpointSet, ActiveExtensionRef, ActiveHttpRoute, ActiveListener,
-    ActiveTls, ActiveTrustRoots,
+    ActiveBackend, ActiveBackendAuth, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls,
+    ActiveBind, ActiveDialable, ActiveEndpointSet, ActiveExtensionRef, ActiveHttpRoute,
+    ActiveListener, ActiveTls, ActiveTrustRoots,
 };
 use crate::error::{ApplyReport, StoreError};
 use crate::event::BindEvent;
@@ -130,6 +130,12 @@ fn secret_deps(kind: &ActiveBackendKind) -> Vec<SecretKey> {
         && let ActiveTrustRoots::Secret { key, .. } = &tls.roots
     {
         keys.push(key.clone());
+    }
+    if let Some(auth) = d.auth.as_deref() {
+        keys.push(SecretKey::new(
+            auth.secret.namespace.clone(),
+            auth.secret.name.clone(),
+        ));
     }
     keys
 }
@@ -739,6 +745,19 @@ impl Inner {
     /// extension ref does, and requests through it fail in the
     /// meantime.
     fn resolve_dialable(&self, d: DialableBackend) -> ActiveDialable {
+        // A credential on a cleartext connection goes out in the
+        // clear, to whoever is on the path. Not rejected: a local
+        // config or an integration test against a mock provider has
+        // every reason to do it, and refusing would leave no way to
+        // exercise the auth path without certificates. Warned about
+        // once per apply, naming the backend, because in production
+        // it is a mistake.
+        if d.auth.is_some() && d.tls.is_none() {
+            tracing::warn!(
+                backend = %d.name,
+                "dialable backend sends a credential over an unencrypted connection"
+            );
+        }
         ActiveDialable {
             host: d.host,
             port: d.port,
@@ -758,15 +777,32 @@ impl Inner {
                     insecure_skip_verify: tls.insecure_skip_verify,
                 })
             }),
+            auth: d.auth.map(|auth| {
+                let BackendAuth::ApiKey(api_key) = *auth;
+                let key = SecretKey::new(
+                    api_key.secret_ref.namespace.clone(),
+                    api_key.secret_ref.name.clone(),
+                );
+                Arc::new(ActiveBackendAuth::resolve(
+                    &api_key,
+                    self.opaque_secret(&key).as_ref(),
+                ))
+            }),
         }
     }
 
-    /// Re-resolve one backend's CA secret, after that secret arrived,
-    /// went away, or was re-sent. Everything else about the backend
-    /// is already resolved and carried over untouched.
+    /// Re-resolve the secrets one backend names, after one of them
+    /// arrived, went away, or was re-sent: the trust roots of its TLS
+    /// block, and the credential of its auth block. Everything else
+    /// about the backend is already resolved and carried over
+    /// untouched.
     ///
-    /// A secret re-sent with the same certificates resolves to the
-    /// same backend and stops here: see [`Inner::place_backend`].
+    /// Both are re-read, not just the one that changed: which secret
+    /// this was called for is not passed down, and re-reading the
+    /// other hands back what it already had.
+    ///
+    /// A secret re-sent with the same material resolves to the same
+    /// backend and stops here: see [`Inner::place_backend`].
     fn re_resolve_backend(&mut self, key: &BackendKey) -> Vec<BindEvent> {
         let Some(current) = self.backends.get(key) else {
             return Vec::new();
@@ -774,21 +810,24 @@ impl Inner {
         let ActiveBackendKind::Dialable(dialable) = &current.kind else {
             return Vec::new();
         };
-        let Some(tls) = dialable.tls.as_deref() else {
-            return Vec::new();
-        };
-        let ActiveTrustRoots::Secret { key: sk, .. } = &tls.roots else {
-            return Vec::new();
-        };
-        let sk = sk.clone();
-        let mut dialable = dialable.clone();
-        let mut tls = tls.clone();
-        tls.roots = ActiveTrustRoots::Secret {
-            secret: self.tls_secret(&sk),
-            key: sk,
-        };
-        dialable.tls = Some(Arc::new(tls));
-        self.place_backend(key, ActiveBackendKind::Dialable(dialable))
+        let mut next = dialable.clone();
+        if let Some(tls) = dialable.tls.as_deref()
+            && let ActiveTrustRoots::Secret { key: sk, .. } = &tls.roots
+        {
+            let sk = sk.clone();
+            let mut tls = tls.clone();
+            tls.roots = ActiveTrustRoots::Secret {
+                secret: self.tls_secret(&sk),
+                key: sk,
+            };
+            next.tls = Some(Arc::new(tls));
+        }
+        if let Some(auth) = dialable.auth.as_deref() {
+            let sk = SecretKey::new(auth.secret.namespace.clone(), auth.secret.name.clone());
+            let secret = self.opaque_secret(&sk);
+            next.auth = Some(Arc::new(auth.re_resolve(secret.as_ref())));
+        }
+        self.place_backend(key, ActiveBackendKind::Dialable(next))
     }
 
     /// Drop the backend's secret-index entries, before re-indexing on
@@ -823,6 +862,15 @@ impl Inner {
     /// mismatch in file config.
     fn tls_secret(&self, key: &SecretKey) -> Option<Arc<TlsSecret>> {
         self.secrets.get(key).and_then(Secret::as_tls).cloned()
+    }
+
+    /// The credentials registered under `key`, or `None` when the
+    /// secret is absent — or carries a certificate rather than
+    /// credentials. The same two states as [`Inner::tls_secret`],
+    /// mirrored: absence resolves itself when the secret lands, the
+    /// mismatch never will, and `validate` rejects it in file config.
+    fn opaque_secret(&self, key: &SecretKey) -> Option<Arc<OpaqueSecret>> {
+        self.secrets.get(key).and_then(Secret::as_opaque).cloned()
     }
 
     fn upsert_extension(&mut self, ext: Extension) -> Vec<BindEvent> {
@@ -1399,8 +1447,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use gateway_config::backend::{
-        Backend, BackendProtocol, BackendRef, BackendTls, DialableBackend, Endpoint, StaticBackend,
-        TrustRoots,
+        ApiKeyAuth, Backend, BackendAuth, BackendProtocol, BackendRef, BackendTls, DialableBackend,
+        Endpoint, StaticBackend, TrustRoots,
     };
     use gateway_config::bind::{Bind, BindProtocol};
     use gateway_config::extension::{FailureMode, Limits};
@@ -1409,7 +1457,7 @@ mod tests {
         CertRef, HttpListener, HttpsListener, Listener, TcpListener, TlsConfig, TlsMode,
     };
     use gateway_config::route::{HttpMatch, HttpRoute, PathMatch};
-    use gateway_config::secret::{OpaqueSecret, SecretValue};
+    use gateway_config::secret::{OpaqueSecret, SecretRef, SecretValue};
 
     // --- fixture builders ---
 
@@ -1534,6 +1582,7 @@ mod tests {
             port: 443,
             path_prefix: Some("/v1".into()),
             tls: None,
+            auth: None,
         })
     }
 
@@ -2667,6 +2716,329 @@ abIF6YlJNVR6UhS8sg==\n\
         );
 
         assert!(backend_revision(&store, "be") > revision);
+    }
+
+    // ---- backend credentials ----
+
+    /// A dialable backend authenticating with an API key, over TLS
+    /// unless `cleartext`. `header` and `prefix` are `None` for the
+    /// defaults an operator gets when they say nothing.
+    fn api_key_backend(
+        name: &str,
+        secret: &str,
+        key: &str,
+        header: Option<&str>,
+        prefix: Option<&str>,
+    ) -> Backend {
+        let Backend::Dialable(mut d) = tls_dialable_backend(name, None) else {
+            unreachable!("dialable_backend builds a dialable backend");
+        };
+        d.auth = Some(Box::new(BackendAuth::ApiKey(ApiKeyAuth {
+            secret_ref: SecretRef::new("", secret, key),
+            header: header.map_or(http::header::AUTHORIZATION, |h| {
+                http::HeaderName::from_bytes(h.as_bytes()).expect("valid header name")
+            }),
+            prefix: prefix.unwrap_or("Bearer ").to_string(),
+        })));
+        Backend::Dialable(d)
+    }
+
+    /// The auth block of a registered dialable backend.
+    fn backend_auth(store: &Store, name: &str) -> Arc<ActiveBackendAuth> {
+        let backend = store
+            .read()
+            .backend(&backendkey(name))
+            .expect("backend registered");
+        let ActiveBackendKind::Dialable(d) = &backend.kind else {
+            panic!("expected a dialable backend");
+        };
+        d.auth.clone().expect("auth block")
+    }
+
+    /// The same auth block as the request path reads it: through the
+    /// route ref, not the backend map.
+    fn route_backend_auth(store: &Store, bind: &str) -> Arc<ActiveBackendAuth> {
+        let read = store.read();
+        let route = &read.bind(&bkey(bind)).expect("bind active").listeners[0].routes[0];
+        let backend = resolved_backend(&route.backends[0]);
+        let ActiveBackendKind::Dialable(d) = &backend.kind else {
+            panic!("expected a dialable backend");
+        };
+        d.auth.clone().expect("auth block")
+    }
+
+    #[test]
+    fn backend_credential_resolves_when_already_registered() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+        let auth = backend_auth(&store, "be");
+        assert_eq!(auth.header, http::header::AUTHORIZATION);
+        assert_eq!(auth.value.as_ref().expect("resolved"), "Bearer sk-test");
+    }
+
+    /// The header and prefix an operator names are what goes out: a
+    /// provider that wants the key bare, under its own header, gets
+    /// exactly that.
+    #[test]
+    fn backend_credential_uses_the_configured_header_and_prefix() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        store.upsert_backend(api_key_backend(
+            "be",
+            "provider-key",
+            "apiKey",
+            Some("x-api-key"),
+            Some(""),
+        ));
+
+        let auth = backend_auth(&store, "be");
+        assert_eq!(auth.header, "x-api-key");
+        assert_eq!(auth.value.as_ref().expect("resolved"), "sk-test");
+    }
+
+    /// A Secret written from a file carries the newline the file
+    /// ended with. It is not part of the credential, and no header
+    /// may hold it, so it is trimmed rather than left to fail the
+    /// request for a reason the operator cannot see.
+    #[test]
+    fn backend_credential_is_trimmed_of_surrounding_whitespace() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "  sk-test\n"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+        assert_eq!(
+            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            "Bearer sk-test"
+        );
+    }
+
+    /// Whitespace is all that is trimmed: a credential is sent
+    /// verbatim otherwise, whatever it looks like.
+    #[test]
+    fn backend_credential_material_is_otherwise_verbatim() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-a b/c=+.~"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+        assert_eq!(
+            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            "Bearer sk-a b/c=+.~"
+        );
+    }
+
+    /// Nothing a header cannot carry, and nothing empty: both leave
+    /// the credential unresolved, which the request path fails on
+    /// rather than reaching the provider without it.
+    #[test]
+    fn unusable_credential_material_stays_unresolved() {
+        for material in ["", "   \n", "sk-\r\nx-injected: yes"] {
+            let store = Store::new();
+            store.upsert_secret(opaque_secret("provider-key", "apiKey", material));
+            store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+            assert!(
+                backend_auth(&store, "be").value.is_none(),
+                "material {material:?} must not resolve to a header"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_naming_a_missing_data_key_stays_unresolved() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "api-key", None, None));
+
+        assert!(backend_auth(&store, "be").value.is_none());
+    }
+
+    /// The mirror of a CA reference landing on credentials: a
+    /// credential reference that lands on a certificate reads exactly
+    /// like one whose secret has not arrived.
+    #[test]
+    fn credential_naming_a_tls_secret_stays_unresolved() {
+        let store = Store::new();
+        store.upsert_secret(tls_secret("provider-key"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+        assert!(backend_auth(&store, "be").value.is_none());
+    }
+
+    /// The secret lands after the backend in `apply_config`, and a
+    /// backend that authenticates but originates no TLS is the case
+    /// with no other secret to carry the re-resolution.
+    #[test]
+    fn backend_credential_resolves_when_the_secret_lands_later() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        let Backend::Dialable(mut d) = api_key_backend("be", "provider-key", "apiKey", None, None)
+        else {
+            unreachable!("built as dialable");
+        };
+        d.tls = None;
+        store.upsert_backend(Backend::Dialable(d));
+
+        assert!(
+            route_backend_auth(&store, "b").value.is_none(),
+            "the credential must not resolve before the secret is registered"
+        );
+
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+
+        assert_eq!(
+            route_backend_auth(&store, "b")
+                .value
+                .as_ref()
+                .expect("resolved once the secret is registered"),
+            "Bearer sk-test"
+        );
+    }
+
+    #[test]
+    fn removing_the_credential_secret_unresolves_the_backend() {
+        let store = Store::new();
+        store.upsert_bind(http_bind("b", 80)).unwrap();
+        store
+            .upsert_listener(&bkey("b"), http_listener("l"))
+            .unwrap();
+        store.upsert_http_route(&lkey("b", "l"), http_route("r", "/", &["be"]));
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+        store.remove_secret(&secretkey("provider-key"));
+
+        assert!(route_backend_auth(&store, "b").value.is_none());
+    }
+
+    /// A backend naming both a CA and a credential depends on both,
+    /// and a change to either re-resolves it: the dependencies are a
+    /// set, not the one slot trust roots used to have.
+    #[test]
+    fn a_backend_follows_both_its_roots_and_its_credential() {
+        let store = Store::new();
+        store.upsert_secret(ca_secret("provider-ca"));
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        let Backend::Dialable(mut d) = api_key_backend("be", "provider-key", "apiKey", None, None)
+        else {
+            unreachable!("built as dialable");
+        };
+        d.tls.as_mut().expect("tls block").ca = TrustRoots::Secret {
+            namespace: String::new(),
+            name: "provider-ca".into(),
+        };
+        store.upsert_backend(Backend::Dialable(d));
+
+        store.remove_secret(&secretkey("provider-ca"));
+        // The credential survives a change to the other secret.
+        assert!(backend_auth(&store, "be").value.is_some());
+        let ActiveTrustRoots::Secret { secret: None, .. } = &backend_tls(&store, "be").roots else {
+            panic!("roots must unresolve when their secret goes away");
+        };
+
+        store.remove_secret(&secretkey("provider-key"));
+        assert!(backend_auth(&store, "be").value.is_none());
+    }
+
+    /// Re-pointing a backend at another credential drops the old
+    /// dependency, the same way trust roots do.
+    #[test]
+    fn backend_moved_off_a_credential_secret_stops_following_it() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("old-key", "apiKey", "sk-old"));
+        store.upsert_secret(opaque_secret("new-key", "apiKey", "sk-new"));
+        store.upsert_backend(api_key_backend("be", "old-key", "apiKey", None, None));
+        store.upsert_backend(api_key_backend("be", "new-key", "apiKey", None, None));
+
+        let revision = backend_revision(&store, "be");
+        store.remove_secret(&secretkey("old-key"));
+
+        assert_eq!(backend_revision(&store, "be"), revision);
+        assert_eq!(
+            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            "Bearer sk-new"
+        );
+    }
+
+    /// A rotated credential is a real change: the revision moves, so
+    /// everything the request path derived from the backend is
+    /// rebuilt against the new key rather than kept.
+    #[test]
+    fn a_rotated_credential_bumps_the_revision() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-old"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+        let revision = backend_revision(&store, "be");
+
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-new"));
+
+        assert!(backend_revision(&store, "be") > revision);
+        assert_eq!(
+            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            "Bearer sk-new"
+        );
+    }
+
+    /// A resync re-sends the same secret, and that must cost nothing.
+    #[test]
+    fn a_credential_re_sent_unchanged_does_not_bump_the_revision() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+        let revision = backend_revision(&store, "be");
+        let auth = backend_auth(&store, "be");
+
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+
+        assert_eq!(backend_revision(&store, "be"), revision);
+        assert!(Arc::ptr_eq(&auth, &backend_auth(&store, "be")));
+    }
+
+    /// Everything about a credential is printable except the
+    /// credential: a resolved backend is `Debug`, and a `{:?}` of it
+    /// is a thing that gets logged.
+    #[test]
+    fn a_resolved_credential_never_prints() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-not-a-real-key"));
+        store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
+
+        let backend = store
+            .read()
+            .backend(&backendkey("be"))
+            .expect("backend registered");
+        let printed = format!("{backend:?}");
+        assert!(!printed.contains("sk-not-a-real-key"), "{printed}");
+        // The reference and whether it resolved are diagnostic, and
+        // are what a reader needs from the line.
+        assert!(printed.contains("/provider-key#apiKey"), "{printed}");
+        assert!(printed.contains(r#"value: "<redacted>""#), "{printed}");
+    }
+
+    /// A credential over cleartext is a mistake in production and
+    /// legitimate in a local config or against a mock provider, so it
+    /// is warned about rather than refused: the backend applies and
+    /// the credential resolves.
+    #[test]
+    fn a_credential_without_tls_is_applied_not_refused() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
+        let Backend::Dialable(mut d) = api_key_backend("be", "provider-key", "apiKey", None, None)
+        else {
+            unreachable!("built as dialable");
+        };
+        d.tls = None;
+        store.upsert_backend(Backend::Dialable(d));
+
+        assert_eq!(
+            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            "Bearer sk-test"
+        );
     }
 
     /// So is a change to the backend's own settings.

@@ -153,6 +153,7 @@ fn dialable_backend(name: &str, port: u16, path_prefix: Option<&str>) -> Backend
         port,
         path_prefix: path_prefix.map(str::to_owned),
         tls: None,
+        auth: None,
     })
 }
 

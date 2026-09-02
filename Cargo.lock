@@ -845,6 +845,7 @@ name = "gateway-state"
 version = "0.0.0"
 dependencies = [
  "gateway-config",
+ "http",
  "parking_lot",
  "thiserror",
  "tokio",
