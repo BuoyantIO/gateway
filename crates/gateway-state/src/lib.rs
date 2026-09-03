@@ -10,9 +10,9 @@ pub mod key;
 pub mod store;
 
 pub use active::{
-    ActiveBackend, ActiveBackendAuth, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls,
-    ActiveBind, ActiveDialable, ActiveEndpointSet, ActiveExtensionRef, ActiveHttpRoute,
-    ActiveListener, ActiveTls, ActiveTrustRoots,
+    ActiveApiKey, ActiveBackend, ActiveBackendAuth, ActiveBackendKind, ActiveBackendRef,
+    ActiveBackendTls, ActiveBind, ActiveDialable, ActiveEndpointSet, ActiveExtensionRef,
+    ActiveHttpRoute, ActiveListener, ActiveOAuth2, ActiveTls, ActiveTrustRoots, ClientSecret,
 };
 pub use error::{ApplyReport, StoreError};
 pub use event::BindEvent;

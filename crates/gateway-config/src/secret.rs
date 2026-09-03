@@ -306,7 +306,14 @@ impl<'de> Deserialize<'de> for OpaqueSecret {
 /// redact, so a struct holding one prints safely in a log line or a
 /// `{:?}` of the whole config. There is deliberately no `Serialize`:
 /// nothing turns a credential back into config.
-#[derive(Clone)]
+///
+/// Equality is the store's "did this actually change" test, asked of
+/// a resolved backend holding one — a rotation has to bump the
+/// revision, and a re-send of the same material must not. It is a
+/// comparison of two copies of our own config, never of a credential
+/// against one someone presented, so it is deliberately the ordinary
+/// byte comparison and not a constant-time one.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecretValue(Vec<u8>);
 
 impl SecretValue {

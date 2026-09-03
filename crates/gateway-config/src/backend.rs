@@ -140,14 +140,29 @@ impl AlpnProtocol {
 
 /// How the gateway authenticates itself to a dialable backend.
 ///
-/// Tagged with one variant today, so the scheme an operator names is
-/// part of what they wrote rather than something inferred from which
-/// fields they filled in; the next scheme is a variant beside this
-/// one.
+/// Tagged, so the scheme an operator names is part of what they wrote
+/// rather than something inferred from which fields they filled in.
+/// The two differ in where the credential comes from, not in where it
+/// goes: [`ApiKeyAuth`] sends material the operator provisioned,
+/// [`OAuth2Auth`] sends a token the gateway fetched with it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum BackendAuth {
     ApiKey(ApiKeyAuth),
+    OAuth2(OAuth2Auth),
+}
+
+impl BackendAuth {
+    /// The one secret this auth block spends: the credential itself
+    /// for an API key, the client secret for `OAuth2`. Every scheme
+    /// names exactly one, which is what lets validation, the
+    /// dependency index and re-resolution treat them alike.
+    pub fn secret_ref(&self) -> &SecretRef {
+        match self {
+            Self::ApiKey(a) => &a.secret_ref,
+            Self::OAuth2(a) => &a.client_secret_ref,
+        }
+    }
 }
 
 /// A credential the operator provisioned, sent verbatim in one
@@ -172,6 +187,58 @@ pub struct ApiKeyAuth {
     /// Prepended to the credential inside the header value.
     #[serde(default = "default_auth_prefix")]
     pub prefix: String,
+}
+
+/// The `OAuth2` client-credentials grant (RFC 6749 §4.4): the gateway
+/// presents its own credentials to a token endpoint and sends the
+/// access token it gets back to the provider.
+///
+/// The gateway is the client here, not a delegate for the caller, so
+/// nothing about the request being proxied takes part: the token is
+/// the backend's, is fetched once and reused until it expires, and
+/// two backends configured differently never share one.
+///
+/// Where the token goes is not configurable the way an API key's
+/// header is. A bearer token is sent as `Authorization: Bearer`
+/// (RFC 6750 §2.1), and a provider that wanted it anywhere else would
+/// not be speaking this grant.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuth2Auth {
+    /// Absolute `http` or `https` URL of the token endpoint. Not
+    /// necessarily on the backend's own host: the provider that
+    /// issues the token is often a different service than the one
+    /// that accepts it.
+    pub token_url: String,
+    /// The gateway's client identifier. Public by construction — it
+    /// travels beside the secret in every token request — so it is
+    /// config rather than a secret reference.
+    pub client_id: String,
+    /// The secret holding the client secret, and the data key inside
+    /// it.
+    pub client_secret_ref: SecretRef,
+    /// Scopes asked for. Empty asks for none, which is what a
+    /// provider that scopes by client identity expects.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// How the client secret is presented to the token endpoint.
+    #[serde(default)]
+    pub client_auth_method: ClientAuthMethod,
+}
+
+/// How a client authenticates to the token endpoint (RFC 6749 §2.3.1).
+///
+/// Providers accept one or the other and not always both, so this is
+/// the operator's to state. The default is the one the RFC says a
+/// client SHOULD use and a server MUST support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum ClientAuthMethod {
+    /// HTTP Basic, with the client id as the user and the client
+    /// secret as the password.
+    #[default]
+    ClientSecretBasic,
+    /// `client_id` and `client_secret` as fields of the form body.
+    ClientSecretPost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

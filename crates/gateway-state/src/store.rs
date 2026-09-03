@@ -6,7 +6,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::sync::broadcast;
 
 use gateway_config::GatewayConfig;
-use gateway_config::backend::{Backend, BackendAuth, BackendRef, DialableBackend, TrustRoots};
+use gateway_config::backend::{Backend, BackendRef, DialableBackend, TrustRoots};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::extension::Extension;
 use gateway_config::filter::HttpFilter;
@@ -132,9 +132,10 @@ fn secret_deps(kind: &ActiveBackendKind) -> Vec<SecretKey> {
         keys.push(key.clone());
     }
     if let Some(auth) = d.auth.as_deref() {
+        let secret = auth.secret();
         keys.push(SecretKey::new(
-            auth.secret.namespace.clone(),
-            auth.secret.name.clone(),
+            secret.namespace.clone(),
+            secret.name.clone(),
         ));
     }
     keys
@@ -778,13 +779,10 @@ impl Inner {
                 })
             }),
             auth: d.auth.map(|auth| {
-                let BackendAuth::ApiKey(api_key) = *auth;
-                let key = SecretKey::new(
-                    api_key.secret_ref.namespace.clone(),
-                    api_key.secret_ref.name.clone(),
-                );
+                let secret_ref = auth.secret_ref();
+                let key = SecretKey::new(secret_ref.namespace.clone(), secret_ref.name.clone());
                 Arc::new(ActiveBackendAuth::resolve(
-                    &api_key,
+                    &auth,
                     self.opaque_secret(&key).as_ref(),
                 ))
             }),
@@ -823,7 +821,8 @@ impl Inner {
             next.tls = Some(Arc::new(tls));
         }
         if let Some(auth) = dialable.auth.as_deref() {
-            let sk = SecretKey::new(auth.secret.namespace.clone(), auth.secret.name.clone());
+            let secret = auth.secret();
+            let sk = SecretKey::new(secret.namespace.clone(), secret.name.clone());
             let secret = self.opaque_secret(&sk);
             next.auth = Some(Arc::new(auth.re_resolve(secret.as_ref())));
         }
@@ -1443,12 +1442,14 @@ fn decompose_listener(
 mod tests {
     use super::*;
 
+    use crate::active::{ActiveApiKey, ActiveOAuth2, ClientSecret};
+
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
 
     use gateway_config::backend::{
-        ApiKeyAuth, Backend, BackendAuth, BackendProtocol, BackendRef, BackendTls, DialableBackend,
-        Endpoint, StaticBackend, TrustRoots,
+        ApiKeyAuth, Backend, BackendAuth, BackendProtocol, BackendRef, BackendTls,
+        ClientAuthMethod, DialableBackend, Endpoint, OAuth2Auth, StaticBackend, TrustRoots,
     };
     use gateway_config::bind::{Bind, BindProtocol};
     use gateway_config::extension::{FailureMode, Limits};
@@ -2743,6 +2744,22 @@ abIF6YlJNVR6UhS8sg==\n\
         Backend::Dialable(d)
     }
 
+    /// A dialable backend authenticating with the client-credentials
+    /// grant, spending `key` of `secret` at the token endpoint.
+    fn oauth2_backend(name: &str, secret: &str, key: &str) -> Backend {
+        let Backend::Dialable(mut d) = tls_dialable_backend(name, None) else {
+            unreachable!("dialable_backend builds a dialable backend");
+        };
+        d.auth = Some(Box::new(BackendAuth::OAuth2(OAuth2Auth {
+            token_url: "https://idp.example.com/oauth2/token".into(),
+            client_id: "gateway".into(),
+            client_secret_ref: SecretRef::new("", secret, key),
+            scopes: vec!["read".into()],
+            client_auth_method: ClientAuthMethod::ClientSecretBasic,
+        })));
+        Backend::Dialable(d)
+    }
+
     /// The auth block of a registered dialable backend.
     fn backend_auth(store: &Store, name: &str) -> Arc<ActiveBackendAuth> {
         let backend = store
@@ -2755,16 +2772,36 @@ abIF6YlJNVR6UhS8sg==\n\
         d.auth.clone().expect("auth block")
     }
 
+    /// The API-key arm of a backend's auth block, which is what most
+    /// of these assert against.
+    fn backend_api_key(store: &Store, name: &str) -> ActiveApiKey {
+        match &*backend_auth(store, name) {
+            ActiveBackendAuth::ApiKey(k) => k.clone(),
+            ActiveBackendAuth::OAuth2(_) => panic!("expected an API key"),
+        }
+    }
+
+    /// The `OAuth2` arm, likewise.
+    fn backend_oauth2(store: &Store, name: &str) -> ActiveOAuth2 {
+        match &*backend_auth(store, name) {
+            ActiveBackendAuth::OAuth2(o) => o.clone(),
+            ActiveBackendAuth::ApiKey(_) => panic!("expected an OAuth2 block"),
+        }
+    }
+
     /// The same auth block as the request path reads it: through the
     /// route ref, not the backend map.
-    fn route_backend_auth(store: &Store, bind: &str) -> Arc<ActiveBackendAuth> {
+    fn route_backend_api_key(store: &Store, bind: &str) -> ActiveApiKey {
         let read = store.read();
         let route = &read.bind(&bkey(bind)).expect("bind active").listeners[0].routes[0];
         let backend = resolved_backend(&route.backends[0]);
         let ActiveBackendKind::Dialable(d) = &backend.kind else {
             panic!("expected a dialable backend");
         };
-        d.auth.clone().expect("auth block")
+        match &**d.auth.as_ref().expect("auth block") {
+            ActiveBackendAuth::ApiKey(k) => k.clone(),
+            ActiveBackendAuth::OAuth2(_) => panic!("expected an API key"),
+        }
     }
 
     #[test]
@@ -2773,7 +2810,7 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
         store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
 
-        let auth = backend_auth(&store, "be");
+        let auth = backend_api_key(&store, "be");
         assert_eq!(auth.header, http::header::AUTHORIZATION);
         assert_eq!(auth.value.as_ref().expect("resolved"), "Bearer sk-test");
     }
@@ -2793,7 +2830,7 @@ abIF6YlJNVR6UhS8sg==\n\
             Some(""),
         ));
 
-        let auth = backend_auth(&store, "be");
+        let auth = backend_api_key(&store, "be");
         assert_eq!(auth.header, "x-api-key");
         assert_eq!(auth.value.as_ref().expect("resolved"), "sk-test");
     }
@@ -2809,7 +2846,10 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
 
         assert_eq!(
-            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            backend_api_key(&store, "be")
+                .value
+                .as_ref()
+                .expect("resolved"),
             "Bearer sk-test"
         );
     }
@@ -2823,7 +2863,10 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
 
         assert_eq!(
-            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            backend_api_key(&store, "be")
+                .value
+                .as_ref()
+                .expect("resolved"),
             "Bearer sk-a b/c=+.~"
         );
     }
@@ -2839,7 +2882,7 @@ abIF6YlJNVR6UhS8sg==\n\
             store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
 
             assert!(
-                backend_auth(&store, "be").value.is_none(),
+                backend_api_key(&store, "be").value.is_none(),
                 "material {material:?} must not resolve to a header"
             );
         }
@@ -2851,7 +2894,7 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
         store.upsert_backend(api_key_backend("be", "provider-key", "api-key", None, None));
 
-        assert!(backend_auth(&store, "be").value.is_none());
+        assert!(backend_api_key(&store, "be").value.is_none());
     }
 
     /// The mirror of a CA reference landing on credentials: a
@@ -2863,7 +2906,7 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_secret(tls_secret("provider-key"));
         store.upsert_backend(api_key_backend("be", "provider-key", "apiKey", None, None));
 
-        assert!(backend_auth(&store, "be").value.is_none());
+        assert!(backend_api_key(&store, "be").value.is_none());
     }
 
     /// The secret lands after the backend in `apply_config`, and a
@@ -2885,14 +2928,14 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_backend(Backend::Dialable(d));
 
         assert!(
-            route_backend_auth(&store, "b").value.is_none(),
+            route_backend_api_key(&store, "b").value.is_none(),
             "the credential must not resolve before the secret is registered"
         );
 
         store.upsert_secret(opaque_secret("provider-key", "apiKey", "sk-test"));
 
         assert_eq!(
-            route_backend_auth(&store, "b")
+            route_backend_api_key(&store, "b")
                 .value
                 .as_ref()
                 .expect("resolved once the secret is registered"),
@@ -2913,7 +2956,7 @@ abIF6YlJNVR6UhS8sg==\n\
 
         store.remove_secret(&secretkey("provider-key"));
 
-        assert!(route_backend_auth(&store, "b").value.is_none());
+        assert!(route_backend_api_key(&store, "b").value.is_none());
     }
 
     /// A backend naming both a CA and a credential depends on both,
@@ -2936,13 +2979,13 @@ abIF6YlJNVR6UhS8sg==\n\
 
         store.remove_secret(&secretkey("provider-ca"));
         // The credential survives a change to the other secret.
-        assert!(backend_auth(&store, "be").value.is_some());
+        assert!(backend_api_key(&store, "be").value.is_some());
         let ActiveTrustRoots::Secret { secret: None, .. } = &backend_tls(&store, "be").roots else {
             panic!("roots must unresolve when their secret goes away");
         };
 
         store.remove_secret(&secretkey("provider-key"));
-        assert!(backend_auth(&store, "be").value.is_none());
+        assert!(backend_api_key(&store, "be").value.is_none());
     }
 
     /// Re-pointing a backend at another credential drops the old
@@ -2960,7 +3003,10 @@ abIF6YlJNVR6UhS8sg==\n\
 
         assert_eq!(backend_revision(&store, "be"), revision);
         assert_eq!(
-            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            backend_api_key(&store, "be")
+                .value
+                .as_ref()
+                .expect("resolved"),
             "Bearer sk-new"
         );
     }
@@ -2979,7 +3025,10 @@ abIF6YlJNVR6UhS8sg==\n\
 
         assert!(backend_revision(&store, "be") > revision);
         assert_eq!(
-            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            backend_api_key(&store, "be")
+                .value
+                .as_ref()
+                .expect("resolved"),
             "Bearer sk-new"
         );
     }
@@ -3020,6 +3069,173 @@ abIF6YlJNVR6UhS8sg==\n\
         assert!(printed.contains(r#"value: "<redacted>""#), "{printed}");
     }
 
+    // ---- backend credentials: OAuth2 ----
+
+    /// What the store settles for this scheme is the client secret,
+    /// and only that: the token is the request path's, and everything
+    /// the operator wrote is carried through untouched for it.
+    #[test]
+    fn a_client_secret_resolves_and_the_rest_is_carried_through() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-test"));
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+
+        let oauth = backend_oauth2(&store, "be");
+        assert_eq!(oauth.token_url, "https://idp.example.com/oauth2/token");
+        assert_eq!(oauth.client_id, "gateway");
+        assert_eq!(oauth.scopes, vec!["read".to_string()]);
+        assert_eq!(
+            oauth.client_auth_method,
+            ClientAuthMethod::ClientSecretBasic
+        );
+        assert_eq!(
+            oauth.client_secret.as_ref().map(ClientSecret::expose),
+            Some("cs-test")
+        );
+    }
+
+    /// The trailing newline a Secret written from a file carries is
+    /// not part of the secret, and would be sent as if it were.
+    #[test]
+    fn a_client_secret_is_trimmed_of_surrounding_whitespace() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret(
+            "provider-creds",
+            "clientSecret",
+            "  cs-test\n",
+        ));
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+
+        assert_eq!(
+            backend_oauth2(&store, "be")
+                .client_secret
+                .as_ref()
+                .map(ClientSecret::expose),
+            Some("cs-test")
+        );
+    }
+
+    /// The same three states an API key has, and the request path
+    /// answers all three the same way: a secret that has not arrived,
+    /// a data key the operator never set, and material that cannot be
+    /// sent.
+    #[test]
+    fn an_unusable_client_secret_stays_unresolved() {
+        let store = Store::new();
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+        assert!(
+            backend_oauth2(&store, "be").client_secret.is_none(),
+            "a secret that has not been registered leaves the client secret unresolved"
+        );
+
+        store.upsert_secret(opaque_secret("provider-creds", "somethingElse", "cs-test"));
+        assert!(
+            backend_oauth2(&store, "be").client_secret.is_none(),
+            "a data key the operator never set leaves it unresolved"
+        );
+
+        store.upsert_secret(Secret::from(OpaqueSecret::new(
+            "",
+            "provider-creds",
+            BTreeMap::from([(
+                "clientSecret".to_string(),
+                SecretValue::new(vec![0xff, 0xfe]),
+            )]),
+        )));
+        assert!(
+            backend_oauth2(&store, "be").client_secret.is_none(),
+            "material that is not text cannot be sent to a token endpoint"
+        );
+
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "   "));
+        assert!(
+            backend_oauth2(&store, "be").client_secret.is_none(),
+            "material that is empty once trimmed is no credential"
+        );
+    }
+
+    /// The ordering fact: a backend applied before its secret picks
+    /// the secret up when it lands, without being re-applied.
+    #[test]
+    fn a_client_secret_resolves_when_the_secret_lands_later() {
+        let store = Store::new();
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+        let revision = backend_revision(&store, "be");
+
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-test"));
+
+        assert_eq!(
+            backend_oauth2(&store, "be")
+                .client_secret
+                .as_ref()
+                .map(ClientSecret::expose),
+            Some("cs-test")
+        );
+        assert!(
+            backend_revision(&store, "be") > revision,
+            "a credential arriving is a change, and the request path has to see it"
+        );
+    }
+
+    /// A rotation is a real change, and has to reach whatever the
+    /// request path cached against the backend: here, the token
+    /// fetched with the old secret.
+    #[test]
+    fn a_rotated_client_secret_bumps_the_revision() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-test"));
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+        let revision = backend_revision(&store, "be");
+
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-new"));
+
+        assert!(backend_revision(&store, "be") > revision);
+        assert_eq!(
+            backend_oauth2(&store, "be")
+                .client_secret
+                .as_ref()
+                .map(ClientSecret::expose),
+            Some("cs-new")
+        );
+
+        // A resync re-sending the same material is not a change.
+        let revision = backend_revision(&store, "be");
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-new"));
+        assert_eq!(backend_revision(&store, "be"), revision);
+    }
+
+    /// The dependency index follows this scheme's secret exactly as
+    /// it follows an API key's: removing it unresolves the backend.
+    #[test]
+    fn removing_the_client_secret_unresolves_the_backend() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-test"));
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+        assert!(backend_oauth2(&store, "be").client_secret.is_some());
+
+        store.remove_secret(&SecretKey::new("", "provider-creds"));
+
+        assert!(backend_oauth2(&store, "be").client_secret.is_none());
+    }
+
+    /// A `{:?}` of a resolved backend is a thing that gets logged.
+    #[test]
+    fn a_resolved_client_secret_never_prints() {
+        let store = Store::new();
+        store.upsert_secret(opaque_secret("provider-creds", "clientSecret", "cs-test"));
+        store.upsert_backend(oauth2_backend("be", "provider-creds", "clientSecret"));
+
+        let backend = store
+            .read()
+            .backend(&backendkey("be"))
+            .expect("backend registered");
+        let printed = format!("{backend:?}");
+        assert!(!printed.contains("cs-test"), "{printed}");
+        assert!(printed.contains("provider-creds"), "{printed}");
+        // The client id is not a credential and stays readable.
+        assert!(printed.contains("gateway"), "{printed}");
+    }
+
     /// A credential over cleartext is a mistake in production and
     /// legitimate in a local config or against a mock provider, so it
     /// is warned about rather than refused: the backend applies and
@@ -3036,7 +3252,10 @@ abIF6YlJNVR6UhS8sg==\n\
         store.upsert_backend(Backend::Dialable(d));
 
         assert_eq!(
-            backend_auth(&store, "be").value.as_ref().expect("resolved"),
+            backend_api_key(&store, "be")
+                .value
+                .as_ref()
+                .expect("resolved"),
             "Bearer sk-test"
         );
     }

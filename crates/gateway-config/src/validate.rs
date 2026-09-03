@@ -50,6 +50,10 @@ pub enum RejectionReason {
     BackendAuthSecretNoName,
     #[error("backend auth secret reference must have a `key`")]
     BackendAuthSecretNoKey,
+    #[error("backend auth `clientId` must not be empty")]
+    BackendAuthNoClientId,
+    #[error("backend auth `tokenUrl` `{0}` is not an absolute http or https URL")]
+    BackendAuthTokenUrlNotAbsolute(String),
     /// A reference that needs a certificate names a secret this
     /// config defines as credentials. Distinct from a reference to a
     /// secret that is simply absent, which is left to resolution.
@@ -203,8 +207,8 @@ fn check_secret_references(cfg: &GatewayConfig, out: &mut Vec<Rejection>) {
                 reason: RejectionReason::SecretNotTlsMaterial(name.clone()),
             });
         }
-        if let Some(BackendAuth::ApiKey(api_key)) = d.auth.as_deref() {
-            let secret = &api_key.secret_ref;
+        if let Some(auth) = d.auth.as_deref() {
+            let secret = auth.secret_ref();
             if not_credential(&secret.namespace, &secret.name) {
                 out.push(Rejection {
                     key: format!("backends[{i}]/auth"),
@@ -463,21 +467,51 @@ fn validate_backend_tls(key: &str, tls: &BackendTls, out: &mut Vec<Rejection>) {
 /// A credential reference that names nothing cannot resolve later:
 /// unlike an absent secret, there is no arrival that fixes it. The
 /// data key is as load-bearing as the name — a secret carries several
-/// — so both are required.
+/// — so both are required. Both schemes name one secret, so both are
+/// checked the same way; what `OAuth2` adds is the endpoint that
+/// secret is spent at.
 fn validate_backend_auth(key: &str, auth: &BackendAuth, out: &mut Vec<Rejection>) {
-    let BackendAuth::ApiKey(api_key) = auth;
-    if api_key.secret_ref.name.is_empty() {
+    let secret = auth.secret_ref();
+    if secret.name.is_empty() {
         out.push(Rejection {
             key: format!("{key}/auth"),
             reason: RejectionReason::BackendAuthSecretNoName,
         });
     }
-    if api_key.secret_ref.key.is_empty() {
+    if secret.key.is_empty() {
         out.push(Rejection {
             key: format!("{key}/auth"),
             reason: RejectionReason::BackendAuthSecretNoKey,
         });
     }
+    if let BackendAuth::OAuth2(oauth) = auth {
+        if oauth.client_id.is_empty() {
+            out.push(Rejection {
+                key: format!("{key}/auth"),
+                reason: RejectionReason::BackendAuthNoClientId,
+            });
+        }
+        // The gateway dials this itself, so it has to carry a scheme
+        // and a host of its own: there is no request whose authority
+        // a relative one could be resolved against.
+        if !is_absolute_http_url(&oauth.token_url) {
+            out.push(Rejection {
+                key: format!("{key}/auth"),
+                reason: RejectionReason::BackendAuthTokenUrlNotAbsolute(oauth.token_url.clone()),
+            });
+        }
+    }
+}
+
+/// Whether `url` is something the gateway can dial on its own: an
+/// absolute URL, `http` or `https`, with a host.
+fn is_absolute_http_url(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+    let scheme = uri.scheme();
+    uri.host().is_some_and(|h| !h.is_empty())
+        && (scheme == Some(&http::uri::Scheme::HTTP) || scheme == Some(&http::uri::Scheme::HTTPS))
 }
 
 fn validate_extension(key: &str, ext: &Extension, out: &mut Vec<Rejection>) {
@@ -515,6 +549,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ClientAuthMethod;
     use crate::parse_yaml;
 
     fn parse(src: &str) -> GatewayConfig {
@@ -1051,6 +1086,217 @@ gatewayConfig:
             errs.iter()
                 .any(|r| matches!(r.reason, RejectionReason::BackendAuthSecretNoKey))
         );
+    }
+
+    // ---- backend auth: OAuth2 ----
+
+    /// The whole block, with everything an operator may leave out
+    /// left out: the defaults are `ClientSecretBasic` and no scopes.
+    #[test]
+    fn oauth2_auth_defaults_to_basic_with_no_scopes() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      tls: {}
+      auth:
+        type: OAuth2
+        tokenUrl: https://idp.example.com/oauth2/token
+        clientId: gateway
+        clientSecretRef: { name: creds, key: clientSecret }
+  secrets:
+    - name: creds
+      type: Opaque
+      data: { clientSecret: cs-not-a-real-secret }
+",
+        );
+        validate(&cfg).expect("validates");
+        let Backend::Dialable(d) = &cfg.backends[0] else {
+            panic!("expected a dialable backend");
+        };
+        let Some(BackendAuth::OAuth2(oauth)) = d.auth.as_deref() else {
+            panic!("expected an OAuth2 auth block");
+        };
+        assert_eq!(
+            oauth.client_auth_method,
+            ClientAuthMethod::ClientSecretBasic
+        );
+        assert!(oauth.scopes.is_empty());
+    }
+
+    /// The gateway dials the token endpoint itself, so the URL has to
+    /// carry a scheme and a host: there is no request whose authority
+    /// a relative one could be resolved against.
+    #[test]
+    fn oauth2_token_url_must_be_absolute() {
+        for token_url in ["/oauth2/token", "idp.example.com/token", "ftp://idp/token"] {
+            let cfg = parse(&format!(
+                r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: OAuth2
+        tokenUrl: {token_url}
+        clientId: gateway
+        clientSecretRef: {{ name: creds, key: clientSecret }}
+"
+            ));
+            let errs = validate(&cfg).unwrap_err();
+            let r = errs
+                .iter()
+                .find(|r| matches!(r.reason, RejectionReason::BackendAuthTokenUrlNotAbsolute(_)))
+                .unwrap_or_else(|| panic!("`{token_url}` is not a URL the gateway can dial"));
+            assert_eq!(r.key, "backends[0]/auth");
+        }
+    }
+
+    /// An `http` token endpoint is accepted: the runtime warns that
+    /// the client secret goes out in the clear, which is what a local
+    /// config and an integration test against a mock endpoint need.
+    #[test]
+    fn oauth2_token_url_may_be_cleartext() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: OAuth2
+        tokenUrl: http://127.0.0.1:8080/token
+        clientId: gateway
+        clientSecretRef: { name: creds, key: clientSecret }
+",
+        );
+        validate(&cfg).expect("a cleartext token endpoint validates");
+    }
+
+    #[test]
+    fn oauth2_client_id_must_not_be_empty() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: OAuth2
+        tokenUrl: https://idp.example.com/token
+        clientId: ''
+        clientSecretRef: { name: creds, key: clientSecret }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        let r = errs
+            .iter()
+            .find(|r| matches!(r.reason, RejectionReason::BackendAuthNoClientId))
+            .expect("a client with no id is rejected");
+        assert_eq!(r.key, "backends[0]/auth");
+    }
+
+    /// The same two checks the API key gets, on the reference this
+    /// scheme names instead.
+    #[test]
+    fn oauth2_client_secret_ref_must_name_a_secret_and_a_key() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: OAuth2
+        tokenUrl: https://idp.example.com/token
+        clientId: gateway
+        clientSecretRef: { name: '', key: '' }
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::BackendAuthSecretNoName))
+        );
+        assert!(
+            errs.iter()
+                .any(|r| matches!(r.reason, RejectionReason::BackendAuthSecretNoKey))
+        );
+    }
+
+    /// A client secret is credentials, whichever scheme spends it:
+    /// naming a certificate is the same mistake here as it is for an
+    /// API key.
+    #[test]
+    fn oauth2_client_secret_naming_a_certificate_rejected() {
+        let cfg = parse(
+            r"
+gatewayConfig:
+  name: g
+  binds: []
+  backends:
+    - name: be
+      type: Dialable
+      host: api.example.com
+      port: 443
+      auth:
+        type: OAuth2
+        tokenUrl: https://idp.example.com/token
+        clientId: gateway
+        clientSecretRef: { name: app-tls, key: clientSecret }
+  secrets:
+    - name: app-tls
+      type: Tls
+      certPem: |
+        -----BEGIN CERTIFICATE-----
+        MIIBgjCCASmgAwIBAgIUW/OT9NoEgpMEra4i2ttY/oSsRe0wCgYIKoZIzj0EAwIw
+        FzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MB4XDTI2MDYyNjEwNTEyOFoXDTM2MDYy
+        MzEwNTEyOFowFzEVMBMGA1UEAwwMZ2F0ZXdheS10ZXN0MFkwEwYHKoZIzj0CAQYI
+        KoZIzj0DAQcDQgAEZoF6gHnR0OJdILhqvT75ZE5oX/NkCobjCPRKQmQAvEFeN8ku
+        f+C449e9U2Gq6S7C72DJWjcsr8gaxjiMRie0H6NTMFEwHQYDVR0OBBYEFKmMFFZT
+        6oW/R893bFKGDqRaBuoRMB8GA1UdIwQYMBaAFKmMFFZT6oW/R893bFKGDqRaBuoR
+        MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgEdjQ6EJUY9QMrNQy
+        YhAYK89fjb5J6TE0AJY4QnmcFR0CIHo7A7WYP2hT7rr6orgxEqAVx7DGbd0aCCqe
+        GkIpYyxV
+        -----END CERTIFICATE-----
+      keyPem: |
+        -----BEGIN PRIVATE KEY-----
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcB/ubr8b5gfbp97H
+        /hzgYBDdRqvQrz6jRyF1kz8TrcChRANCAARmgXqAedHQ4l0guGq9PvlkTmhf82QK
+        huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf
+        -----END PRIVATE KEY-----
+",
+        );
+        let errs = validate(&cfg).unwrap_err();
+        let r = errs
+            .iter()
+            .find(|r| {
+                matches!(&r.reason, RejectionReason::SecretNotCredentialMaterial(n) if n == "app-tls")
+            })
+            .expect("a client secret naming a certificate is rejected");
+        assert_eq!(r.key, "backends[0]/auth");
     }
 
     /// Absence is not a mismatch: a reference to a secret this config
