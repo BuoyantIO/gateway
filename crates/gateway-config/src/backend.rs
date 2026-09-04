@@ -1,6 +1,9 @@
 use std::net::IpAddr;
 
+use http::HeaderName;
 use serde::Deserialize;
+
+use crate::secret::SecretRef;
 
 /// A destination a route can name. Two kinds, distinguished by what
 /// the gateway has to do to reach them: a [`StaticBackend`] is a set
@@ -36,7 +39,6 @@ pub struct StaticBackend {
     pub protocol: BackendProtocol,
 }
 
-/// TODO: optional TLS origination and creds
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DialableBackend {
@@ -50,6 +52,193 @@ pub struct DialableBackend {
     /// forwards the path unchanged.
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// `Some` originates TLS to this host; `None` dials it in the
+    /// clear.
+    #[serde(default)]
+    pub tls: Option<BackendTls>,
+    /// `Some` authenticates the gateway to this host: every request
+    /// it forwards carries the credential. `None` sends none, which
+    /// is every backend inside the cluster.
+    ///
+    /// Boxed to keep [`Backend`]'s two variants comparable in size;
+    /// nothing about the shape depends on it.
+    #[serde(default)]
+    pub auth: Option<Box<BackendAuth>>,
+}
+
+/// Client-side TLS the gateway originates to a dialable backend.
+///
+/// The four settings are what an external provider needs: what to
+/// trust, what name to ask for, what protocols to offer, and — for
+/// development against a self-signed endpoint — nothing at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendTls {
+    /// Certificates the upstream chain is verified against.
+    #[serde(default)]
+    pub ca: TrustRoots,
+    /// Name sent as SNI and verified against the upstream
+    /// certificate. `None` uses the backend's `host`, which is also
+    /// the only thing to go on when the host is a literal IP — one
+    /// that no certificate covers unless it carries an IP SAN.
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// Protocols offered in the TLS handshake, in preference order.
+    /// What the server picks decides the HTTP version upstream, so
+    /// the default offers both and lets the provider choose. An
+    /// explicitly empty list offers no ALPN at all, which settles on
+    /// HTTP/1.1.
+    #[serde(default = "default_alpn")]
+    pub alpn: Vec<AlpnProtocol>,
+    /// Accept any certificate, from anyone, for any name. For
+    /// development and integration testing against an endpoint whose
+    /// chain the gateway has no way to trust — never in production,
+    /// and it overrides `ca`.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// Where the trust roots for an upstream chain come from.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(tag = "type")]
+pub enum TrustRoots {
+    /// The platform trust store, which is what a public provider
+    /// chains to.
+    #[default]
+    System,
+    /// A CA-only secret: the certificates in its chain become the
+    /// only roots, replacing the system store rather than adding to
+    /// it.
+    Secret {
+        /// Namespace of the referenced Secret. Empty for a flat
+        /// local config, which has no namespaces.
+        #[serde(default)]
+        namespace: String,
+        name: String,
+    },
+}
+
+/// An ALPN protocol identifier, offered upstream and — when the
+/// server selects it — deciding the HTTP version the gateway speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum AlpnProtocol {
+    #[serde(rename = "h2")]
+    H2,
+    #[serde(rename = "http/1.1")]
+    Http11,
+}
+
+impl AlpnProtocol {
+    /// The identifier as it goes on the wire.
+    pub fn as_wire(self) -> &'static [u8] {
+        match self {
+            Self::H2 => b"h2",
+            Self::Http11 => b"http/1.1",
+        }
+    }
+}
+
+/// How the gateway authenticates itself to a dialable backend.
+///
+/// Tagged, so the scheme an operator names is part of what they wrote
+/// rather than something inferred from which fields they filled in.
+/// The two differ in where the credential comes from, not in where it
+/// goes: [`ApiKeyAuth`] sends material the operator provisioned,
+/// [`OAuth2Auth`] sends a token the gateway fetched with it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type")]
+pub enum BackendAuth {
+    ApiKey(ApiKeyAuth),
+    OAuth2(OAuth2Auth),
+}
+
+impl BackendAuth {
+    /// The one secret this auth block spends: the credential itself
+    /// for an API key, the client secret for `OAuth2`. Every scheme
+    /// names exactly one, which is what lets validation, the
+    /// dependency index and re-resolution treat them alike.
+    pub fn secret_ref(&self) -> &SecretRef {
+        match self {
+            Self::ApiKey(a) => &a.secret_ref,
+            Self::OAuth2(a) => &a.client_secret_ref,
+        }
+    }
+}
+
+/// A credential the operator provisioned, sent verbatim in one
+/// header.
+///
+/// The defaults are what most providers ask for — `Authorization:
+/// Bearer <key>`. A provider that names its own header sets `header`
+/// (`x-api-key`, `api-key`), and one that wants the key with nothing
+/// in front of it sets `prefix: ""`; an absent `prefix` is the
+/// default, an empty one is a choice.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyAuth {
+    /// The secret holding the credential, and the data key inside it.
+    pub secret_ref: SecretRef,
+    /// Header the credential is sent in.
+    #[serde(
+        default = "default_auth_header",
+        with = "crate::serde_http::header_name"
+    )]
+    pub header: HeaderName,
+    /// Prepended to the credential inside the header value.
+    #[serde(default = "default_auth_prefix")]
+    pub prefix: String,
+}
+
+/// The `OAuth2` client-credentials grant (RFC 6749 §4.4): the gateway
+/// presents its own credentials to a token endpoint and sends the
+/// access token it gets back to the provider.
+///
+/// The gateway is the client here, not a delegate for the caller, so
+/// nothing about the request being proxied takes part: the token is
+/// the backend's, is fetched once and reused until it expires, and
+/// two backends configured differently never share one.
+///
+/// Where the token goes is not configurable the way an API key's
+/// header is. A bearer token is sent as `Authorization: Bearer`
+/// (RFC 6750 §2.1), and a provider that wanted it anywhere else would
+/// not be speaking this grant.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuth2Auth {
+    /// Absolute `http` or `https` URL of the token endpoint. Not
+    /// necessarily on the backend's own host: the provider that
+    /// issues the token is often a different service than the one
+    /// that accepts it.
+    pub token_url: String,
+    /// The gateway's client identifier. Public by construction — it
+    /// travels beside the secret in every token request — so it is
+    /// config rather than a secret reference.
+    pub client_id: String,
+    /// The secret holding the client secret, and the data key inside
+    /// it.
+    pub client_secret_ref: SecretRef,
+    /// Scopes asked for. Empty asks for none, which is what a
+    /// provider that scopes by client identity expects.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// How the client secret is presented to the token endpoint.
+    #[serde(default)]
+    pub client_auth_method: ClientAuthMethod,
+}
+
+/// How a client authenticates to the token endpoint (RFC 6749 §2.3.1).
+///
+/// Providers accept one or the other and not always both, so this is
+/// the operator's to state. The default is the one the RFC says a
+/// client SHOULD use and a server MUST support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum ClientAuthMethod {
+    /// HTTP Basic, with the client id as the user and the client
+    /// secret as the password.
+    #[default]
+    ClientSecretBasic,
+    /// `client_id` and `client_secret` as fields of the form body.
+    ClientSecretPost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -78,4 +267,18 @@ pub struct BackendRef {
 
 fn default_weight() -> u32 {
     1
+}
+
+/// Offer both and let the provider choose: HTTP/2 where it is
+/// available, HTTP/1.1 everywhere else.
+fn default_alpn() -> Vec<AlpnProtocol> {
+    vec![AlpnProtocol::H2, AlpnProtocol::Http11]
+}
+
+fn default_auth_header() -> HeaderName {
+    http::header::AUTHORIZATION
+}
+
+fn default_auth_prefix() -> String {
+    "Bearer ".to_string()
 }

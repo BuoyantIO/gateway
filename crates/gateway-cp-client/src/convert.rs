@@ -7,6 +7,7 @@
 //! invalid input rather than silently defaulting, so translator-side
 //! bugs surface as errors at the data plane.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
@@ -20,7 +21,9 @@ use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, HttpRoute, PathMatch, QueryParamMatch,
     QueryValueMatch,
 };
-use gateway_config::secret::TlsSecret;
+use gateway_config::secret::{
+    OpaqueSecret, Secret, SecretError, SecretValue, TLS_CERT_KEY, TLS_KEY_KEY, TlsSecret,
+};
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
 
@@ -131,16 +134,61 @@ pub fn backend(msg: pb::BackendUpsert) -> Result<Backend, Error> {
     }))
 }
 
+/// Build a secret from its data map, by the type the CP stamped on
+/// it: TLS material is parsed to DER here, credentials are carried
+/// as they arrived.
+///
+/// An empty `tls.key` is a CA-only secret: certificates to verify an
+/// upstream against, with no key to serve. A keypair secret carries
+/// both.
+///
 /// # Errors
-/// Returns [`Error::InvalidSecret`] if the cert chain / private key
-/// PEM is malformed (parsed up front so a bad secret is rejected here
-/// rather than at handshake time).
-pub fn secret(msg: pb::SecretUpsert) -> Result<TlsSecret, Error> {
+/// Returns [`Error::InvalidSecret`] if the type is unspecified, a TLS
+/// data key is missing or not UTF-8, or the PEM is malformed (parsed
+/// up front so a bad secret is rejected here rather than at handshake
+/// time).
+pub fn secret(msg: pb::SecretUpsert) -> Result<Secret, Error> {
     // Namespace-qualified for the error so two same-named secrets in
     // different namespaces are distinguishable in logs.
     let name = SecretKey::new(msg.namespace.clone(), msg.name.clone()).to_string();
-    TlsSecret::new(msg.namespace, msg.name, &msg.cert_pem, &msg.key_pem)
-        .map_err(|source| Error::InvalidSecret { name, source })
+    build_secret(msg).map_err(|source| Error::InvalidSecret { name, source })
+}
+
+fn build_secret(msg: pb::SecretUpsert) -> Result<Secret, SecretError> {
+    match pb::SecretType::try_from(msg.r#type) {
+        Ok(pb::SecretType::Tls) => {
+            let cert_pem = required_utf8(&msg.data, TLS_CERT_KEY)?;
+            // Present but empty is how a CA-only secret arrives; a
+            // `kubernetes.io/tls` Secret always carries the key.
+            let key_pem = required_utf8(&msg.data, TLS_KEY_KEY)?;
+            let parsed = if key_pem.is_empty() {
+                TlsSecret::ca(msg.namespace, msg.name, cert_pem)?
+            } else {
+                TlsSecret::new(msg.namespace, msg.name, cert_pem, key_pem)?
+            };
+            Ok(parsed.into())
+        }
+        Ok(pb::SecretType::Opaque) => {
+            let data = msg
+                .data
+                .into_iter()
+                .map(|(k, v)| (k, SecretValue::new(v)))
+                .collect();
+            Ok(OpaqueSecret::new(msg.namespace, msg.name, data).into())
+        }
+        Ok(pb::SecretType::Unspecified) | Err(_) => Err(SecretError::UnspecifiedType),
+    }
+}
+
+/// One TLS data key, as text. Absent and non-UTF-8 are told apart:
+/// the first is a Secret that never carried the material, the second
+/// one that carries something that is not PEM.
+fn required_utf8<'a>(
+    data: &'a HashMap<String, Vec<u8>>,
+    key: &'static str,
+) -> Result<&'a str, SecretError> {
+    let bytes = data.get(key).ok_or(SecretError::MissingData(key))?;
+    std::str::from_utf8(bytes).map_err(|_| SecretError::NotUtf8(key))
 }
 
 /// # Errors

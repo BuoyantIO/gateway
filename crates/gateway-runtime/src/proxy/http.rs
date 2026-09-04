@@ -26,8 +26,8 @@ use gateway_config::route::{
     HeaderMatch, HeaderValueMatch, HttpMatch, PathMatch, QueryParamMatch, QueryValueMatch,
 };
 use gateway_state::{
-    ActiveBackend, ActiveBackendKind, ActiveBackendRef, ActiveDialable, ActiveHttpRoute,
-    ActiveListener, BindKey, Store,
+    ActiveBackend, ActiveBackendAuth, ActiveBackendKind, ActiveBackendRef, ActiveBackendTls,
+    ActiveDialable, ActiveHttpRoute, ActiveListener, BackendKey, BindKey, Store,
 };
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
@@ -50,6 +50,8 @@ use crate::metrics::Reason;
 use crate::proxy::access::{Access, RequestOutcome};
 use crate::proxy::body::{BoxError, HeldBody, UpstreamBody, apply_body_source};
 use crate::proxy::gate;
+use crate::proxy::oauth2::{TokenCaches, TokenFailure};
+use crate::proxy::originate::{TlsClient, TlsClients};
 use crate::proxy::tap;
 
 /// Response body handed back to hyper. `Unsync` because the response
@@ -62,16 +64,26 @@ pub(super) type ResponseBody = UnsyncBoxBody<Bytes, BoxError>;
 /// connection pool that is shared across every cloned handle.
 ///
 /// Process-wide upstream HTTP client. Holds one HTTP/1.1 client and
-/// one HTTP/2-only client; `forward()` selects between them by the
-/// backend's `BackendProtocol`. The H2 client over a plaintext
-/// connector speaks h2c (prior-knowledge) — that's how we reach a
-/// plaintext gRPC backend.
+/// one HTTP/2-only client for everything dialed in the clear;
+/// `forward()` selects between them by the backend's
+/// `BackendProtocol`. The H2 client over a plaintext connector
+/// speaks h2c (prior-knowledge) — that's how we reach a plaintext
+/// gRPC backend.
+///
+/// A dialable backend that originates TLS is dialed by a client of
+/// its own instead (`originate`), because the client config is that
+/// backend's and so is the pool of connections made with it. There
+/// the wire version is not selected at all: ALPN decides it.
 ///
 /// TODO: replace these two hyper legacy clients
 #[derive(Clone)]
 pub struct HttpClient {
     h1: hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
     h2: hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
+    tls: Arc<TlsClients>,
+    /// The access token each backend authenticating with `OAuth2` is
+    /// currently sending, and what it takes to fetch the next one.
+    tokens: Arc<TokenCaches>,
 }
 
 impl HttpClient {
@@ -97,7 +109,12 @@ impl Default for HttpClient {
         let h2 = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
             .http2_only(true)
             .build_http::<UpstreamBody>();
-        Self { h1, h2 }
+        Self {
+            h1,
+            h2,
+            tls: Arc::new(TlsClients::default()),
+            tokens: Arc::new(TokenCaches::default()),
+        }
     }
 }
 
@@ -121,23 +138,15 @@ struct Destination {
     /// time. Also the `endpoint` label the access log and metrics
     /// carry.
     authority: String,
-    /// `Host` to send upstream; `None` keeps the client's. An
-    /// endpoint is one member of the service the client addressed,
-    /// so the client's host stands. A dialable backend is a
-    /// different origin and has to be addressed as itself.
-    host: Option<String>,
-    /// Joined ahead of the request path. `None` for an endpoint,
-    /// which forwards the path untouched.
-    path_prefix: Option<String>,
+    /// `Some` for a dialable backend — a host that answers for its
+    /// own origin, with its own path prefix and, when configured,
+    /// its own TLS. `None` for an endpoint, which is one member of
+    /// the service the client already addressed.
+    dialable: Option<Dialable>,
     protocol: BackendProtocol,
     /// In-flight count, latency estimate and eviction state.
     info: Arc<EndpointInfo>,
 }
-
-/// Default port for the scheme upstream requests are dialed with. A
-/// `Host` carrying the default port is legal but unusual, so it is
-/// left off; TLS origination will bring the second default with it.
-const DEFAULT_PORT: u16 = 80;
 
 impl Destination {
     /// Where a request to `backend` goes: the balanced pick over an
@@ -150,11 +159,9 @@ impl Destination {
                 let (endpoint, info) = lb.pick_endpoint(backend)?;
                 Some(Self::at_endpoint(&endpoint, backend.protocol(), info))
             }
-            ActiveBackendKind::Dialable(dialable) => Some(Self::at_host(
-                dialable,
-                backend.protocol(),
-                lb.dialable_state(backend),
-            )),
+            ActiveBackendKind::Dialable(dialable) => {
+                Some(Self::at_host(backend, dialable, lb.dialable_state(backend)))
+            }
         }
     }
 
@@ -165,32 +172,74 @@ impl Destination {
     ) -> Self {
         Self {
             authority: format!("{}:{}", endpoint.address, endpoint.port),
-            host: None,
-            path_prefix: None,
+            dialable: None,
             protocol,
             info,
         }
     }
 
     fn at_host(
+        backend: &Arc<ActiveBackend>,
         dialable: &ActiveDialable,
-        protocol: BackendProtocol,
         info: Arc<EndpointInfo>,
     ) -> Self {
-        let authority = format!("{}:{}", dialable.host, dialable.port);
-        let host = if dialable.port == DEFAULT_PORT {
-            dialable.host.clone()
-        } else {
-            authority.clone()
-        };
         Self {
-            authority,
-            host: Some(host),
-            path_prefix: dialable.path_prefix.clone(),
-            protocol,
+            authority: format!("{}:{}", dialable.host, dialable.port),
+            dialable: Some(Dialable {
+                backend: backend.key.clone(),
+                revision: backend.revision,
+                path_prefix: dialable.path_prefix.clone(),
+                tls: dialable.tls.clone(),
+                auth: dialable.auth.clone(),
+            }),
+            protocol: backend.protocol(),
             info,
         }
     }
+
+    /// Joined ahead of the request path. `None` for an endpoint,
+    /// which forwards the path untouched.
+    fn path_prefix(&self) -> Option<&str> {
+        self.dialable
+            .as_ref()
+            .and_then(|d| d.path_prefix.as_deref())
+    }
+
+    /// A destination reached over TLS: the backend's cache identity
+    /// (name and revision) and the settings its client is built from.
+    fn tls(&self) -> Option<(&BackendKey, u64, &ActiveBackendTls)> {
+        let dialable = self.dialable.as_ref()?;
+        Some((
+            &dialable.backend,
+            dialable.revision,
+            dialable.tls.as_deref()?,
+        ))
+    }
+
+    /// The credential this destination authenticates with, and the
+    /// backend it belongs to — which is what a token is cached
+    /// under. `None` for a destination that authenticates with
+    /// nothing, which is every endpoint and every dialable backend
+    /// without an auth block.
+    fn auth(&self) -> Option<(&BackendKey, &ActiveBackendAuth)> {
+        let dialable = self.dialable.as_ref()?;
+        Some((&dialable.backend, dialable.auth.as_deref()?))
+    }
+}
+
+/// The dialable-backend half of a destination.
+struct Dialable {
+    /// The backend's own name: what its upstream client is cached
+    /// under.
+    backend: BackendKey,
+    /// The applied version of the backend, which is what says whether
+    /// a cached client is still the right one.
+    revision: u64,
+    path_prefix: Option<String>,
+    /// `Some` originates TLS with this backend's settings.
+    tls: Option<Arc<ActiveBackendTls>>,
+    /// `Some` authenticates to this backend with this credential.
+    auth: Option<Arc<ActiveBackendAuth>>,
 }
 
 // =================== connection + request handlers ===================
@@ -702,8 +751,8 @@ fn validate_target(
                 return None;
             };
             Some(Destination::at_host(
+                active,
                 dialable,
-                active.protocol(),
                 lb.dialable_state(active),
             ))
         }
@@ -1282,29 +1331,179 @@ fn upstream_path<'a>(prefix: Option<&str>, path_and_query: &'a str) -> Cow<'a, s
     Cow::Owned(format!("{prefix}{path_and_query}"))
 }
 
-/// Rewrite `req` for `dest` — authority, path, and the `Host` a
-/// dialable backend is addressed by — set the server-side wire
-/// version from the destination's protocol, strip hop-by-hop
-/// headers, and forward via the matching client. The dial is timed
-/// either way: a success feeds the destination's latency estimate, a
-/// failure increments the counter that drives passive eviction and
-/// answers 502.
+/// The client one destination is reached through, and what that
+/// choice settles about the request.
+enum Upstream<'a> {
+    /// A process-wide plaintext client, with the wire version the
+    /// backend's protocol names.
+    Plaintext(
+        &'a hyper_util::client::legacy::Client<HttpConnector, UpstreamBody>,
+        http::Version,
+    ),
+    /// One dialable backend's TLS client. Boxed only because it is
+    /// far bigger than a borrowed one; the pool it dials through is
+    /// shared with every clone.
+    Tls(Box<TlsClient>),
+}
+
+impl Upstream<'_> {
+    fn scheme(&self) -> http::uri::Scheme {
+        match self {
+            Self::Plaintext(..) => http::uri::Scheme::HTTP,
+            Self::Tls(_) => http::uri::Scheme::HTTPS,
+        }
+    }
+
+    /// The version the request is handed to the client with — which
+    /// is not always the one that goes on the wire. Over TLS it is
+    /// HTTP/1.1 whatever ALPN settles on: hyper will send an
+    /// HTTP/1.1 request over an h2 connection it negotiated, but
+    /// refuses an HTTP/2 request over an H1 one.
+    fn version(&self) -> http::Version {
+        match self {
+            Self::Plaintext(_, version) => *version,
+            Self::Tls(_) => http::Version::HTTP_11,
+        }
+    }
+
+    async fn send(
+        self,
+        req: Request<UpstreamBody>,
+    ) -> Result<Response<Incoming>, hyper_util::client::legacy::Error> {
+        match self {
+            Self::Plaintext(client, _) => client.request(req).await,
+            Self::Tls(client) => client.request(req).await,
+        }
+    }
+}
+
+/// An error with its cause chain flattened onto one log line.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
+/// Put the backend's credential on the request, if it has one.
+///
+/// The last thing done to a request before it is dialed, and done by
+/// replacing whatever was under the credential's header name: a client
+/// may have sent a credential of its own, and a route filter or an
+/// extension may have set the same header, so inserting rather than
+/// appending is what makes the provider see exactly one — the
+/// configured one. Nothing after this point reads it, and the value is
+/// marked sensitive, so it stays out of debug output and out of the H2
+/// header index.
+///
+/// # Errors
+/// The reason the request must not be forwarded. A credential the
+/// operator asked for that the gateway does not have fails the request
+/// here rather than reaching the provider unauthenticated, which is a
+/// different request than the one that was asked for, answered
+/// differently by the provider rather than visibly failing. Both ways
+/// that happens are logged at debug, not warn: they are per-request,
+/// whoever decided the credential was unusable has already said so,
+/// and the access log carries the reason on every one of them. Same
+/// reasoning as the unbuildable TLS client in [`forward`].
+async fn attach_credential(
+    client: &HttpClient,
+    req: &mut Request<UpstreamBody>,
+    dest: &Destination,
+) -> Result<(), Reason> {
+    let Some((backend, auth)) = dest.auth() else {
+        return Ok(());
+    };
+    let (name, value) = match auth {
+        ActiveBackendAuth::ApiKey(api_key) => {
+            let Some(value) = api_key.value.clone() else {
+                // The secret has not arrived, names no such data key,
+                // or holds something no header can carry.
+                tracing::debug!(
+                    secret = %api_key.secret,
+                    "backend credential is unresolved; not forwarding unauthenticated"
+                );
+                return Err(Reason::CredentialUnresolved);
+            };
+            (api_key.header.clone(), value)
+        }
+        ActiveBackendAuth::OAuth2(oauth) => {
+            // The cached token, or a fetch. This is the one place the
+            // request path waits on the gateway's own call, and only
+            // when there is no token it could send instead; it is
+            // before the dial, so the wait is not counted against the
+            // backend's latency or its eviction state.
+            match client.tokens.header(backend, oauth).await {
+                Ok(value) => (http::header::AUTHORIZATION, value),
+                Err(failure) => {
+                    tracing::debug!(
+                        %backend,
+                        "no access token for backend; not forwarding unauthenticated"
+                    );
+                    return Err(match failure {
+                        TokenFailure::Unresolved => Reason::CredentialUnresolved,
+                        TokenFailure::Unavailable => Reason::TokenUnavailable,
+                    });
+                }
+            }
+        }
+    };
+    req.headers_mut().insert(name, value);
+    Ok(())
+}
+
+/// Rewrite `req` for `dest` — scheme, authority, path, and the
+/// `Host` a dialable backend is addressed by — set the server-side
+/// wire version, strip hop-by-hop headers, and forward via the
+/// client that reaches this destination. The dial is timed either
+/// way: a success feeds the destination's latency estimate, a
+/// failure — a refused connection, an untrusted chain, a name the
+/// certificate does not cover — increments the counter that drives
+/// passive eviction and answers 502.
 ///
 /// The server-side protocol is fully independent of the client-side
 /// version the gateway served: an `Http2` backend gets h2c
-/// origination whether the client spoke H1 or H2.
+/// origination whether the client spoke H1 or H2, and a backend
+/// reached over TLS gets whatever ALPN settled on.
 async fn forward(
     client: &HttpClient,
     mut req: Request<UpstreamBody>,
     dest: &Destination,
 ) -> (Response<ResponseBody>, Reason, Option<f64>) {
+    // Which client reaches this destination, and over which scheme.
+    // A TLS backend's client is built on first use from settings the
+    // control plane already resolved; a failure here is a config
+    // problem, not an upstream one, so it is not counted as a dial
+    // failure against the destination. The cache logged it once when
+    // it decided it; the per-request record is the access log's
+    // reason.
+    let upstream = if let Some((backend, revision, tls)) = dest.tls() {
+        match client.tls.client_for(backend, revision, tls) {
+            Ok(tls_client) => Upstream::Tls(Box::new(tls_client)),
+            Err(_) => {
+                return (
+                    synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+                    Reason::BackendUnresolved,
+                    None,
+                );
+            }
+        }
+    } else {
+        let (plaintext, version) = client.select(dest.protocol);
+        Upstream::Plaintext(plaintext, version)
+    };
+
     let pq = req
         .uri()
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str);
-    let path = upstream_path(dest.path_prefix.as_deref(), pq);
+    let path = upstream_path(dest.path_prefix(), pq);
     let upstream_uri = match Uri::builder()
-        .scheme(http::uri::Scheme::HTTP)
+        .scheme(upstream.scheme())
         .authority(dest.authority.as_str())
         .path_and_query(path.as_ref())
         .build()
@@ -1320,12 +1519,7 @@ async fn forward(
         }
     };
     *req.uri_mut() = upstream_uri;
-
-    // Pick the client + wire version for this backend's protocol. The
-    // client-side version (which may be H2 when the downstream codec
-    // was H2) does not constrain the server side.
-    let (upstream_client, version) = client.select(dest.protocol);
-    *req.version_mut() = version;
+    *req.version_mut() = upstream.version();
 
     // Strip hop-by-hop headers before crossing the proxy hop. This is
     // load-bearing for H2: a stale `Connection` / `Transfer-Encoding`
@@ -1334,28 +1528,33 @@ async fn forward(
     strip_hop_by_hop_headers(req.headers_mut());
 
     // A dialable backend answers for itself, not for the host the
-    // client addressed, so the client's `Host` is replaced rather
-    // than carried (hyper only fills one in when it is absent). On
-    // H2 the URI's authority becomes `:authority` and is the
-    // authoritative form, so a leftover `Host` — which would
-    // contradict it — is dropped instead of rewritten.
-    if let Some(host) = &dest.host {
+    // client addressed, so the client's `Host` does not go upstream.
+    // Dropping it lets hyper fill in the one that matches the URI we
+    // just built (default port left off) on H1, and on H2 the URI's
+    // authority becomes `:authority`, which is the authoritative
+    // form and needs no `Host` beside it. Neither is knowable here
+    // when ALPN picks the version.
+    if dest.dialable.is_some() {
         req.headers_mut().remove(http::header::HOST);
-        if version == http::Version::HTTP_11 {
-            let Ok(value) = http::HeaderValue::from_str(host) else {
-                tracing::warn!(%host, "backend host is not a valid Host header");
-                return (
-                    synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
-                    Reason::Internal,
-                    None,
-                );
-            };
-            req.headers_mut().insert(http::header::HOST, value);
-        }
+    }
+
+    // The credential goes on last, and by replacing whatever was
+    // under its name: a client may have sent a credential of its own,
+    // and a route filter or an extension may have set the same
+    // header, so inserting rather than appending is what makes the
+    // provider see exactly one — the configured one. Nothing after
+    // this point reads it, and the value is marked sensitive, so it
+    // stays out of debug output and out of the H2 header index.
+    if let Err(reason) = attach_credential(client, &mut req, dest).await {
+        return (
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            reason,
+            None,
+        );
     }
 
     let dial_start = Instant::now();
-    let (upstream_resp, dial_ms) = match upstream_client.request(req).await {
+    let (upstream_resp, dial_ms) = match upstream.send(req).await {
         Ok(r) => {
             let dial_ms = dial_start.elapsed().as_secs_f64() * 1000.0;
             dest.info.record_success(dial_ms);
@@ -1363,7 +1562,10 @@ async fn forward(
         }
         Err(e) => {
             dest.info.record_failure();
-            tracing::warn!(error = %e, "upstream dial failed");
+            // hyper's own message says only that the connect failed;
+            // the reason — refused, timed out, certificate rejected
+            // — is down the cause chain.
+            tracing::warn!(error = %error_chain(&e), "upstream dial failed");
             // The elapsed time still reaches the log: how long the
             // dial waited before the 502.
             return (
@@ -2129,6 +2331,7 @@ mod tests {
             key: key.clone(),
             backend: Some(Arc::new(ActiveBackend {
                 key,
+                revision: 0,
                 kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
                     endpoints: vec![Endpoint {
                         name: "e0".into(),
@@ -2228,6 +2431,7 @@ mod tests {
             backend: resolved.then(|| {
                 Arc::new(ActiveBackend {
                     key,
+                    revision: 0,
                     kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
                         endpoints: vec![],
                         protocol: BackendProtocol::Http1,
@@ -2249,7 +2453,27 @@ mod tests {
             host: "api.example.com".into(),
             port,
             path_prefix: path_prefix.map(str::to_owned),
+            tls: None,
+            auth: None,
         }
+    }
+
+    /// The registered backend a dialable destination is built from.
+    fn dialable_backend(dialable: ActiveDialable) -> Arc<ActiveBackend> {
+        Arc::new(ActiveBackend {
+            key: BackendKey::new("provider"),
+            revision: 0,
+            kind: ActiveBackendKind::Dialable(dialable),
+        })
+    }
+
+    fn backend_tls(sni: Option<&str>) -> Arc<ActiveBackendTls> {
+        Arc::new(ActiveBackendTls {
+            roots: gateway_state::ActiveTrustRoots::System,
+            sni: sni.map(str::to_owned),
+            alpn: vec![],
+            insecure_skip_verify: false,
+        })
     }
 
     #[test]
@@ -2261,24 +2485,41 @@ mod tests {
         };
         let dest = Destination::at_endpoint(&endpoint, BackendProtocol::Http1, info());
         assert_eq!(dest.authority, "127.0.0.1:8080");
-        assert!(dest.host.is_none());
-        assert!(dest.path_prefix.is_none());
+        assert!(dest.dialable.is_none());
+        assert!(dest.path_prefix().is_none());
+        assert!(dest.tls().is_none());
     }
 
     #[test]
     fn dialable_destination_addresses_the_target() {
-        let dest =
-            Destination::at_host(&dialable(8443, Some("/v1")), BackendProtocol::Http1, info());
+        let backend = dialable_backend(dialable(8443, Some("/v1")));
+        let ActiveBackendKind::Dialable(d) = &backend.kind else {
+            unreachable!("built as dialable");
+        };
+        let dest = Destination::at_host(&backend, d, info());
         assert_eq!(dest.authority, "api.example.com:8443");
-        assert_eq!(dest.host.as_deref(), Some("api.example.com:8443"));
-        assert_eq!(dest.path_prefix.as_deref(), Some("/v1"));
+        assert_eq!(dest.path_prefix(), Some("/v1"));
+        // A dialable backend answers for its own origin, so the
+        // client's Host does not go upstream.
+        assert!(dest.dialable.is_some());
+        // Plaintext until a TLS block says otherwise.
+        assert!(dest.tls().is_none());
     }
 
+    /// A TLS destination carries what identifies the client to use —
+    /// the backend's own name and the revision that says whether a
+    /// cached one is current — plus the settings to build it from.
     #[test]
-    fn dialable_host_drops_the_default_port() {
-        let dest = Destination::at_host(&dialable(80, None), BackendProtocol::Http1, info());
-        assert_eq!(dest.authority, "api.example.com:80");
-        assert_eq!(dest.host.as_deref(), Some("api.example.com"));
+    fn tls_destination_carries_the_backend_and_its_settings() {
+        let mut d = dialable(443, None);
+        d.tls = Some(backend_tls(Some("edge.example.com")));
+        let mut backend = dialable_backend(d.clone());
+        Arc::get_mut(&mut backend).expect("sole owner").revision = 7;
+        let dest = Destination::at_host(&backend, &d, info());
+        let (key, revision, tls) = dest.tls().expect("tls settings");
+        assert_eq!(key, &BackendKey::new("provider"));
+        assert_eq!(revision, 7);
+        assert_eq!(tls.sni.as_deref(), Some("edge.example.com"));
     }
 
     #[test]

@@ -821,6 +821,7 @@ name = "gateway-runtime"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "form_urlencoded",
  "futures",
@@ -840,10 +841,14 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]
@@ -853,6 +858,7 @@ name = "gateway-state"
 version = "0.0.0"
 dependencies = [
  "gateway-config",
+ "http",
  "parking_lot",
  "thiserror",
  "tokio",

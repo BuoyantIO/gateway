@@ -172,7 +172,11 @@ fn https_config(bind_port: u16, upstream_port: u16, with_secret: bool) -> Gatewa
             protocol: BackendProtocol::Http1,
         })],
         secrets: if with_secret {
-            vec![TlsSecret::new("", "app-tls", CERT_PEM, KEY_PEM).unwrap()]
+            vec![
+                TlsSecret::new("", "app-tls", CERT_PEM, KEY_PEM)
+                    .unwrap()
+                    .into(),
+            ]
         } else {
             vec![]
         },
@@ -396,8 +400,12 @@ fn two_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
             protocol: BackendProtocol::Http1,
         })],
         secrets: vec![
-            TlsSecret::new("", "secret-a", CERT_PEM, KEY_PEM).unwrap(),
-            TlsSecret::new("", "secret-b", CERT_B_PEM, KEY_B_PEM).unwrap(),
+            TlsSecret::new("", "secret-a", CERT_PEM, KEY_PEM)
+                .unwrap()
+                .into(),
+            TlsSecret::new("", "secret-b", CERT_B_PEM, KEY_B_PEM)
+                .unwrap()
+                .into(),
         ],
         extensions: vec![],
     }

@@ -321,8 +321,11 @@ mod tests {
             pb::SecretUpsert {
                 namespace: "demo".into(),
                 name: "tls".into(),
-                cert_pem: "cert".into(),
-                key_pem: "key".into(),
+                r#type: pb::SecretType::Tls as i32,
+                data: HashMap::from([
+                    ("tls.crt".to_string(), b"cert".to_vec()),
+                    ("tls.key".to_string(), b"key".to_vec()),
+                ]),
             },
         );
         snap.listeners.insert(

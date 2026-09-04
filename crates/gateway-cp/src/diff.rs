@@ -189,6 +189,8 @@ fn diff_extensions(
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+
     fn upsert_bind(name: &str, port: u32) -> pb::BindUpsert {
         pb::BindUpsert {
             name: name.into(),
@@ -202,8 +204,11 @@ mod tests {
         pb::SecretUpsert {
             namespace: namespace.into(),
             name: name.into(),
-            cert_pem: cert_pem.into(),
-            key_pem: "key".into(),
+            r#type: pb::SecretType::Tls as i32,
+            data: HashMap::from([
+                ("tls.crt".to_string(), cert_pem.as_bytes().to_vec()),
+                ("tls.key".to_string(), b"key".to_vec()),
+            ]),
         }
     }
 
