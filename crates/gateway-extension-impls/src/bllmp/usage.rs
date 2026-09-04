@@ -42,6 +42,12 @@ impl Capture {
     pub(crate) fn completion_tokens(&self) -> Option<u64> {
         extract_usage_uint(&self.tail, "completion_tokens")
     }
+
+    /// Cached prompt tokens, reported under `prompt_tokens_details`
+    /// by providers that serve a prefix from cache; absent otherwise.
+    pub(crate) fn cached_tokens(&self) -> Option<u64> {
+        extract_usage_uint(&self.tail, "cached_tokens")
+    }
 }
 
 /// First `"model": "…"` in the head. Best-effort scan — the head is
@@ -184,6 +190,7 @@ mod tests {
         );
         assert_eq!(c.prompt_tokens(), Some(3));
         assert_eq!(c.completion_tokens(), Some(9));
+        assert_eq!(c.cached_tokens(), Some(99));
     }
 
     #[test]
@@ -193,6 +200,7 @@ mod tests {
         assert_eq!(c.model(), "");
         assert_eq!(c.prompt_tokens(), None);
         assert_eq!(c.completion_tokens(), None);
+        assert_eq!(c.cached_tokens(), None);
     }
 
     #[test]

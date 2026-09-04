@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Body chunks as `Bytes`: the hooks hand chunks over without
         // copying into a Vec.
         .bytes(".")
+        .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(&[proto], &["proto"])?;
     println!("cargo:rerun-if-changed={proto}");
     Ok(())

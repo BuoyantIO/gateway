@@ -414,12 +414,14 @@ impl Extension for BllmpSelector {
                 );
                 return;
             }
+            let cached = self.capture.cached_tokens();
             let model = self.capture.model();
             tracing::debug!(target: LOG,
                 response_id,
                 %model,
                 prompt_tokens = prompt.unwrap_or(0),
                 completion_tokens = completion.unwrap_or(0),
+                cached_tokens = cached.unwrap_or(0),
                 itl_samples = counts.iter().sum::<u32>(),
                 "bllmp: reporting final token"
             );
@@ -428,6 +430,7 @@ impl Extension for BllmpSelector {
                 model,
                 prompt_tokens: clamp_u32(prompt.unwrap_or(0)),
                 completion_tokens: clamp_u32(completion.unwrap_or(0)),
+                cached_tokens: cached.map(clamp_u32),
                 itl_bucket_layout: if counts.is_empty() {
                     0
                 } else {

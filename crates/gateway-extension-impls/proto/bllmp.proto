@@ -170,6 +170,7 @@ message ReportFinalTokenRequest {
   string model = 2;
   uint32 prompt_tokens = 3;
   uint32 completion_tokens = 4;
+  optional uint32 cached_tokens = 5; // not always reported
 
   /*
   Per-bucket counts of inter-token ARRIVAL gaps in milliseconds, index-aligned
@@ -189,8 +190,9 @@ message ReportFinalTokenRequest {
     [ 3] (15, 20]      [ 8] (75, 100]     [13] (500, 1000]
     [ 4] (20, 30]      [ 9] (100, 150]    [14] (1000, +inf)
   */
-  repeated uint32 itl_bucket_counts = 5;
-  uint32 itl_bucket_layout = 6;
+
+  repeated uint32 itl_bucket_counts = 6;
+  uint32 itl_bucket_layout = 7;
 }
 
 message ReportFinalTokenResponse {
