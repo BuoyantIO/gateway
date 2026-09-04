@@ -8,7 +8,18 @@
 //! data-plane snapshots; the status builder consumes the outcomes.
 //! Neither re-derives a decision.
 //!
-//! `attachedRoutes` counting follows the CRD text precisely: it
+//! A `GatewayBackend` is decided here too, and once per object
+//! rather than once per reference: its `baseURL` is split into the
+//! host, port and path prefix the data plane dials with (a URL exists
+//! nowhere past this module), and every Secret it names is looked up.
+//! The two failures are deliberately different. A spec that cannot
+//! name a destination is [`GatewayBackendOutcome::Invalid`] and
+//! publishes nothing. A spec that is fine but names material that has
+//! not arrived stays `Resolved` with that reference unresolved: the
+//! backend is published, the request path fails visibly, and the
+//! material can land later without the object changing.
+//!
+//! `attachedRoutes` counting follows the Gateway CRD text precisely: it
 //! counts *distinct routes* whose parent attachment is Accepted, on
 //! every listener the parentRef selects (plus `allowedRoutes`, once
 //! enforced) — even a listener that is itself conflicted. Routes not
@@ -23,10 +34,12 @@ use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewayLi
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteParentRefs, HttpRouteRulesBackendRefs,
 };
+use gateway_config::secret::SecretValue;
 use gateway_cp_proto::v1 as pb;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 
+use crate::crd::{self, GatewayBackend};
 use crate::infra;
 use crate::infra::desired::object_name;
 use crate::infra::{GATEWAY_NAME_LABEL, MANAGED_BY_LABEL, MANAGED_BY_VALUE};
@@ -35,15 +48,23 @@ use crate::translator::K8sState;
 
 /// The well-known `EndpointSlice` label naming the owning Service.
 pub(crate) const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
+/// API group of the gateway's own custom resources.
+pub(crate) const GATEWAY_GROUP: &str = "gateway.linkerd.io";
 
 /// The resolved world for one pass: every owned Gateway with its
-/// classified listeners and addresses, and every (route x parentRef)
-/// with its attachment outcome, emission edges, and backend
-/// resolutions.
+/// classified listeners and addresses, every `GatewayBackend` with
+/// its URL parsed and its secrets looked up, and every
+/// (route x parentRef) with its attachment outcome, emission edges,
+/// and backend resolutions.
 pub struct Resolution<'a> {
     /// `GatewayClass`es whose `controllerName` is ours.
     pub gateway_classes: Vec<&'a GatewayClass>,
     pub gateways: Vec<GatewayResolution<'a>>,
+    /// Every `GatewayBackend` in the cluster, resolved once whether
+    /// or not a route names it. Route refs point in here by index,
+    /// and the status builder reads it directly, so an object ten
+    /// routes reference is still decided once.
+    pub gateway_backends: Vec<GatewayBackendResolution<'a>>,
     pub routes: Vec<RouteResolution<'a>>,
 }
 
@@ -93,8 +114,15 @@ impl ListenerOutcome {
     }
 }
 
-/// An accepted certificateRef. `secret` is `Some` when the material
-/// is present in the cluster (the DP stashes the listener until then).
+/// An accepted reference to TLS material: a listener's
+/// certificateRef, or the trust roots of a `GatewayBackend`.
+///
+/// `secret` is `Some` only when the named Secret is present *and*
+/// carries a non-empty `tls.crt`. A Secret whose material is
+/// unusable is deliberately indistinguishable here from one that has
+/// not arrived: both leave the reference unresolved, both are
+/// reported the same way, and neither is published to a data plane
+/// that would only reject it.
 pub struct CertRef<'a> {
     pub namespace: String,
     pub name: String,
@@ -186,10 +214,26 @@ pub enum BackendOutcome<'a> {
     /// Services could resolve through their `EndpointSlice`s too;
     /// that is deliberately not done yet.
     Headless { key: String },
+    /// A `GatewayBackend` this route names, resolved once at
+    /// `Resolution::gateway_backends[index]`. The ref is emitted
+    /// whatever that resolution says; the upsert behind it is only
+    /// emitted when the object is usable, so a route pointing at a
+    /// broken backend gets a 500 rather than silence.
+    Dialable { key: String, index: usize },
+    /// Named `GatewayBackend` does not exist. Same wire behavior as
+    /// a missing Service: the ref rides along unresolved.
+    MissingDialable { key: String },
     /// Cross-namespace without a `ReferenceGrant`: dropped entirely.
     CrossNamespace,
-    /// backendRef without a port: dropped entirely.
+    /// A Service backendRef without a port: dropped entirely.
     NoPort,
+    /// A `GatewayBackend` backendRef *with* a port: dropped
+    /// entirely. The port belongs to `baseURL`, and a ref naming a
+    /// second one has no sensible reading.
+    PortNotAllowed,
+    /// A group/kind pair that is neither a core `Service` nor our
+    /// `GatewayBackend`: dropped entirely.
+    UnsupportedKind,
 }
 
 /// One usable pod address for a backend, derived from the Service's
@@ -203,6 +247,117 @@ pub struct ResolvedEndpoint {
     pub name: String,
     pub address: String,
     pub port: u16,
+}
+
+/// One `GatewayBackend`, decided once per pass.
+pub struct GatewayBackendResolution<'a> {
+    pub object: &'a GatewayBackend,
+    pub namespace: String,
+    pub name: String,
+    /// The key this backend travels under on the wire, and therefore
+    /// the data plane's per-backend state key: `namespace/name`. It
+    /// cannot collide with a Service-derived key, which always
+    /// carries `:port`, and it is stable across every edit to the
+    /// spec — the connection pool and the endpoint's latency and
+    /// eviction history hang off it.
+    pub key: String,
+    pub outcome: GatewayBackendOutcome<'a>,
+}
+
+pub enum GatewayBackendOutcome<'a> {
+    /// Usable: the URL is split into what the data plane dials with,
+    /// and every Secret the spec names has been looked up. A named
+    /// Secret that is absent leaves its reference unresolved rather
+    /// than failing the object; the backend is still published, and
+    /// requests through it fail until the material lands.
+    Resolved(Box<ResolvedDialable<'a>>),
+    /// The spec cannot be turned into a destination at all, so
+    /// nothing is published for it and traffic aimed at it gets a
+    /// 500. `reason` is the status condition reason.
+    Invalid {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+/// A `GatewayBackend` spec resolved into what the data plane needs:
+/// the URL in parts (the DP never sees a URL), and each referenced
+/// Secret paired with what the lookup found.
+pub struct ResolvedDialable<'a> {
+    pub host: String,
+    pub port: u16,
+    /// The `baseURL` path, when it is one worth sending: `/` and an
+    /// empty path both forward the request path untouched.
+    pub path_prefix: Option<String>,
+    /// `Some` originates TLS, which the `https` scheme decides.
+    pub tls: Option<ResolvedBackendTls<'a>>,
+    pub auth: Option<ResolvedBackendAuth>,
+}
+
+pub struct ResolvedBackendTls<'a> {
+    /// `None` is the platform trust store.
+    pub ca: Option<CertRef<'a>>,
+    pub sni: Option<String>,
+    pub alpn: Vec<pb::AlpnProtocol>,
+    pub insecure_skip_verify: bool,
+}
+
+/// The credential a backend authenticates with, with the material
+/// already looked up.
+///
+/// Deliberately not `Debug`: the variants carry a resolved
+/// credential, and the only thing that may print one is nothing.
+pub enum ResolvedBackendAuth {
+    ApiKey {
+        credential: CredentialRef,
+        header: String,
+        prefix: String,
+    },
+    OAuth2 {
+        credential: CredentialRef,
+        token_url: String,
+        client_id: String,
+        scopes: Vec<String>,
+        client_auth_method: pb::ClientAuthMethod,
+    },
+}
+
+impl ResolvedBackendAuth {
+    /// The one secret this auth block spends. Every scheme names
+    /// exactly one, which is what lets status and emission treat
+    /// them alike.
+    pub fn credential(&self) -> &CredentialRef {
+        match self {
+            Self::ApiKey { credential, .. } | Self::OAuth2 { credential, .. } => credential,
+        }
+    }
+}
+
+/// A reference to one data key inside one Secret, resolved.
+pub struct CredentialRef {
+    pub namespace: String,
+    pub name: String,
+    pub key: String,
+    pub outcome: CredentialOutcome,
+}
+
+impl CredentialRef {
+    /// `namespace/name#key`, matching how a reference to it prints
+    /// everywhere else.
+    pub fn id(&self) -> String {
+        format!("{}/{}#{}", self.namespace, self.name, self.key)
+    }
+}
+
+pub enum CredentialOutcome {
+    /// The material under the named data key. Owned, and in the
+    /// carrier that redacts under `Debug` and `Display`, so holding
+    /// it here cannot leak it.
+    Present(SecretValue),
+    /// No such Secret in this namespace.
+    SecretMissing,
+    /// The Secret is there and carries no such data key.
+    KeyMissing,
 }
 
 /// Names of the `GatewayClass`es whose `controllerName` is ours.
@@ -233,6 +388,15 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
     let secrets_by_id = index_by_id(&state.secrets, |s| &s.metadata);
     let extensions_by_id = index_by_id(&state.extensions, |e| &e.metadata);
     let slices_by_service = index_slices(&state.endpoint_slices);
+
+    // Resolved before routes so a ref can point at the one
+    // resolution by index instead of re-deciding per ref.
+    let gateway_backends = resolve_gateway_backends(&state.gateway_backends, &secrets_by_id);
+    let dialables_by_id: HashMap<(&str, &str), usize> = gateway_backends
+        .iter()
+        .enumerate()
+        .map(|(idx, b)| ((b.namespace.as_str(), b.name.as_str()), idx))
+        .collect();
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
     for gw in &state.gateways {
@@ -287,6 +451,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
                 &mut counted,
                 &services_by_id,
                 &slices_by_service,
+                &dialables_by_id,
                 &extensions_by_id,
             ));
         }
@@ -295,6 +460,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
     Resolution {
         gateway_classes,
         gateways,
+        gateway_backends,
         routes,
     }
 }
@@ -433,13 +599,42 @@ fn resolve_cert_refs<'a>(
             tracing::info!(name = %r.name, namespace = %ref_ns,
                 "accepting cross-namespace certificateRef without a ReferenceGrant check");
         }
-        accepted.push(CertRef {
-            namespace: ref_ns.to_string(),
-            name: r.name.clone(),
-            secret: secrets_by_id.get(&(ref_ns, r.name.as_str())).copied(),
-        });
+        accepted.push(cert_ref(ref_ns, &r.name, secrets_by_id));
     }
     (accepted, rejected)
+}
+
+/// Resolve one reference to TLS material in `namespace`.
+///
+/// A Secret carrying no usable certificate chain leaves the
+/// reference unresolved rather than resolved-to-something-broken.
+/// That keeps two things true at once: the status of the object that
+/// named it says so, and nothing the data plane would refuse is ever
+/// published — a rejected upsert costs the rest of its batch.
+fn cert_ref<'a>(
+    namespace: &str,
+    name: &str,
+    secrets_by_id: &HashMap<(&str, &str), &'a Secret>,
+) -> CertRef<'a> {
+    CertRef {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        secret: secrets_by_id
+            .get(&(namespace, name))
+            .copied()
+            .filter(|s| has_certificate(s)),
+    }
+}
+
+/// Whether a Secret carries a non-empty `tls.crt`. A
+/// `kubernetes.io/tls` Secret always has the data key, so this asks
+/// about the material, not the shape.
+fn has_certificate(secret: &Secret) -> bool {
+    secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get(gateway_config::secret::TLS_CERT_KEY))
+        .is_some_and(|v| !v.0.is_empty())
 }
 
 /// Evaluate one (route x parentRef): compute emission edges over the
@@ -456,9 +651,16 @@ fn resolve_route_parent<'a>(
     counted: &mut std::collections::HashSet<(usize, usize)>,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
+    dialables_by_id: &HashMap<(&str, &str), usize>,
     extensions_by_id: &HashMap<(&str, &str), &'a crate::crd::Extension>,
 ) -> RouteResolution<'a> {
-    let rule_backends = resolve_rule_backends(hr, route_ns, services_by_id, slices_by_service);
+    let rule_backends = resolve_rule_backends(
+        hr,
+        route_ns,
+        services_by_id,
+        slices_by_service,
+        dialables_by_id,
+    );
     let extensions = resolve_route_extensions(hr, route_ns, extensions_by_id);
 
     let Some((gw_idx, gateway)) = gateway else {
@@ -558,7 +760,7 @@ fn resolve_route_extensions<'a>(
             let Some(er) = f.extension_ref.as_ref() else {
                 continue;
             };
-            if er.group != "gateway.linkerd.io" || er.kind != "Extension" {
+            if er.group != GATEWAY_GROUP || er.kind != "Extension" {
                 continue; // foreign refs drop at translation, with a warn
             }
             if !seen.insert(er.name.clone()) {
@@ -579,6 +781,7 @@ fn resolve_rule_backends<'a>(
     route_ns: &str,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
+    dialables_by_id: &HashMap<(&str, &str), usize>,
 ) -> Vec<Vec<BackendResolution<'a>>> {
     hr.spec
         .rules
@@ -592,11 +795,272 @@ fn resolve_rule_backends<'a>(
                 .iter()
                 .map(|br| BackendResolution {
                     backend_ref: br,
-                    outcome: resolve_backend(br, route_ns, services_by_id, slices_by_service),
+                    outcome: resolve_backend(
+                        br,
+                        route_ns,
+                        services_by_id,
+                        slices_by_service,
+                        dialables_by_id,
+                    ),
                 })
                 .collect()
         })
         .collect()
+}
+
+/// Resolve every `GatewayBackend` in the cluster: split its
+/// `baseURL` into the parts a data plane dials with, and look up
+/// each Secret it names.
+///
+/// Two failure shapes, deliberately different. A spec that cannot
+/// name a destination — an unparseable URL, an auth block that
+/// contradicts its own `type` — is [`GatewayBackendOutcome::Invalid`]
+/// and publishes nothing. A spec that is fine but names material
+/// that has not arrived stays `Resolved` with that one reference
+/// unresolved: the backend is published, the request path fails the
+/// dial, and the material can land later without the object having
+/// to change.
+fn resolve_gateway_backends<'a>(
+    objects: &'a [GatewayBackend],
+    secrets_by_id: &HashMap<(&str, &str), &'a Secret>,
+) -> Vec<GatewayBackendResolution<'a>> {
+    let mut out = Vec::with_capacity(objects.len());
+    for object in objects {
+        let (Some(namespace), Some(name)) = (
+            object.metadata.namespace.as_deref(),
+            object.metadata.name.as_deref(),
+        ) else {
+            continue;
+        };
+        out.push(GatewayBackendResolution {
+            object,
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            key: dialable_key_string(namespace, name),
+            outcome: resolve_gateway_backend(object, namespace, secrets_by_id),
+        });
+    }
+    out
+}
+
+fn resolve_gateway_backend<'a>(
+    object: &GatewayBackend,
+    namespace: &str,
+    secrets_by_id: &HashMap<(&str, &str), &'a Secret>,
+) -> GatewayBackendOutcome<'a> {
+    let spec = &object.spec;
+    let url = match parse_base_url(&spec.base_url) {
+        Ok(url) => url,
+        Err(message) => {
+            return GatewayBackendOutcome::Invalid {
+                reason: "InvalidBaseURL",
+                message,
+            };
+        }
+    };
+    // The scheme decides whether TLS is originated at all; the `tls`
+    // block only says how. Settings on a cleartext URL would be
+    // silently ignored, which is worse than being told.
+    if !url.tls && spec.tls.is_some() {
+        return GatewayBackendOutcome::Invalid {
+            reason: "InvalidBaseURL",
+            message: "tls settings require an https baseURL".to_string(),
+        };
+    }
+    let auth = match spec
+        .auth
+        .as_ref()
+        .map(|a| resolve_auth(a, namespace, secrets_by_id))
+    {
+        Some(Ok(auth)) => Some(auth),
+        Some(Err(invalid)) => return invalid,
+        None => None,
+    };
+    GatewayBackendOutcome::Resolved(Box::new(ResolvedDialable {
+        host: url.host,
+        port: url.port,
+        path_prefix: url.path_prefix,
+        tls: url.tls.then(|| {
+            let tls = spec.tls.as_ref();
+            ResolvedBackendTls {
+                ca: tls
+                    .and_then(|t| t.ca.as_ref())
+                    .map(|ca| cert_ref(namespace, &ca.name, secrets_by_id)),
+                sni: tls.and_then(|t| t.sni.clone()),
+                alpn: tls.and_then(|t| t.alpn.as_deref()).map_or_else(
+                    // Offer both and let the provider choose: HTTP/2
+                    // where it is available, HTTP/1.1 everywhere else.
+                    || vec![pb::AlpnProtocol::H2, pb::AlpnProtocol::Http11],
+                    |alpn| alpn.iter().copied().map(alpn_protocol).collect(),
+                ),
+                insecure_skip_verify: tls.is_some_and(|t| t.insecure_skip_verify),
+            }
+        }),
+        auth,
+    }))
+}
+
+/// Resolve an auth block, or say why it is not one. The `type` and
+/// the block of the same name have to agree: a `type` whose block is
+/// absent is a spec that states a scheme and then does not configure
+/// it.
+fn resolve_auth<'a>(
+    auth: &crd::BackendAuth,
+    namespace: &str,
+    secrets_by_id: &HashMap<(&str, &str), &'a Secret>,
+) -> Result<ResolvedBackendAuth, GatewayBackendOutcome<'a>> {
+    let missing = |field: &str| GatewayBackendOutcome::Invalid {
+        reason: "InvalidAuth",
+        message: format!("auth.type is {:?} but auth.{field} is absent", auth.r#type),
+    };
+    match auth.r#type {
+        crd::BackendAuthType::ApiKey => {
+            let Some(api_key) = auth.api_key.as_ref() else {
+                return Err(missing("apiKey"));
+            };
+            Ok(ResolvedBackendAuth::ApiKey {
+                credential: credential_ref(namespace, &api_key.secret_ref, secrets_by_id),
+                header: api_key
+                    .header
+                    .clone()
+                    .unwrap_or_else(|| http::header::AUTHORIZATION.to_string()),
+                // An absent prefix is the default; an empty one is a
+                // choice, and sends the credential bare.
+                prefix: api_key
+                    .prefix
+                    .clone()
+                    .unwrap_or_else(|| "Bearer ".to_string()),
+            })
+        }
+        crd::BackendAuthType::OAuth2 => {
+            let Some(oauth2) = auth.oauth2.as_ref() else {
+                return Err(missing("oauth2"));
+            };
+            if !is_absolute_http_url(&oauth2.token_url) {
+                return Err(GatewayBackendOutcome::Invalid {
+                    reason: "InvalidAuth",
+                    message: format!(
+                        "auth.oauth2.tokenURL `{}` is not an absolute http(s) URL",
+                        oauth2.token_url
+                    ),
+                });
+            }
+            Ok(ResolvedBackendAuth::OAuth2 {
+                credential: credential_ref(namespace, &oauth2.client_secret_ref, secrets_by_id),
+                token_url: oauth2.token_url.clone(),
+                client_id: oauth2.client_id.clone(),
+                scopes: oauth2.scopes.clone(),
+                client_auth_method: match oauth2.client_auth_method {
+                    Some(crd::ClientAuthMethod::ClientSecretPost) => {
+                        pb::ClientAuthMethod::ClientSecretPost
+                    }
+                    Some(crd::ClientAuthMethod::ClientSecretBasic) | None => {
+                        pb::ClientAuthMethod::ClientSecretBasic
+                    }
+                },
+            })
+        }
+    }
+}
+
+/// Look up one data key inside one Secret in `namespace`.
+///
+/// "Present but without that key" is kept apart from "not there at
+/// all" because they are different operator mistakes and only the
+/// first is diagnosable from the object alone.
+fn credential_ref(
+    namespace: &str,
+    secret_ref: &crd::SecretKeyReference,
+    secrets_by_id: &HashMap<(&str, &str), &Secret>,
+) -> CredentialRef {
+    let outcome = match secrets_by_id.get(&(namespace, secret_ref.name.as_str())) {
+        None => CredentialOutcome::SecretMissing,
+        Some(secret) => match secret.data.as_ref().and_then(|d| d.get(&secret_ref.key)) {
+            Some(value) => CredentialOutcome::Present(SecretValue::new(value.0.clone())),
+            None => CredentialOutcome::KeyMissing,
+        },
+    };
+    CredentialRef {
+        namespace: namespace.to_string(),
+        name: secret_ref.name.clone(),
+        key: secret_ref.key.clone(),
+        outcome,
+    }
+}
+
+/// The parts of a `baseURL` the data plane is given.
+struct BaseUrl {
+    host: String,
+    port: u16,
+    path_prefix: Option<String>,
+    /// The `https` scheme, which is what decides TLS origination.
+    tls: bool,
+}
+
+/// Split a `baseURL` into host, port, path prefix and scheme.
+///
+/// This is the one place a URL exists: the data plane is handed the
+/// parts. The scheme supplies the default port, and a path of `/`
+/// (or none) is no prefix at all rather than one that contributes
+/// nothing.
+fn parse_base_url(raw: &str) -> Result<BaseUrl, String> {
+    let uri = raw
+        .parse::<http::Uri>()
+        .map_err(|e| format!("baseURL `{raw}` is not a URL: {e}"))?;
+    let tls = match uri.scheme() {
+        Some(s) if *s == http::uri::Scheme::HTTPS => true,
+        Some(s) if *s == http::uri::Scheme::HTTP => false,
+        _ => return Err(format!("baseURL `{raw}` must be an http or https URL")),
+    };
+    let host = uri
+        .host()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("baseURL `{raw}` names no host"))?;
+    if uri.query().is_some() {
+        return Err(format!("baseURL `{raw}` must not carry a query"));
+    }
+    let path = uri.path();
+    Ok(BaseUrl {
+        host: host.to_string(),
+        port: uri.port_u16().unwrap_or(if tls { 443 } else { 80 }),
+        path_prefix: (path != "/" && !path.is_empty()).then(|| path.to_string()),
+        tls,
+    })
+}
+
+fn is_absolute_http_url(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+    let scheme = uri.scheme();
+    uri.host().is_some_and(|h| !h.is_empty())
+        && (scheme == Some(&http::uri::Scheme::HTTP) || scheme == Some(&http::uri::Scheme::HTTPS))
+}
+
+fn alpn_protocol(p: crd::AlpnProtocol) -> pb::AlpnProtocol {
+    match p {
+        crd::AlpnProtocol::H2 => pb::AlpnProtocol::H2,
+        crd::AlpnProtocol::Http11 => pb::AlpnProtocol::Http11,
+    }
+}
+
+/// Which kind a backendRef names. Group and kind are both optional
+/// in the API and default to the core `Service`, so a ref that says
+/// nothing is a Service.
+enum RefKind {
+    Service,
+    GatewayBackend,
+    Unsupported,
+}
+
+fn classify_ref(br: &HttpRouteRulesBackendRefs) -> RefKind {
+    let group = br.group.as_deref().unwrap_or("");
+    let kind = br.kind.as_deref().unwrap_or("Service");
+    match (group, kind) {
+        ("", "Service") => RefKind::Service,
+        (GATEWAY_GROUP, "GatewayBackend") => RefKind::GatewayBackend,
+        _ => RefKind::Unsupported,
+    }
 }
 
 fn resolve_backend<'a>(
@@ -604,10 +1068,19 @@ fn resolve_backend<'a>(
     route_ns: &str,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
+    dialables_by_id: &HashMap<(&str, &str), usize>,
 ) -> BackendOutcome<'a> {
-    let Some(port) = br.port else {
-        return BackendOutcome::NoPort;
-    };
+    let kind = classify_ref(br);
+    if matches!(kind, RefKind::Unsupported) {
+        tracing::warn!(
+            name = %br.name, group = ?br.group, kind = ?br.kind,
+            "skipping backendRef of an unsupported kind"
+        );
+        return BackendOutcome::UnsupportedKind;
+    }
+    // Cross-namespace is refused before anything else is looked at,
+    // for either kind: it is a decision about the reference, not
+    // about what it points to.
     let backend_ns = br.namespace.as_deref().unwrap_or(route_ns);
     if backend_ns != route_ns {
         tracing::warn!(
@@ -616,6 +1089,23 @@ fn resolve_backend<'a>(
         );
         return BackendOutcome::CrossNamespace;
     }
+    if matches!(kind, RefKind::GatewayBackend) {
+        if br.port.is_some() {
+            tracing::warn!(
+                name = %br.name, port = ?br.port,
+                "skipping GatewayBackend backendRef carrying a port; the port belongs to baseURL"
+            );
+            return BackendOutcome::PortNotAllowed;
+        }
+        let key = dialable_key_string(backend_ns, &br.name);
+        return match dialables_by_id.get(&(backend_ns, br.name.as_str())) {
+            Some(&index) => BackendOutcome::Dialable { key, index },
+            None => BackendOutcome::MissingDialable { key },
+        };
+    }
+    let Some(port) = br.port else {
+        return BackendOutcome::NoPort;
+    };
     let key = backend_key_string(backend_ns, &br.name, port);
     let Some(service) = services_by_id.get(&(backend_ns, br.name.as_str())) else {
         return BackendOutcome::MissingService { key };
@@ -910,6 +1400,13 @@ pub(crate) fn backend_key_string(svc_ns: &str, svc_name: &str, port: i32) -> Str
     format!("{svc_ns}/{svc_name}:{port}")
 }
 
+/// The wire key of a `GatewayBackend`. No port, which is what keeps
+/// it out of [`backend_key_string`]'s space for good: a Service key
+/// always ends in `:port`.
+pub(crate) fn dialable_key_string(ns: &str, name: &str) -> String {
+    format!("{ns}/{name}")
+}
+
 fn index_by_id<T>(
     items: &[T],
     meta: impl Fn(&T) -> &kube::api::ObjectMeta,
@@ -934,6 +1431,7 @@ mod tests {
         GatewayListenersTls, GatewayListenersTlsCertificateRefs, GatewaySpec,
     };
     use gateway_api::apis::standard::httproutes::{HttpRouteRules, HttpRouteSpec};
+    use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::{
         LoadBalancerIngress, LoadBalancerStatus, ObjectReference, ServicePort, ServiceSpec,
         ServiceStatus,
@@ -1166,13 +1664,28 @@ mod tests {
         }
     }
 
+    /// A `kubernetes.io/tls` Secret carrying material, which is what
+    /// makes a reference to it resolve.
     fn secret(ns: &str, name: &str) -> Secret {
+        secret_with(ns, name, [("tls.crt", &b"cert"[..]), ("tls.key", b"key")])
+    }
+
+    fn secret_with<'a>(
+        ns: &str,
+        name: &str,
+        data: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+    ) -> Secret {
         Secret {
             metadata: ObjectMeta {
                 namespace: Some(ns.into()),
                 name: Some(name.into()),
                 ..Default::default()
             },
+            data: Some(
+                data.into_iter()
+                    .map(|(k, v)| (k.to_string(), ByteString(v.to_vec())))
+                    .collect(),
+            ),
             ..Default::default()
         }
     }
@@ -1408,6 +1921,382 @@ mod tests {
             BackendOutcome::CrossNamespace
         ));
         assert!(matches!(&outcomes[4].outcome, BackendOutcome::NoPort));
+    }
+
+    // ----- GatewayBackend -----
+
+    fn dialable_ref(name: &str, ns: Option<&str>, port: Option<i32>) -> HttpRouteRulesBackendRefs {
+        HttpRouteRulesBackendRefs {
+            name: name.into(),
+            namespace: ns.map(String::from),
+            port,
+            group: Some(GATEWAY_GROUP.into()),
+            kind: Some("GatewayBackend".into()),
+            ..Default::default()
+        }
+    }
+
+    fn gateway_backend(ns: &str, name: &str, base_url: &str) -> GatewayBackend {
+        GatewayBackend {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                generation: Some(2),
+                ..Default::default()
+            },
+            spec: crd::GatewayBackendSpec {
+                base_url: base_url.into(),
+                tls: None,
+                auth: None,
+            },
+            status: None,
+        }
+    }
+
+    fn api_key_auth(secret: &str, key: &str) -> crd::BackendAuth {
+        crd::BackendAuth {
+            r#type: crd::BackendAuthType::ApiKey,
+            api_key: Some(crd::ApiKeyAuth {
+                secret_ref: crd::SecretKeyReference {
+                    name: secret.into(),
+                    key: key.into(),
+                },
+                header: None,
+                prefix: None,
+            }),
+            oauth2: None,
+        }
+    }
+
+    /// Resolve one `GatewayBackend` on its own, with `secrets` in the
+    /// cluster.
+    fn resolve_one<'a>(
+        object: &'a GatewayBackend,
+        secrets: &'a [Secret],
+    ) -> GatewayBackendOutcome<'a> {
+        let by_id = index_by_id(secrets, |s| &s.metadata);
+        resolve_gateway_backend(object, "demo", &by_id)
+    }
+
+    fn resolved<'a>(outcome: &'a GatewayBackendOutcome<'a>) -> &'a ResolvedDialable<'a> {
+        match outcome {
+            GatewayBackendOutcome::Resolved(r) => r,
+            GatewayBackendOutcome::Invalid { reason, message } => {
+                panic!("expected a resolved backend, got {reason}: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn base_url_splits_into_host_port_and_prefix() {
+        let cases = [
+            (
+                "https://api.example.com/v1",
+                "api.example.com",
+                443,
+                Some("/v1"),
+                true,
+            ),
+            ("http://api.example.com", "api.example.com", 80, None, false),
+            (
+                "https://api.example.com:8443/",
+                "api.example.com",
+                8443,
+                None,
+                true,
+            ),
+            (
+                "http://10.0.0.7:8080/base/",
+                "10.0.0.7",
+                8080,
+                Some("/base/"),
+                false,
+            ),
+        ];
+        for (url, host, port, prefix, tls) in cases {
+            let object = gateway_backend("demo", "be", url);
+            let outcome = resolve_one(&object, &[]);
+            let r = resolved(&outcome);
+            assert_eq!((r.host.as_str(), r.port), (host, port), "{url}");
+            assert_eq!(r.path_prefix.as_deref(), prefix, "{url}");
+            assert_eq!(r.tls.is_some(), tls, "{url}");
+        }
+    }
+
+    #[test]
+    fn base_url_must_be_an_absolute_http_url() {
+        for url in [
+            "api.example.com/v1",
+            "ftp://api.example.com",
+            "https://",
+            "https://api.example.com?k=v",
+        ] {
+            let object = gateway_backend("demo", "be", url);
+            let outcome = resolve_one(&object, &[]);
+            assert!(
+                matches!(
+                    &outcome,
+                    GatewayBackendOutcome::Invalid { reason, .. } if *reason == "InvalidBaseURL"
+                ),
+                "`{url}` must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_settings_require_an_https_base_url() {
+        let mut object = gateway_backend("demo", "be", "http://api.example.com");
+        object.spec.tls = Some(crd::BackendTls::default());
+        assert!(matches!(
+            resolve_one(&object, &[]),
+            GatewayBackendOutcome::Invalid { reason, .. } if reason == "InvalidBaseURL"
+        ));
+    }
+
+    #[test]
+    fn https_defaults_the_trust_roots_and_alpn() {
+        let object = gateway_backend("demo", "be", "https://api.example.com");
+        let outcome = resolve_one(&object, &[]);
+        let tls = resolved(&outcome).tls.as_ref().expect("tls originated");
+        assert!(tls.ca.is_none(), "no CA named means the system store");
+        assert_eq!(
+            tls.alpn,
+            vec![pb::AlpnProtocol::H2, pb::AlpnProtocol::Http11]
+        );
+        assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn an_explicitly_empty_alpn_list_offers_none() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        object.spec.tls = Some(crd::BackendTls {
+            alpn: Some(vec![]),
+            ..Default::default()
+        });
+        let outcome = resolve_one(&object, &[]);
+        let tls = resolved(&outcome).tls.as_ref().expect("tls originated");
+        assert!(tls.alpn.is_empty());
+    }
+
+    #[test]
+    fn trust_roots_resolve_against_a_ca_secret() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        object.spec.tls = Some(crd::BackendTls {
+            ca: Some(crd::LocalSecretReference { name: "ca".into() }),
+            ..Default::default()
+        });
+
+        let outcome = resolve_one(&object, &[]);
+        let tls = resolved(&outcome).tls.as_ref().unwrap();
+        let ca = tls.ca.as_ref().expect("ca named");
+        assert!(ca.secret.is_none(), "not present yet");
+
+        // A CA-only Secret: a chain and no key.
+        let secrets = vec![secret_with("demo", "ca", [("tls.crt", &b"cert"[..])])];
+        let outcome = resolve_one(&object, &secrets);
+        let tls = resolved(&outcome).tls.as_ref().unwrap();
+        assert!(tls.ca.as_ref().unwrap().secret.is_some());
+    }
+
+    #[test]
+    fn api_key_defaults_the_header_and_prefix() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        object.spec.auth = Some(api_key_auth("key", "apiKey"));
+        let secrets = vec![secret_with(
+            "demo",
+            "key",
+            [
+                ("tls.crt", &b""[..]),
+                ("tls.key", b""),
+                ("apiKey", b"s3cr3t"),
+            ],
+        )];
+        let outcome = resolve_one(&object, &secrets);
+        let auth = resolved(&outcome).auth.as_ref().expect("auth resolved");
+        let ResolvedBackendAuth::ApiKey { header, prefix, .. } = auth else {
+            panic!("expected an api key");
+        };
+        assert_eq!(header, "authorization");
+        assert_eq!(prefix, "Bearer ");
+        assert!(matches!(
+            auth.credential().outcome,
+            CredentialOutcome::Present(_)
+        ));
+    }
+
+    #[test]
+    fn an_empty_api_key_prefix_is_a_choice() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        let mut auth = api_key_auth("key", "apiKey");
+        auth.api_key.as_mut().unwrap().prefix = Some(String::new());
+        auth.api_key.as_mut().unwrap().header = Some("x-api-key".into());
+        object.spec.auth = Some(auth);
+        let outcome = resolve_one(&object, &[]);
+        let ResolvedBackendAuth::ApiKey { header, prefix, .. } =
+            resolved(&outcome).auth.as_ref().unwrap()
+        else {
+            panic!("expected an api key");
+        };
+        assert_eq!(header, "x-api-key");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn a_credential_tells_a_missing_secret_from_a_missing_key() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        object.spec.auth = Some(api_key_auth("key", "apiKey"));
+
+        let outcome = resolve_one(&object, &[]);
+        assert!(matches!(
+            resolved(&outcome)
+                .auth
+                .as_ref()
+                .unwrap()
+                .credential()
+                .outcome,
+            CredentialOutcome::SecretMissing
+        ));
+
+        let secrets = vec![secret_with("demo", "key", [("apikey", &b"s3cr3t"[..])])];
+        let outcome = resolve_one(&object, &secrets);
+        let credential = resolved(&outcome).auth.as_ref().unwrap().credential();
+        assert!(matches!(credential.outcome, CredentialOutcome::KeyMissing));
+        assert_eq!(credential.id(), "demo/key#apiKey");
+    }
+
+    #[test]
+    fn an_auth_type_without_its_block_is_invalid() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        object.spec.auth = Some(crd::BackendAuth {
+            r#type: crd::BackendAuthType::OAuth2,
+            api_key: None,
+            oauth2: None,
+        });
+        assert!(matches!(
+            resolve_one(&object, &[]),
+            GatewayBackendOutcome::Invalid { reason, .. } if reason == "InvalidAuth"
+        ));
+    }
+
+    #[test]
+    fn an_oauth2_token_url_must_be_absolute() {
+        let mut object = gateway_backend("demo", "be", "https://api.example.com");
+        let oauth2 = |token_url: &str| crd::BackendAuth {
+            r#type: crd::BackendAuthType::OAuth2,
+            api_key: None,
+            oauth2: Some(crd::OAuth2Auth {
+                token_url: token_url.into(),
+                client_id: "gw".into(),
+                client_secret_ref: crd::SecretKeyReference {
+                    name: "key".into(),
+                    key: "clientSecret".into(),
+                },
+                scopes: vec!["all-apis".into()],
+                client_auth_method: Some(crd::ClientAuthMethod::ClientSecretPost),
+            }),
+        };
+
+        object.spec.auth = Some(oauth2("/oauth2/token"));
+        assert!(matches!(
+            resolve_one(&object, &[]),
+            GatewayBackendOutcome::Invalid { reason, .. } if reason == "InvalidAuth"
+        ));
+
+        object.spec.auth = Some(oauth2("https://idp.example.com/token"));
+        let outcome = resolve_one(&object, &[]);
+        let ResolvedBackendAuth::OAuth2 {
+            client_id,
+            scopes,
+            client_auth_method,
+            ..
+        } = resolved(&outcome).auth.as_ref().unwrap()
+        else {
+            panic!("expected oauth2");
+        };
+        assert_eq!(client_id, "gw");
+        assert_eq!(scopes, &["all-apis".to_string()]);
+        assert_eq!(*client_auth_method, pb::ClientAuthMethod::ClientSecretPost);
+    }
+
+    #[test]
+    fn dialable_backend_refs_resolve_by_kind() {
+        let mut s = state(
+            vec![gw("demo", "gw", "zd", vec![http_listener("h", 80, None)])],
+            vec![route(
+                "demo",
+                "r",
+                vec![parent("gw", None)],
+                None,
+                vec![
+                    dialable_ref("provider", None, None),
+                    dialable_ref("gone", None, None),
+                    dialable_ref("provider", None, Some(443)),
+                    dialable_ref("provider", Some("elsewhere"), None),
+                    HttpRouteRulesBackendRefs {
+                        name: "cm".into(),
+                        kind: Some("ConfigMap".into()),
+                        port: Some(80),
+                        ..Default::default()
+                    },
+                ],
+            )],
+        );
+        s.gateway_backends = vec![gateway_backend(
+            "demo",
+            "provider",
+            "https://api.example.com/v1",
+        )];
+        let r = resolve(&s, OURS);
+
+        let outcomes = &r.routes[0].rule_backends[0];
+        // The key has no port, which is what keeps it out of the
+        // Service key space for good.
+        assert!(matches!(
+            &outcomes[0].outcome,
+            BackendOutcome::Dialable { key, index }
+                if key == "demo/provider" && *index == 0
+        ));
+        assert!(matches!(
+            &outcomes[1].outcome,
+            BackendOutcome::MissingDialable { key } if key == "demo/gone"
+        ));
+        assert!(matches!(
+            &outcomes[2].outcome,
+            BackendOutcome::PortNotAllowed
+        ));
+        assert!(matches!(
+            &outcomes[3].outcome,
+            BackendOutcome::CrossNamespace
+        ));
+        assert!(matches!(
+            &outcomes[4].outcome,
+            BackendOutcome::UnsupportedKind
+        ));
+    }
+
+    #[test]
+    fn every_gateway_backend_resolves_whether_or_not_a_route_names_it() {
+        let mut s = state(
+            vec![gw("demo", "gw", "zd", vec![http_listener("h", 80, None)])],
+            vec![],
+        );
+        s.gateway_backends = vec![
+            gateway_backend("demo", "unreferenced", "https://api.example.com"),
+            gateway_backend("other", "broken", "not-a-url"),
+        ];
+        let r = resolve(&s, OURS);
+
+        assert_eq!(r.gateway_backends.len(), 2);
+        assert_eq!(r.gateway_backends[0].key, "demo/unreferenced");
+        assert!(matches!(
+            r.gateway_backends[0].outcome,
+            GatewayBackendOutcome::Resolved(_)
+        ));
+        assert_eq!(r.gateway_backends[1].key, "other/broken");
+        assert!(matches!(
+            r.gateway_backends[1].outcome,
+            GatewayBackendOutcome::Invalid { .. }
+        ));
     }
 
     // ----- per-pod endpoints -----

@@ -312,8 +312,10 @@ mod tests {
             BackendKey::new("be"),
             pb::BackendUpsert {
                 name: "be".into(),
-                endpoints: vec![],
-                protocol: pb::BackendProtocol::Http1 as i32,
+                kind: Some(pb::backend_upsert::Kind::EndpointSet(pb::EndpointSet {
+                    endpoints: vec![],
+                    protocol: pb::BackendProtocol::Http1 as i32,
+                })),
             },
         );
         snap.secrets.insert(
