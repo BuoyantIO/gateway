@@ -6,6 +6,7 @@
 
 mod backend_protocol;
 mod drain;
+mod egress;
 mod endpoints;
 mod extensions;
 mod filters;

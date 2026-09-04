@@ -120,12 +120,14 @@ mod tests {
         };
         let backend_upsert = v1::BackendUpsert {
             name: "demo/api-svc:8080".into(),
-            endpoints: vec![v1::Endpoint {
-                name: "demo/api-svc".into(),
-                address: "10.96.0.42".into(),
-                port: 8080,
-            }],
-            protocol: v1::BackendProtocol::Http1 as i32,
+            kind: Some(v1::backend_upsert::Kind::EndpointSet(v1::EndpointSet {
+                endpoints: vec![v1::Endpoint {
+                    name: "demo/api-svc".into(),
+                    address: "10.96.0.42".into(),
+                    port: 8080,
+                }],
+                protocol: v1::BackendProtocol::Http1 as i32,
+            })),
         };
 
         let upserts = vec![

@@ -166,12 +166,14 @@ fn backend_upsert(name: &str, ip: &str, port: u32) -> pb::Upsert {
     pb::Upsert {
         body: Some(pb::upsert::Body::Backend(pb::BackendUpsert {
             name: name.into(),
-            endpoints: vec![pb::Endpoint {
-                name: format!("{name}/0"),
-                address: ip.into(),
-                port,
-            }],
-            protocol: pb::BackendProtocol::Http1 as i32,
+            kind: Some(pb::backend_upsert::Kind::EndpointSet(pb::EndpointSet {
+                endpoints: vec![pb::Endpoint {
+                    name: format!("{name}/0"),
+                    address: ip.into(),
+                    port,
+                }],
+                protocol: pb::BackendProtocol::Http1 as i32,
+            })),
         })),
     }
 }

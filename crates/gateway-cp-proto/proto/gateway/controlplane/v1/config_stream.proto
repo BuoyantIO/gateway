@@ -253,14 +253,103 @@ enum BackendProtocol {
   BACKEND_PROTOCOL_HTTP2       = 2;
 }
 
+// Two kinds, distinguished by what the gateway has to do to reach
+// the destination: an endpoint set it balances over, or a single host
+// it dials by name.
 message BackendUpsert {
-  string            name      = 1;
-  repeated Endpoint endpoints = 2;
-  BackendProtocol   protocol  = 3;
+  string name = 1;
+  oneof kind {
+    EndpointSet endpoint_set = 2;
+    Dialable    dialable     = 3;
+  }
+}
+
+message EndpointSet {
+  repeated Endpoint endpoints = 1;
+  BackendProtocol   protocol  = 2;
 }
 
 message Endpoint {
   string name    = 1;
   string address = 2;  // textual IP
   uint32 port    = 3;
+}
+
+// A host the gateway dials by name. The CP has already parsed the
+// operator's URL into these parts; the DP never sees a URL.
+message Dialable {
+  string host = 1;  // hostname or literal IP, resolved at dial time
+  uint32 port = 2;  // u16, never 0
+  // Prepended to the request path on the way upstream. "" = unset:
+  // a prefix must be absolute, so the empty string is never a
+  // legitimate value.
+  string path_prefix = 3;
+  // Unset dials the host in the clear.
+  BackendTls  tls  = 4;
+  // Unset sends no credential.
+  BackendAuth auth = 5;
+}
+
+// Client-side TLS the gateway originates to a dialable backend.
+message BackendTls {
+  // The CA-only Secret whose chain becomes the only trust root.
+  // Unset uses the platform trust store.
+  SecretKey ca = 1;
+  // Sent as SNI and verified against the upstream certificate.
+  // "" = unset, which falls back to the backend's host.
+  string sni = 2;
+  // Offered in the handshake, in preference order, and therefore
+  // what decides the HTTP version upstream. Empty offers no ALPN.
+  repeated AlpnProtocol alpn = 3;
+  bool insecure_skip_verify  = 4;
+}
+
+enum AlpnProtocol {
+  ALPN_PROTOCOL_UNSPECIFIED = 0;
+  ALPN_PROTOCOL_H2          = 1;
+  ALPN_PROTOCOL_HTTP11      = 2;
+}
+
+// How the gateway authenticates itself to a dialable backend. Every
+// scheme spends exactly one secret.
+message BackendAuth {
+  oneof kind {
+    ApiKeyAuth api_key = 1;
+    OAuth2Auth oauth2  = 2;
+  }
+}
+
+// A credential sent verbatim in one header. The CP resolves the
+// defaults, so `header` is always set and `prefix` is exactly what
+// goes in front of the credential ("" = nothing).
+//
+// A credential is named by a secret plus a data key, because an
+// opaque secret's keys are the operator's to choose. TLS material is
+// named by the secret alone, since kubernetes.io/tls fixes its keys.
+message ApiKeyAuth {
+  SecretKey secret   = 1;
+  string    data_key = 2;
+  string    header   = 3;
+  string    prefix   = 4;
+}
+
+// The OAuth2 client-credentials grant. Where the token goes is not
+// configurable: a bearer token is sent as `Authorization: Bearer`.
+message OAuth2Auth {
+  string           token_url          = 1;  // absolute http(s) URL
+  string           client_id          = 2;
+  // The secret holding the client secret, and the data key inside it.
+  SecretKey        secret             = 3;
+  string           data_key           = 4;
+  repeated string  scopes             = 5;
+  ClientAuthMethod client_auth_method = 6;
+}
+
+// How the client secret is presented to the token endpoint
+// (RFC 6749 2.3.1). Unspecified is Basic, which is the method the
+// RFC says a client SHOULD use.
+enum ClientAuthMethod {
+  CLIENT_AUTH_METHOD_UNSPECIFIED         = 0;
+  CLIENT_AUTH_METHOD_CLIENT_SECRET_BASIC = 1;
+  CLIENT_AUTH_METHOD_CLIENT_SECRET_POST  = 2;
 }

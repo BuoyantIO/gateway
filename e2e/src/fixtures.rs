@@ -21,7 +21,10 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
-use gateway_cp::crd::{Extension, ExtensionSpec, FailureMode, Limits};
+use gateway_cp::crd::{
+    ApiKeyAuth, BackendAuth, BackendAuthType, Extension, ExtensionSpec, FailureMode,
+    GatewayBackend, GatewayBackendSpec, Limits, SecretKeyReference,
+};
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -462,6 +465,25 @@ impl HttpRouteBuilder {
         self
     }
 
+    /// A `backendRefs` entry naming a `GatewayBackend`: our group
+    /// and kind, and no port — the port is part of its `baseURL`.
+    pub fn dialable_backend(mut self, name: &str) -> Self {
+        let br = HttpRouteRulesBackendRefs {
+            name: name.into(),
+            port: None,
+            namespace: None,
+            group: Some("gateway.linkerd.io".into()),
+            kind: Some("GatewayBackend".into()),
+            weight: None,
+            filters: None,
+        };
+        self.pending
+            .backend_refs
+            .get_or_insert_with(Vec::new)
+            .push(br);
+        self
+    }
+
     /// Commit the rule under construction and start a fresh one.
     pub fn add_rule(mut self) -> Self {
         let done = std::mem::replace(&mut self.pending, empty_rule());
@@ -824,5 +846,114 @@ pub async fn delete_extension(client: &Client, ns: &str, name: &str) -> Result<(
         .delete(name, &DeleteParams::default())
         .await
         .with_context(|| format!("deleting Extension {ns}/{name}"))?;
+    Ok(())
+}
+
+/// Build a `GatewayBackend` with no TLS and no auth.
+#[must_use]
+pub fn gateway_backend(ns: &str, name: &str, base_url: &str) -> GatewayBackend {
+    let mut object = GatewayBackend::new(
+        name,
+        GatewayBackendSpec {
+            base_url: base_url.into(),
+            tls: None,
+            auth: None,
+        },
+    );
+    object.metadata.namespace = Some(ns.into());
+    object
+}
+
+/// The same, authenticating with an API key from `secret`'s `key`
+/// data key.
+#[must_use]
+pub fn gateway_backend_with_api_key(
+    ns: &str,
+    name: &str,
+    base_url: &str,
+    secret: &str,
+    key: &str,
+    header: &str,
+) -> GatewayBackend {
+    let mut object = gateway_backend(ns, name, base_url);
+    object.spec.auth = Some(BackendAuth {
+        r#type: BackendAuthType::ApiKey,
+        api_key: Some(ApiKeyAuth {
+            secret_ref: SecretKeyReference {
+                name: secret.into(),
+                key: key.into(),
+            },
+            header: Some(header.into()),
+            prefix: None,
+        }),
+        oauth2: None,
+    });
+    object
+}
+
+/// Create a `GatewayBackend`.
+///
+/// # Errors
+/// Returns an error if the create call fails.
+pub async fn apply_gateway_backend(client: &Client, object: &GatewayBackend) -> Result<()> {
+    let ns = object
+        .metadata
+        .namespace
+        .as_deref()
+        .context("GatewayBackend has no namespace")?;
+    Api::<GatewayBackend>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), object)
+        .await
+        .with_context(|| {
+            format!(
+                "creating GatewayBackend {}",
+                object.metadata.name.as_deref().unwrap_or("?")
+            )
+        })?;
+    Ok(())
+}
+
+/// An `Opaque` Secret carrying one credential under `key` — the
+/// shape secret tooling produces, and the shape a `GatewayBackend`
+/// auth block names.
+///
+/// # Errors
+/// Returns an error if the create call fails.
+pub async fn deploy_credential_secret(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let secret = Secret {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        type_: Some("Opaque".into()),
+        data: Some(BTreeMap::from([(
+            key.to_owned(),
+            ByteString(value.as_bytes().to_vec()),
+        )])),
+        ..Default::default()
+    };
+    Api::<Secret>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), &secret)
+        .await
+        .with_context(|| format!("creating Secret {ns}/{name}"))?;
+    Ok(())
+}
+
+/// Delete a Secret by name.
+///
+/// # Errors
+/// Returns an error if the delete call fails.
+pub async fn delete_secret(client: &Client, ns: &str, name: &str) -> Result<()> {
+    Api::<Secret>::namespaced(client.clone(), ns)
+        .delete(name, &DeleteParams::default())
+        .await
+        .with_context(|| format!("deleting Secret {ns}/{name}"))?;
     Ok(())
 }

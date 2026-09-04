@@ -14,8 +14,11 @@ use gateway_api::apis::standard::gateways::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
+use crate::crd::{GatewayBackend, GatewayBackendStatus};
 use crate::resolve::{
-    AddressKind, GatewayResolution, ListenerOutcome, ListenerResolution, Resolution,
+    AddressKind, CredentialOutcome, GatewayBackendOutcome, GatewayBackendResolution,
+    GatewayResolution, ListenerOutcome, ListenerResolution, Resolution, ResolvedBackendAuth,
+    ResolvedDialable,
 };
 use crate::snapshot::GatewayId;
 
@@ -25,6 +28,8 @@ pub struct StatusSet {
     /// `GatewayClass` name -> desired status.
     pub gateway_classes: Vec<(String, GatewayClassStatus)>,
     pub gateways: Vec<(GatewayId, GatewayStatus)>,
+    /// `GatewayBackend` `(namespace, name)` -> desired status.
+    pub gateway_backends: Vec<(GatewayId, GatewayBackendStatus)>,
 }
 
 /// One translate pass's status work for the writer: each desired
@@ -35,6 +40,7 @@ pub struct StatusSet {
 pub struct StatusWork {
     pub gateway_classes: Vec<(GatewayClass, GatewayClassStatus)>,
     pub gateways: Vec<(Gateway, GatewayStatus)>,
+    pub gateway_backends: Vec<(GatewayBackend, GatewayBackendStatus)>,
 }
 
 /// [`build`], with each desired status paired to a clone of the
@@ -50,6 +56,11 @@ pub fn build_work(resolution: &Resolution<'_>, now: &Time) -> StatusWork {
             .gateways
             .iter()
             .map(|g| (g.gateway.clone(), gateway_status(g, now)))
+            .collect(),
+        gateway_backends: resolution
+            .gateway_backends
+            .iter()
+            .map(|b| (b.object.clone(), gateway_backend_status(b, now)))
             .collect(),
     }
 }
@@ -72,6 +83,16 @@ pub fn build(resolution: &Resolution<'_>, now: &Time) -> StatusSet {
             .iter()
             .map(|g| (g.id.clone(), gateway_status(g, now)))
             .collect(),
+        gateway_backends: resolution
+            .gateway_backends
+            .iter()
+            .map(|b| {
+                (
+                    (b.namespace.clone(), b.name.clone()),
+                    gateway_backend_status(b, now),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -86,6 +107,22 @@ pub fn reconcile_gateway_class_status(
             desired.conditions.as_deref_mut().unwrap_or(&mut []),
             observed.conditions.as_deref().unwrap_or(&[]),
         );
+        if *observed == desired {
+            return None;
+        }
+    }
+    Some(desired)
+}
+
+/// Decide whether the `GatewayBackend` status needs a write:
+/// `Some(final)` with carried-forward timestamps, or `None` when
+/// semantically equal.
+pub fn reconcile_gateway_backend_status(
+    mut desired: GatewayBackendStatus,
+    observed: Option<&GatewayBackendStatus>,
+) -> Option<GatewayBackendStatus> {
+    if let Some(observed) = observed {
+        carry_timestamps(&mut desired.conditions, &observed.conditions);
         if *observed == desired {
             return None;
         }
@@ -193,6 +230,88 @@ fn gateway_status(g: &GatewayResolution<'_>, now: &Time) -> GatewayStatus {
             ),
         ]),
         listeners: Some(listeners),
+    }
+}
+
+/// Two conditions, and they answer different questions.
+///
+/// `Accepted` is about the object: can this spec name a destination
+/// at all. `ResolvedRefs` is about what it points at: is every
+/// Secret it names there, with the data key it asked for. The split
+/// matters because the second one is the failure an operator hits
+/// while everything else is right — a rotated Secret, a mistyped
+/// data key — and it is the one that has to say what is wrong
+/// without printing what is missing.
+fn gateway_backend_status(br: &GatewayBackendResolution<'_>, now: &Time) -> GatewayBackendStatus {
+    let generation = br.object.metadata.generation;
+    let (accepted, resolved_refs) = match &br.outcome {
+        GatewayBackendOutcome::Invalid { reason, message } => (
+            (false, *reason, message.clone()),
+            // Nothing was looked up, so nothing is claimed about the
+            // references either.
+            (
+                false,
+                "InvalidBackend",
+                "backend is not accepted".to_string(),
+            ),
+        ),
+        GatewayBackendOutcome::Resolved(resolved) => (
+            (true, "Accepted", "backend is accepted".to_string()),
+            resolved_refs_condition(resolved),
+        ),
+    };
+
+    GatewayBackendStatus {
+        conditions: vec![
+            condition(
+                "Accepted",
+                accepted.0,
+                accepted.1,
+                &accepted.2,
+                generation,
+                now,
+            ),
+            condition(
+                "ResolvedRefs",
+                resolved_refs.0,
+                resolved_refs.1,
+                &resolved_refs.2,
+                generation,
+                now,
+            ),
+        ],
+    }
+}
+
+/// Every reference a resolved backend makes, in one condition. The
+/// message names the reference, never its contents.
+fn resolved_refs_condition(resolved: &ResolvedDialable<'_>) -> (bool, &'static str, String) {
+    let mut unresolved: Vec<String> = Vec::new();
+    if let Some(ca) = resolved.tls.as_ref().and_then(|tls| tls.ca.as_ref())
+        && ca.secret.is_none()
+    {
+        unresolved.push(format!(
+            "trust roots {}/{} are not present or carry no certificate",
+            ca.namespace, ca.name
+        ));
+    }
+    if let Some(credential) = resolved.auth.as_ref().map(ResolvedBackendAuth::credential) {
+        match credential.outcome {
+            CredentialOutcome::Present(_) => {}
+            CredentialOutcome::SecretMissing => unresolved.push(format!(
+                "credential Secret {}/{} is not present",
+                credential.namespace, credential.name
+            )),
+            CredentialOutcome::KeyMissing => unresolved.push(format!(
+                "credential Secret {}/{} carries no key `{}`",
+                credential.namespace, credential.name, credential.key
+            )),
+        }
+    }
+    if unresolved.is_empty() {
+        (true, "ResolvedRefs", "all references resolved".to_string())
+    } else {
+        (false, "InvalidRef", unresolved.join("; "))
     }
 }
 
@@ -344,7 +463,8 @@ mod tests {
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
     use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewaySpec};
     use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteParentRefs, HttpRouteSpec};
-    use k8s_openapi::api::core::v1::{Service, ServiceSpec};
+    use k8s_openapi::ByteString;
+    use k8s_openapi::api::core::v1::{Secret, Service, ServiceSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
     use crate::resolve::resolve;
@@ -573,6 +693,139 @@ mod tests {
         assert_eq!(
             find(written.conditions.as_deref().unwrap(), "Programmed").last_transition_time,
             t(100)
+        );
+    }
+
+    // ---------- GatewayBackend ----------
+
+    fn backend_object(ns: &str, name: &str, base_url: &str) -> GatewayBackend {
+        GatewayBackend {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                generation: Some(4),
+                ..Default::default()
+            },
+            spec: crate::crd::GatewayBackendSpec {
+                base_url: base_url.into(),
+                tls: None,
+                auth: None,
+            },
+            status: None,
+        }
+    }
+
+    fn api_key(secret: &str, key: &str) -> crate::crd::BackendAuth {
+        crate::crd::BackendAuth {
+            r#type: crate::crd::BackendAuthType::ApiKey,
+            api_key: Some(crate::crd::ApiKeyAuth {
+                secret_ref: crate::crd::SecretKeyReference {
+                    name: secret.into(),
+                    key: key.into(),
+                },
+                header: None,
+                prefix: None,
+            }),
+            oauth2: None,
+        }
+    }
+
+    fn backend_status(state: &K8sState) -> GatewayBackendStatus {
+        let resolution = resolve(state, OURS);
+        build(&resolution, &t(100)).gateway_backends.remove(0).1
+    }
+
+    #[test]
+    fn a_resolved_backend_is_accepted_with_its_refs() {
+        let mut state = fixture_state();
+        state.gateway_backends = vec![backend_object(
+            "demo",
+            "provider",
+            "https://api.example.com",
+        )];
+
+        let status = backend_status(&state);
+        let accepted = find(&status.conditions, "Accepted");
+        assert_eq!(accepted.status, "True");
+        assert_eq!(accepted.observed_generation, Some(4));
+        assert_eq!(find(&status.conditions, "ResolvedRefs").status, "True");
+    }
+
+    #[test]
+    fn an_unusable_spec_is_not_accepted_and_claims_nothing_about_refs() {
+        let mut state = fixture_state();
+        state.gateway_backends = vec![backend_object("demo", "provider", "api.example.com")];
+
+        let status = backend_status(&state);
+        let accepted = find(&status.conditions, "Accepted");
+        assert_eq!(accepted.status, "False");
+        assert_eq!(accepted.reason, "InvalidBaseURL");
+        assert!(accepted.message.contains("baseURL"));
+        assert_eq!(find(&status.conditions, "ResolvedRefs").status, "False");
+    }
+
+    /// The acceptance criterion of the issue this landed with: break
+    /// the secret and the status says so, in a message that names the
+    /// reference and never its contents.
+    #[test]
+    fn a_broken_credential_shows_up_as_resolved_refs_false() {
+        let mut state = fixture_state();
+        let mut object = backend_object("demo", "provider", "https://api.example.com");
+        object.spec.auth = Some(api_key("provider-key", "apiKey"));
+        state.gateway_backends = vec![object];
+
+        // No Secret at all.
+        let status = backend_status(&state);
+        assert_eq!(find(&status.conditions, "Accepted").status, "True");
+        let refs = find(&status.conditions, "ResolvedRefs");
+        assert_eq!(refs.status, "False");
+        assert_eq!(refs.reason, "InvalidRef");
+        assert!(refs.message.contains("demo/provider-key"));
+
+        // Present, wrong data key.
+        state.secrets = vec![Secret {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some("provider-key".into()),
+                ..Default::default()
+            },
+            data: Some(
+                [("apikey".to_string(), ByteString(b"s3cr3t".to_vec()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        }];
+        let status = backend_status(&state);
+        let refs = find(&status.conditions, "ResolvedRefs");
+        assert_eq!(refs.status, "False");
+        assert!(
+            refs.message.contains("carries no key `apiKey`"),
+            "the message names the key: {}",
+            refs.message
+        );
+        assert!(
+            !refs.message.contains("s3cr3t"),
+            "and never the material: {}",
+            refs.message
+        );
+    }
+
+    #[test]
+    fn an_unchanged_backend_status_is_not_rewritten() {
+        let mut state = fixture_state();
+        state.gateway_backends = vec![backend_object(
+            "demo",
+            "provider",
+            "https://api.example.com",
+        )];
+        let observed = backend_status(&state);
+
+        let resolution = resolve(&state, OURS);
+        let desired = build(&resolution, &t(200)).gateway_backends.remove(0).1;
+        assert!(
+            reconcile_gateway_backend_status(desired, Some(&observed)).is_none(),
+            "a later clock alone must not produce a write"
         );
     }
 }
