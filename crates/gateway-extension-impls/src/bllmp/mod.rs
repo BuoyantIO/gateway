@@ -887,4 +887,256 @@ qos: Batch
             proto::abort_request::Reason::NotDispatched as i32
         );
     }
+
+    // ---- the fake picker: select() through a real gRPC exchange ----
+
+    use std::net::IpAddr;
+
+    use gateway_config::backend::{BackendProtocol, Endpoint};
+    use gateway_extension::{TargetBackend, Targets};
+    use gateway_state::{ActiveBackend, ActiveBackendKind, ActiveEndpointSet, BackendKey};
+
+    use proto::picker_server::{Picker as PickerService, PickerServer};
+    use proto::{AbortResponse, PickResponse, ReportFinalTokenResponse, ReportFirstTokenResponse};
+
+    /// A picker with scripted answers. What it is told lands on the
+    /// channel the test holds.
+    struct FakePicker {
+        pick: PickResponse,
+        body: Vec<Bytes>,
+        aborts: mpsc::UnboundedSender<AbortRequest>,
+    }
+
+    #[tonic::async_trait]
+    impl PickerService for FakePicker {
+        async fn push_body(
+            &self,
+            request: tonic::Request<tonic::Streaming<BodyChunk>>,
+        ) -> Result<tonic::Response<PushBodyResponse>, tonic::Status> {
+            let mut stream = request.into_inner();
+            let mut total_bytes = 0;
+            while let Some(chunk) = stream.message().await? {
+                total_bytes += chunk.chunk.len() as u64;
+            }
+            Ok(tonic::Response::new(PushBodyResponse {
+                stream_id: 11,
+                total_bytes,
+            }))
+        }
+
+        async fn pick(
+            &self,
+            _request: tonic::Request<PickRequest>,
+        ) -> Result<tonic::Response<PickResponse>, tonic::Status> {
+            Ok(tonic::Response::new(self.pick.clone()))
+        }
+
+        type PullBodyStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<BodyChunk, tonic::Status>>>;
+
+        async fn pull_body(
+            &self,
+            _request: tonic::Request<PullBodyRequest>,
+        ) -> Result<tonic::Response<Self::PullBodyStream>, tonic::Status> {
+            let chunks: Vec<_> = self
+                .body
+                .iter()
+                .map(|chunk| {
+                    Ok(BodyChunk {
+                        chunk: chunk.clone(),
+                    })
+                })
+                .collect();
+            Ok(tonic::Response::new(tokio_stream::iter(chunks)))
+        }
+
+        async fn report_first_token(
+            &self,
+            _request: tonic::Request<ReportFirstTokenRequest>,
+        ) -> Result<tonic::Response<ReportFirstTokenResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ReportFirstTokenResponse {
+                acknowledged: true,
+            }))
+        }
+
+        async fn report_final_token(
+            &self,
+            _request: tonic::Request<ReportFinalTokenRequest>,
+        ) -> Result<tonic::Response<ReportFinalTokenResponse>, tonic::Status> {
+            Ok(tonic::Response::new(ReportFinalTokenResponse {
+                acknowledged: true,
+            }))
+        }
+
+        async fn abort(
+            &self,
+            request: tonic::Request<AbortRequest>,
+        ) -> Result<tonic::Response<AbortResponse>, tonic::Status> {
+            let _ = self.aborts.send(request.into_inner());
+            Ok(tonic::Response::new(AbortResponse { released: true }))
+        }
+    }
+
+    /// Serve a scripted picker on a loopback port. Returns its
+    /// `host:port` and the intake of aborts it was sent.
+    async fn spawn_picker(
+        pick: PickResponse,
+        body: Vec<Bytes>,
+    ) -> (String, mpsc::UnboundedReceiver<AbortRequest>) {
+        let (aborts, rx) = mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(PickerServer::new(FakePicker { pick, body, aborts }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await;
+        });
+        (addr.to_string(), rx)
+    }
+
+    fn ok_pick(
+        destination: proto::pick_response::Destination,
+        body_total_bytes: u64,
+    ) -> PickResponse {
+        PickResponse {
+            outcome: proto::pick_response::Outcome::Ok as i32,
+            destination: Some(destination),
+            response_id: 42,
+            reason: String::new(),
+            body_total_bytes,
+            requested_model: String::new(),
+        }
+    }
+
+    /// One endpoint-set ref, the shape a local pick resolves against.
+    fn endpoint_targets(name: &str, address: IpAddr, port: u16) -> Targets {
+        Targets::new(vec![TargetBackend::new(
+            name.to_owned(),
+            1,
+            Some(Arc::new(ActiveBackend {
+                key: BackendKey::new(name),
+                revision: 1,
+                kind: ActiveBackendKind::Endpoints(ActiveEndpointSet {
+                    endpoints: vec![Endpoint {
+                        name: "ep".into(),
+                        address,
+                        port,
+                    }],
+                    protocol: BackendProtocol::Http1,
+                }),
+            })),
+        )])
+    }
+
+    /// Drive one request through the hooks against `service` and
+    /// return the selector (for the response phase) and what select
+    /// decided.
+    async fn run_select(service: &str, cx: &mut Cx) -> (BllmpSelector, Result<Selected, Error>) {
+        let mut ext = selector_for(service, None);
+        let mut parts = request_parts();
+        ext.on_request_start(&mut parts, cx).await.unwrap();
+        ext.on_request_body(Bytes::from_static(b"prompt"), true, cx)
+            .await
+            .unwrap();
+        let selected = ext.select(Held::Nothing, cx).await;
+        (ext, selected)
+    }
+
+    fn dispatched(selected: Result<Selected, Error>) -> Selection {
+        match selected {
+            Ok(Selected::Target(selection)) => selection,
+            Ok(Selected::Respond(resp)) => panic!("answered locally: {}", resp.status),
+            Err(e) => panic!("select failed: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn select_dispatches_a_provider_pick() {
+        let pick = ok_pick(provider_pick("prod", "openai"), 9);
+        let (service, _aborts) = spawn_picker(pick, vec![Bytes::from_static(b"rewritten")]).await;
+
+        let mut cx = Cx::new();
+        let selection = dispatched(run_select(&service, &mut cx).await.1);
+        assert!(matches!(selection.target, Target::Backend { ref name } if name == "prod/openai"));
+        let BodySource::Stream(body, len) = selection.body else {
+            panic!("a pick's body streams back from the picker");
+        };
+        assert_eq!(len, Some(9));
+        let collected = body.collect().await.expect("body").to_bytes();
+        assert_eq!(&collected[..], b"rewritten");
+    }
+
+    #[tokio::test]
+    async fn select_dispatches_a_local_pick() {
+        let destination = proto::pick_response::Destination::Local(proto::LocalTarget {
+            endpoint: "10.0.0.9:8080".into(),
+        });
+        let (service, _aborts) = spawn_picker(ok_pick(destination, 0), vec![]).await;
+
+        let mut cx = Cx::new();
+        cx.set_targets(endpoint_targets(
+            "workers",
+            "10.0.0.9".parse().unwrap(),
+            8080,
+        ));
+        let selection = dispatched(run_select(&service, &mut cx).await.1);
+        let Target::Endpoint { backend, addr } = selection.target else {
+            panic!("a local pick targets an endpoint");
+        };
+        assert_eq!(backend, "workers");
+        assert_eq!(addr, "10.0.0.9:8080".parse().unwrap());
+    }
+
+    /// The loop the hand-held-channel tests cannot close: a provider
+    /// dispatch that ends synthesized sends `BACKEND_UNRESOLVED` over
+    /// the wire, and the picker receives it.
+    #[tokio::test]
+    async fn a_failed_provider_dispatch_aborts_backend_unresolved() {
+        let pick = ok_pick(provider_pick("prod", "openai"), 0);
+        let (service, mut aborts) = spawn_picker(pick, vec![]).await;
+
+        let mut cx = Cx::new();
+        let (mut ext, selected) = run_select(&service, &mut cx).await;
+        dispatched(selected);
+        ext.on_response_end(&ended(StatusCode::BAD_GATEWAY, false), &mut cx);
+
+        let abort = tokio::time::timeout(Duration::from_secs(2), aborts.recv())
+            .await
+            .expect("the abort must reach the picker")
+            .expect("picker running");
+        assert_eq!(abort.response_id, 42);
+        assert_eq!(
+            abort.reason,
+            proto::abort_request::Reason::BackendUnresolved as i32
+        );
+        assert!(abort.detail.contains("502"), "{}", abort.detail);
+    }
+
+    /// `NO_WORKERS` answers the client locally: nothing was dispatched,
+    /// so nothing is aborted either.
+    #[tokio::test]
+    async fn a_no_workers_pick_answers_locally() {
+        let pick = PickResponse {
+            outcome: proto::pick_response::Outcome::NoWorkers as i32,
+            destination: None,
+            response_id: 0,
+            reason: "full".into(),
+            body_total_bytes: 0,
+            requested_model: String::new(),
+        };
+        let (service, mut aborts) = spawn_picker(pick, vec![]).await;
+
+        let mut cx = Cx::new();
+        let (mut ext, selected) = run_select(&service, &mut cx).await;
+        let Ok(Selected::Respond(resp)) = selected else {
+            panic!("NO_WORKERS answers locally");
+        };
+        assert_eq!(resp.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(&resp.body[..], b"full");
+
+        // No dispatch was counted, so the terminal settles nothing.
+        ext.on_response_end(&ended(StatusCode::SERVICE_UNAVAILABLE, false), &mut cx);
+        assert!(aborts.try_recv().is_err(), "nothing to abort");
+    }
 }

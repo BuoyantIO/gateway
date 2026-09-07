@@ -800,6 +800,7 @@ dependencies = [
  "bytes",
  "gateway-config",
  "gateway-extension",
+ "gateway-state",
  "http",
  "http-body",
  "http-body-util",
