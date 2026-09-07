@@ -59,11 +59,8 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for each call a request waits on: the `PushBody` tail
 /// after the body is fully sent, Pick, and opening the `PullBody`
-/// stream. Short in tests, where the deadline firing IS the test.
-#[cfg(not(test))]
+/// stream.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const RPC_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Deadline for one report rpc; reports are best-effort and nothing
 /// waits on them.
@@ -73,10 +70,7 @@ const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
 /// from a picker reading slowly is deliberate; a picker that stopped
 /// reading altogether is not, and without this it would hold the
 /// request forever.
-#[cfg(not(test))]
 const BODY_SEND_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(test)]
-const BODY_SEND_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Reports queued behind a slow picker before new ones are dropped.
 const REPORT_QUEUE_CAPACITY: usize = 256;
@@ -127,6 +121,10 @@ struct Prepared {
     pool: Option<InferencePoolRef>,
     tenant_header: Option<http::HeaderName>,
     qos: i32,
+    /// [`RPC_TIMEOUT`] and [`BODY_SEND_TIMEOUT`] in production;
+    /// carried as data so tests can shrink them to milliseconds.
+    rpc_timeout: Duration,
+    body_send_timeout: Duration,
 }
 
 /// `bllmp_selector` as an extension class.
@@ -166,6 +164,8 @@ impl ExtensionClass for BllmpSelectorClass {
                 }),
                 tenant_header,
                 qos: cfg.qos.wire(),
+                rpc_timeout: RPC_TIMEOUT,
+                body_send_timeout: BODY_SEND_TIMEOUT,
             }),
         }))
     }
@@ -292,7 +292,7 @@ impl Extension for BllmpSelector {
             // bounded so a picker that stopped reading does not hold
             // the request forever.
             let send = push.tx.send(BodyChunk { chunk: piece });
-            match tokio::time::timeout(BODY_SEND_TIMEOUT, send).await {
+            match tokio::time::timeout(self.prepared.body_send_timeout, send).await {
                 Err(_) => return Err("picker stalled pulling the request body".into()),
                 Ok(Err(_)) => return Err("picker closed the body stream".into()),
                 Ok(Ok(())) => {}
@@ -311,7 +311,7 @@ impl Extension for BllmpSelector {
         // The half-close that marks the body complete.
         drop(push.tx);
         let mut task = push.task;
-        let pushed = match tokio::time::timeout(RPC_TIMEOUT, &mut task).await {
+        let pushed = match tokio::time::timeout(self.prepared.rpc_timeout, &mut task).await {
             Err(_) => {
                 task.abort();
                 return Err("PushBody timed out".into());
@@ -334,7 +334,7 @@ impl Extension for BllmpSelector {
             qos_class: self.prepared.qos,
             tenant: self.tenant.clone(),
         });
-        let pick = tokio::time::timeout(RPC_TIMEOUT, pick)
+        let pick = tokio::time::timeout(self.prepared.rpc_timeout, pick)
             .await
             .map_err(|_| "Pick timed out")?
             .map_err(|s| format!("Pick failed: {s}"))?
@@ -374,7 +374,7 @@ impl Extension for BllmpSelector {
         let pull = client.pull_body(PullBodyRequest {
             response_id: pick.response_id,
         });
-        let pull = tokio::time::timeout(RPC_TIMEOUT, pull)
+        let pull = tokio::time::timeout(self.prepared.rpc_timeout, pull)
             .await
             .map_err(|_| "PullBody timed out")?
             .map_err(|s| format!("PullBody failed: {s}"))?
@@ -647,12 +647,37 @@ qos: Batch
         addr.to_string()
     }
 
-    fn selector_for(service: &str) -> Box<dyn Extension> {
-        let config: ConfigValue = serde_yaml::from_str(&format!("service: {service}")).unwrap();
-        BllmpSelectorClass
-            .configure(&config)
-            .expect("valid config")
-            .build()
+    /// The deadlines the hang tests wait out, shrunk from the
+    /// production constants so the suite runs in milliseconds.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(200);
+
+    /// A selector wired by hand: the client points at `service`, and
+    /// every deadline is [`TEST_TIMEOUT`]. `push` pre-seeds the
+    /// in-flight `PushBody`, for tests that stage it directly.
+    fn selector_for(service: &str, push: Option<Push>) -> BllmpSelector {
+        let endpoint =
+            tonic::transport::Endpoint::from_shared(format!("http://{service}")).unwrap();
+        let client = PickerClient::new(endpoint.connect_lazy());
+        BllmpSelector {
+            client: client.clone(),
+            reporter: Reporter::spawn(client),
+            prepared: Arc::new(Prepared {
+                pool: None,
+                tenant_header: None,
+                qos: 0,
+                rpc_timeout: TEST_TIMEOUT,
+                body_send_timeout: TEST_TIMEOUT,
+            }),
+            push,
+            tenant: String::new(),
+            client_request_id: String::new(),
+            response_id: 0,
+            dispatched_at: None,
+            upstream_status: 0,
+            ttft_reported: false,
+            itl: usage::Itl::default(),
+            capture: usage::Capture::default(),
+        }
     }
 
     fn request_parts() -> http::request::Parts {
@@ -667,7 +692,7 @@ qos: Batch
     #[tokio::test]
     async fn a_silent_picker_fails_select_within_its_deadline() {
         let service = silent_picker().await;
-        let mut ext = selector_for(&service);
+        let mut ext = selector_for(&service, None);
         let mut cx = Cx::new();
         let mut parts = request_parts();
         ext.on_request_start(&mut parts, &mut cx).await.unwrap();
@@ -693,27 +718,7 @@ qos: Batch
         let task = tokio::spawn(async {
             std::future::pending::<Result<PushBodyResponse, tonic::Status>>().await
         });
-        let endpoint =
-            tonic::transport::Endpoint::from_shared("http://127.0.0.1:1".to_owned()).unwrap();
-        let client = PickerClient::new(endpoint.connect_lazy());
-        let mut ext = BllmpSelector {
-            client: client.clone(),
-            reporter: Reporter::spawn(client),
-            prepared: Arc::new(Prepared {
-                pool: None,
-                tenant_header: None,
-                qos: 0,
-            }),
-            push: Some(Push { tx, task }),
-            tenant: String::new(),
-            client_request_id: String::new(),
-            response_id: 0,
-            dispatched_at: None,
-            upstream_status: 0,
-            ttft_reported: false,
-            itl: usage::Itl::default(),
-            capture: usage::Capture::default(),
-        };
+        let mut ext = selector_for("127.0.0.1:1", Some(Push { tx, task }));
 
         let mut cx = Cx::new();
         let chunk = Bytes::from_static(b"{}");
