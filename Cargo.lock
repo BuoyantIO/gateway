@@ -805,7 +805,6 @@ dependencies = [
  "http-body-util",
  "prost",
  "serde",
- "serde_json",
  "serde_yaml",
  "thiserror",
  "tokio",
