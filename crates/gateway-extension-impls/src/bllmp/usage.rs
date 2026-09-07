@@ -1,5 +1,5 @@
 //! Bounded capture of a completion response for `ReportFinalToken`:
-//! model from the head, usage from the tail, inter-token gaps
+//! model from the head, usage from the tail, chunk-arrival gaps
 //! bucketed. Raw scans over capped bytes work for SSE and plain
 //! JSON alike; the body is never retained beyond the caps.
 
@@ -120,7 +120,11 @@ const EDGES_MS: [u128; 14] = [5, 10, 15, 20, 30, 40, 50, 75, 100, 150, 200, 300,
 /// Layout-1 identifier for `ReportFinalTokenRequest.itl_bucket_layout`.
 pub(crate) const ITL_LAYOUT: u32 = 1;
 
-/// Inter-token arrival gaps, bucketed per layout 1.
+/// Response-chunk arrival gaps, bucketed per layout 1 — the
+/// measurable stand-in for inter-token latency. A chunk carries one
+/// token when the upstream flushes per token; under batching it
+/// carries several whose gaps go unseen, so the histogram reports
+/// fewer, larger gaps than the tokens truly had.
 #[derive(Default)]
 pub(crate) struct Itl {
     last: Option<Instant>,

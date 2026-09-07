@@ -440,7 +440,7 @@ impl Extension for BllmpSelector {
             if prompt.is_none() && completion.is_none() && counts.is_empty() {
                 tracing::debug!(target: LOG,
                     response_id,
-                    "bllmp: no usage and no inter-token data; skipping ReportFinalToken"
+                    "bllmp: no usage and no arrival gaps; skipping ReportFinalToken"
                 );
                 return;
             }
