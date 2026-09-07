@@ -191,6 +191,7 @@ pub struct OAuth2Auth {
     pub token_url: String,
     /// The gateway's client identifier. Public by construction, so
     /// it is config rather than a secret reference.
+    #[serde(rename = "clientID")]
     pub client_id: String,
     /// The Secret holding the client secret, and the data key inside
     /// it.
