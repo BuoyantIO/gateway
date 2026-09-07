@@ -45,7 +45,11 @@ make -C k8s/bllmp crds TARGET=local KUBE_CONTEXT=kind-gateway-e2e
 make -C k8s/bllmp deploy TARGET=local TAG=dev KUBE_CONTEXT=kind-gateway-e2e
 ```
 
-The picker is now listens `bllmp.default.svc:50051`.
+The picker now listens at `bllmp.default.svc:50051`. The gateway's
+`service` target must resolve to a single picker instance — the one
+replica deployed here, or a single pod's DNS name. The picker holds
+per-request state, so a Service balancing across replicas would break
+any request whose calls land on different ones.
 
 ## 3. Dummy worker + demo config
 

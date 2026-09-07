@@ -79,7 +79,12 @@ const REPORT_QUEUE_CAPACITY: usize = 256;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Config {
-    /// The picker's gRPC target, `host:port`.
+    /// The picker's gRPC target, `host:port`. Must resolve to a
+    /// single picker instance — one replica, or one pod's DNS name,
+    /// not a load-balanced set: the picker holds per-request state
+    /// (the pushed body, the pick), and a call landing on another
+    /// replica does not find it. Multiple replicas need affinity or
+    /// shared picker state, neither of which exists yet.
     service: String,
     /// Absent means the picker picks across everything it serves.
     #[serde(default)]
