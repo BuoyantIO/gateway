@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use gateway_config::backend::{Backend, BackendProtocol, BackendRef, Endpoint, StaticBackend};
+use gateway_config::backend::{
+    AlpnProtocol, ApiKeyAuth, Backend, BackendAuth, BackendProtocol, BackendRef, BackendTls,
+    ClientAuthMethod, DialableBackend, Endpoint, OAuth2Auth, StaticBackend, TrustRoots,
+};
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::extension::{ConfigValue, Extension, FailureMode, Limits, RequestBodyLimit};
 use gateway_config::filter::HttpFilter;
@@ -22,10 +25,11 @@ use gateway_config::route::{
     QueryValueMatch,
 };
 use gateway_config::secret::{
-    OpaqueSecret, Secret, SecretError, SecretValue, TLS_CERT_KEY, TLS_KEY_KEY, TlsSecret,
+    OpaqueSecret, Secret, SecretError, SecretRef, SecretValue, TLS_CERT_KEY, TLS_KEY_KEY, TlsSecret,
 };
 use gateway_cp_proto::v1 as pb;
 use gateway_state::{BackendKey, BindKey, ExtensionKey, ListenerKey, RouteKey, SecretKey};
+use http::HeaderName;
 
 use crate::error::Error;
 
@@ -121,17 +125,96 @@ pub fn http_route(msg: pb::HttpRouteUpsert) -> Result<(ListenerKey, HttpRoute), 
 }
 
 /// # Errors
-/// Returns [`Error::InvalidValue`] for any endpoint with an
-/// unparseable address or out-of-range port, or
-/// [`Error::UnsupportedEnum`] if `protocol` is not `HTTP1` or `HTTP2`.
+/// Returns [`Error::MissingField`] if `kind` is unset,
+/// [`Error::InvalidValue`] for any endpoint with an unparseable
+/// address or an out-of-range port (or a dialable backend with an
+/// out-of-range port), [`Error::UnsupportedEnum`] if a protocol or
+/// ALPN enum is unrecognized, or [`Error::InvalidHeaderName`] if an
+/// API key names a header that is not one.
 pub fn backend(msg: pb::BackendUpsert) -> Result<Backend, Error> {
-    let endpoints: Result<Vec<Endpoint>, Error> = msg.endpoints.into_iter().map(endpoint).collect();
-    let protocol = backend_protocol(msg.protocol)?;
-    Ok(Backend::Static(StaticBackend {
-        name: msg.name,
-        endpoints: endpoints?,
-        protocol,
-    }))
+    let kind = msg.kind.ok_or(Error::MissingField("BackendUpsert.kind"))?;
+    match kind {
+        pb::backend_upsert::Kind::EndpointSet(set) => {
+            let endpoints: Result<Vec<Endpoint>, Error> =
+                set.endpoints.into_iter().map(endpoint).collect();
+            let protocol = backend_protocol(set.protocol)?;
+            Ok(Backend::Static(StaticBackend {
+                name: msg.name,
+                endpoints: endpoints?,
+                protocol,
+            }))
+        }
+        pb::backend_upsert::Kind::Dialable(d) => Ok(Backend::Dialable(dialable(msg.name, d)?)),
+    }
+}
+
+fn dialable(name: String, msg: pb::Dialable) -> Result<DialableBackend, Error> {
+    let port: u16 = msg.port.try_into().map_err(|_| Error::InvalidValue {
+        field: "Dialable.port",
+        value: msg.port.to_string(),
+    })?;
+    Ok(DialableBackend {
+        name,
+        host: msg.host,
+        port,
+        // A path prefix is absolute, so the empty string is the one
+        // value that cannot have been asked for: it means unset.
+        path_prefix: non_empty(msg.path_prefix),
+        tls: msg.tls.map(backend_tls).transpose()?,
+        auth: msg.auth.map(backend_auth).transpose()?.map(Box::new),
+    })
+}
+
+fn backend_tls(msg: pb::BackendTls) -> Result<BackendTls, Error> {
+    let alpn: Result<Vec<AlpnProtocol>, Error> = msg.alpn.into_iter().map(alpn_protocol).collect();
+    Ok(BackendTls {
+        // No CA named means the platform trust store, which is what
+        // a public provider chains to.
+        ca: match msg.ca {
+            Some(k) => TrustRoots::Secret {
+                namespace: k.namespace,
+                name: k.name,
+            },
+            None => TrustRoots::System,
+        },
+        sni: non_empty(msg.sni),
+        alpn: alpn?,
+        insecure_skip_verify: msg.insecure_skip_verify,
+    })
+}
+
+fn backend_auth(msg: pb::BackendAuth) -> Result<BackendAuth, Error> {
+    let kind = msg.kind.ok_or(Error::MissingField("BackendAuth.kind"))?;
+    match kind {
+        pb::backend_auth::Kind::ApiKey(a) => {
+            let header =
+                HeaderName::try_from(&a.header).map_err(|source| Error::InvalidHeaderName {
+                    name: a.header.clone(),
+                    source,
+                })?;
+            Ok(BackendAuth::ApiKey(ApiKeyAuth {
+                secret_ref: secret_ref(a.secret, a.data_key, "ApiKeyAuth.secret")?,
+                header,
+                prefix: a.prefix,
+            }))
+        }
+        pb::backend_auth::Kind::Oauth2(a) => Ok(BackendAuth::OAuth2(OAuth2Auth {
+            token_url: a.token_url,
+            client_id: a.client_id,
+            client_secret_ref: secret_ref(a.secret, a.data_key, "OAuth2Auth.secret")?,
+            scopes: a.scopes,
+            client_auth_method: client_auth_method(a.client_auth_method)?,
+        })),
+    }
+}
+
+fn secret_ref(
+    secret: Option<pb::SecretKey>,
+    data_key: String,
+    field: &'static str,
+) -> Result<SecretRef, Error> {
+    let secret = secret.ok_or(Error::MissingField(field))?;
+    Ok(SecretRef::new(secret.namespace, secret.name, data_key))
 }
 
 /// Build a secret from its data map, by the type the CP stamped on
@@ -430,6 +513,33 @@ fn backend_protocol(value: i32) -> Result<BackendProtocol, Error> {
     }
 }
 
+fn alpn_protocol(value: i32) -> Result<AlpnProtocol, Error> {
+    match pb::AlpnProtocol::try_from(value) {
+        Ok(pb::AlpnProtocol::H2) => Ok(AlpnProtocol::H2),
+        Ok(pb::AlpnProtocol::Http11) => Ok(AlpnProtocol::Http11),
+        Ok(pb::AlpnProtocol::Unspecified) | Err(_) => Err(Error::UnsupportedEnum {
+            kind: "AlpnProtocol",
+            value,
+        }),
+    }
+}
+
+fn client_auth_method(value: i32) -> Result<ClientAuthMethod, Error> {
+    match pb::ClientAuthMethod::try_from(value) {
+        // Basic is what the RFC says a client SHOULD use and a
+        // server MUST support, so an unset method is that one rather
+        // than an error.
+        Ok(pb::ClientAuthMethod::Unspecified | pb::ClientAuthMethod::ClientSecretBasic) => {
+            Ok(ClientAuthMethod::ClientSecretBasic)
+        }
+        Ok(pb::ClientAuthMethod::ClientSecretPost) => Ok(ClientAuthMethod::ClientSecretPost),
+        Err(_) => Err(Error::UnsupportedEnum {
+            kind: "ClientAuthMethod",
+            value,
+        }),
+    }
+}
+
 fn tls_mode(value: i32) -> Result<TlsMode, Error> {
     match pb::TlsMode::try_from(value) {
         Ok(pb::TlsMode::Terminate) => Ok(TlsMode::Terminate),
@@ -439,6 +549,12 @@ fn tls_mode(value: i32) -> Result<TlsMode, Error> {
             value,
         }),
     }
+}
+
+/// A proto string field standing in for an `Option<String>` whose
+/// empty value is not a legitimate one.
+fn non_empty(value: String) -> Option<String> {
+    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]

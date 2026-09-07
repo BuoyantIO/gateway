@@ -198,12 +198,14 @@ mod tests {
         pb::Upsert {
             body: Some(pb::upsert::Body::Backend(pb::BackendUpsert {
                 name: name.into(),
-                endpoints: vec![pb::Endpoint {
-                    name: format!("{name}/0"),
-                    address: ip.into(),
-                    port,
-                }],
-                protocol: pb::BackendProtocol::Http1 as i32,
+                kind: Some(pb::backend_upsert::Kind::EndpointSet(pb::EndpointSet {
+                    endpoints: vec![pb::Endpoint {
+                        name: format!("{name}/0"),
+                        address: ip.into(),
+                        port,
+                    }],
+                    protocol: pb::BackendProtocol::Http1 as i32,
+                })),
             })),
         }
     }
@@ -888,5 +890,155 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         };
         apply_update(&store, update).unwrap();
         assert_eq!(store.read().binds().count(), 0);
+    }
+
+    // ----- dialable backends -----
+
+    /// The dialable half of a registered backend.
+    fn dialable_of(backend: &gateway_state::ActiveBackend) -> &gateway_state::ActiveDialable {
+        match &backend.kind {
+            gateway_state::ActiveBackendKind::Dialable(d) => d,
+            gateway_state::ActiveBackendKind::Endpoints(_) => {
+                panic!("expected a dialable backend")
+            }
+        }
+    }
+
+    /// The wire form the control plane sends for a `GatewayBackend`,
+    /// with every optional part filled in.
+    fn dialable_upsert() -> pb::Upsert {
+        pb::Upsert {
+            body: Some(pb::upsert::Body::Backend(pb::BackendUpsert {
+                name: "demo/provider".into(),
+                kind: Some(pb::backend_upsert::Kind::Dialable(pb::Dialable {
+                    host: "api.example.com".into(),
+                    port: 8443,
+                    path_prefix: "/v1".into(),
+                    tls: Some(pb::BackendTls {
+                        ca: Some(pb::SecretKey {
+                            namespace: String::new(),
+                            name: "provider-ca".into(),
+                        }),
+                        sni: "edge.example.com".into(),
+                        alpn: vec![pb::AlpnProtocol::Http11 as i32],
+                        insecure_skip_verify: false,
+                    }),
+                    auth: Some(pb::BackendAuth {
+                        kind: Some(pb::backend_auth::Kind::ApiKey(pb::ApiKeyAuth {
+                            secret: Some(pb::SecretKey {
+                                namespace: String::new(),
+                                name: "provider-key".into(),
+                            }),
+                            data_key: "apiKey".into(),
+                            header: "x-api-key".into(),
+                            prefix: String::new(),
+                        })),
+                    }),
+                })),
+            })),
+        }
+    }
+
+    #[test]
+    fn dialable_backend_round_trips() {
+        let store = Store::new();
+        apply_update(&store, batch(vec![dialable_upsert()], vec![])).expect("apply ok");
+
+        let backend = store
+            .read()
+            .backend(&BackendKey::new("demo/provider"))
+            .expect("backend registered");
+        let dialable = dialable_of(&backend);
+        assert_eq!(dialable.host, "api.example.com");
+        assert_eq!(dialable.port, 8443);
+        assert_eq!(dialable.path_prefix.as_deref(), Some("/v1"));
+
+        let tls = dialable.tls.as_deref().expect("tls settings");
+        assert_eq!(tls.sni.as_deref(), Some("edge.example.com"));
+        assert_eq!(
+            tls.alpn,
+            vec![gateway_config::backend::AlpnProtocol::Http11]
+        );
+        assert!(!tls.insecure_skip_verify);
+    }
+
+    /// An empty `path_prefix` or `sni` is how the wire says "unset":
+    /// neither has a legitimate empty value.
+    #[test]
+    fn empty_optional_strings_arrive_as_unset() {
+        let store = Store::new();
+        let mut upsert = dialable_upsert();
+        let Some(pb::upsert::Body::Backend(be)) = upsert.body.as_mut() else {
+            unreachable!()
+        };
+        let Some(pb::backend_upsert::Kind::Dialable(d)) = be.kind.as_mut() else {
+            unreachable!()
+        };
+        d.path_prefix = String::new();
+        d.tls.as_mut().unwrap().sni = String::new();
+        d.tls.as_mut().unwrap().ca = None;
+
+        apply_update(&store, batch(vec![upsert], vec![])).expect("apply ok");
+        let backend = store
+            .read()
+            .backend(&BackendKey::new("demo/provider"))
+            .expect("backend registered");
+        let dialable = dialable_of(&backend);
+        assert!(dialable.path_prefix.is_none());
+        let tls = dialable.tls.as_deref().expect("tls settings");
+        assert!(tls.sni.is_none());
+        assert!(
+            matches!(tls.roots, gateway_state::ActiveTrustRoots::System),
+            "no CA named means the platform trust store"
+        );
+    }
+
+    /// A backend whose kind never arrived is a translator bug, and
+    /// this is where it surfaces.
+    #[test]
+    fn backend_without_a_kind_rejected() {
+        let store = Store::new();
+        let err = apply_update(
+            &store,
+            batch(
+                vec![pb::Upsert {
+                    body: Some(pb::upsert::Body::Backend(pb::BackendUpsert {
+                        name: "demo/provider".into(),
+                        kind: None,
+                    })),
+                }],
+                vec![],
+            ),
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, Error::MissingField("BackendUpsert.kind")));
+    }
+
+    /// The credential and the backend arrive in the same batch and in
+    /// either order; the store resolves the reference once both are
+    /// registered.
+    #[test]
+    fn a_credential_reaches_the_backend_it_belongs_to() {
+        let store = Store::new();
+        apply_update(
+            &store,
+            batch(
+                vec![
+                    dialable_upsert(),
+                    opaque_upsert("provider-key", "apiKey", SENSITIVE),
+                    secret_upsert("provider-ca", CERT_PEM, ""),
+                ],
+                vec![],
+            ),
+        )
+        .expect("apply ok");
+
+        let read = store.read();
+        let backend = read
+            .backend(&BackendKey::new("demo/provider"))
+            .expect("backend registered");
+        let dialable = dialable_of(&backend);
+        let printed = format!("{dialable:?}");
+        assert!(!printed.contains(SENSITIVE), "{printed}");
     }
 }

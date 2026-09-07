@@ -32,8 +32,9 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 
 use crate::crd;
 use crate::resolve::{
-    BackendOutcome, BackendResolution, GatewayResolution, ListenerOutcome, Resolution, RouteEdge,
-    RouteResolution, resolve,
+    BackendOutcome, BackendResolution, CertRef, CredentialOutcome, CredentialRef,
+    GatewayBackendOutcome, GatewayBackendResolution, GatewayResolution, ListenerOutcome,
+    Resolution, ResolvedBackendAuth, RouteEdge, RouteResolution, resolve,
 };
 use crate::snapshot::{GatewayId, Snapshot};
 
@@ -54,7 +55,8 @@ pub struct K8sState {
     pub services: Vec<Service>,
     pub endpoint_slices: Vec<EndpointSlice>,
     pub secrets: Vec<Secret>,
-    pub extensions: Vec<crate::crd::Extension>,
+    pub extensions: Vec<crd::Extension>,
+    pub gateway_backends: Vec<crd::GatewayBackend>,
 }
 
 /// Build per-Gateway snapshots from a static K8s state: resolve the
@@ -86,7 +88,7 @@ pub fn translate_resolution(resolution: &Resolution<'_>) -> HashMap<GatewayId, S
         // Gateway's slice — independent of listener attachment.
         for rule in &route.rule_backends {
             for backend in rule {
-                emit_backend(snapshot, backend);
+                emit_backend(snapshot, backend, &resolution.gateway_backends);
             }
         }
         emit_route_extensions(snapshot, route);
@@ -209,40 +211,77 @@ fn emit_route_extensions(snapshot: &mut Snapshot, route: &RouteResolution<'_>) {
 fn emit_gateway_secrets(snapshot: &mut Snapshot, gw: &GatewayResolution<'_>) {
     for lr in &gw.listeners {
         for cert in &lr.cert_refs {
-            let Some(secret) = cert.secret else {
-                tracing::warn!(namespace = %cert.namespace, name = %cert.name,
-                    "certificateRef Secret not present yet");
-                continue;
-            };
-            let Some((cert_pem, key_pem)) = tls_material(secret) else {
-                tracing::warn!(namespace = %cert.namespace, name = %cert.name,
-                    "Secret missing or invalid tls.crt / tls.key");
-                continue;
-            };
-            // HashMap insert dedups a Secret referenced by several listeners.
-            snapshot.secrets.insert(
-                SecretKey::new(cert.namespace.clone(), cert.name.clone()),
-                pb::SecretUpsert {
-                    namespace: cert.namespace.clone(),
-                    name: cert.name.clone(),
-                    r#type: pb::SecretType::Tls as i32,
-                    data: HashMap::from([
-                        (TLS_CERT_KEY.to_string(), cert_pem.into_bytes()),
-                        (TLS_KEY_KEY.to_string(), key_pem.into_bytes()),
-                    ]),
-                },
-            );
+            emit_tls_secret(snapshot, cert);
         }
     }
 }
 
+/// Emit the TLS material one reference names, when it is there.
+///
+/// Shared by the two things that name a certificate: a listener's
+/// `certificateRef` and a `GatewayBackend`'s trust roots. Both are
+/// unresolved until the material arrives, and neither publishes
+/// anything the data plane would refuse — an upsert it rejects costs
+/// the rest of its batch.
+///
+/// The `HashMap` insert dedups a Secret several listeners or
+/// backends name. It also settles the one collision the wire cannot
+/// carry: a secret is TLS material *or* credentials, never both, so a
+/// Secret named for its certificate wins over the same Secret named
+/// for a data key inside it. A listener that cannot serve its
+/// certificate is the worse failure of the two, and losing this race
+/// is a mistake worth a warning either way.
+fn emit_tls_secret(snapshot: &mut Snapshot, cert: &CertRef<'_>) {
+    let Some(secret) = cert.secret else {
+        tracing::warn!(namespace = %cert.namespace, name = %cert.name,
+            "certificate Secret not present yet");
+        return;
+    };
+    let Some((cert_pem, key_pem)) = tls_material(secret) else {
+        tracing::warn!(namespace = %cert.namespace, name = %cert.name,
+            "Secret carries no usable tls.crt / tls.key");
+        return;
+    };
+    let key = SecretKey::new(cert.namespace.clone(), cert.name.clone());
+    if let Some(previous) = snapshot.secrets.get(&key)
+        && previous.r#type == pb::SecretType::Opaque as i32
+    {
+        tracing::warn!(namespace = %cert.namespace, name = %cert.name,
+            "Secret is named both as a certificate and as a credential; \
+             carrying the certificate. Use separate Secrets.");
+    }
+    snapshot.secrets.insert(
+        key,
+        pb::SecretUpsert {
+            namespace: cert.namespace.clone(),
+            name: cert.name.clone(),
+            r#type: pb::SecretType::Tls as i32,
+            data: HashMap::from([
+                (TLS_CERT_KEY.to_string(), cert_pem.into_bytes()),
+                (TLS_KEY_KEY.to_string(), key_pem.into_bytes()),
+            ]),
+        },
+    );
+}
+
 /// Pull the PEM cert chain and key out of a `kubernetes.io/tls`
-/// Secret's `tls.crt` / `tls.key` data. `None` if either is absent or
-/// not valid UTF-8.
+/// Secret's `tls.crt` / `tls.key` data.
+///
+/// An empty key is how CA-only material travels — trust roots to
+/// verify an upstream against, with nothing to serve — so a Secret
+/// without one is carried as CA-only rather than dropped. An empty
+/// *chain* is nothing at all: `None`, and the reference stays
+/// unresolved.
 fn tls_material(secret: &Secret) -> Option<(String, String)> {
     let data = secret.data.as_ref()?;
     let cert = String::from_utf8(data.get(TLS_CERT_KEY)?.0.clone()).ok()?;
-    let key = String::from_utf8(data.get(TLS_KEY_KEY)?.0.clone()).ok()?;
+    if cert.is_empty() {
+        return None;
+    }
+    let key = data
+        .get(TLS_KEY_KEY)
+        .map_or(Ok(String::new()), |k| String::from_utf8(k.0.clone()))
+        .ok()?;
     Some((cert, key))
 }
 
@@ -332,16 +371,26 @@ fn emit_routes_under_edge(
     }
 }
 
-/// The proto ref a rule carries for one resolved backendRef. Missing
-/// and headless Services keep their ref (the DP stashes the route
-/// until the backend lands); dropped refs (cross-namespace, no port)
-/// emit nothing.
+/// The proto ref a rule carries for one resolved backendRef.
+///
+/// A ref whose target is named but not usable keeps its ref anyway —
+/// a missing or headless Service, a `GatewayBackend` that is absent
+/// or invalid — because the runtime answers 500 for a ref it cannot
+/// resolve, and 500 is the honest answer while the object is being
+/// fixed. Refs that were rejected outright (cross-namespace, a
+/// Service with no port, a `GatewayBackend` with one, a foreign
+/// kind) emit nothing.
 fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> {
     let key = match &backend.outcome {
         BackendOutcome::Resolved { key, .. }
         | BackendOutcome::MissingService { key }
-        | BackendOutcome::Headless { key } => key.clone(),
-        BackendOutcome::CrossNamespace | BackendOutcome::NoPort => return None,
+        | BackendOutcome::Headless { key }
+        | BackendOutcome::Dialable { key, .. }
+        | BackendOutcome::MissingDialable { key } => key.clone(),
+        BackendOutcome::CrossNamespace
+        | BackendOutcome::NoPort
+        | BackendOutcome::PortNotAllowed
+        | BackendOutcome::UnsupportedKind => return None,
     };
     Some(pb::BackendRef {
         name: key,
@@ -365,7 +414,18 @@ fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> 
 /// not inspected — the K8s API treats name as an operator-facing
 /// label only; `appProtocol` is the standard hint. See
 /// [`map_app_protocol`] for recognized values.
-fn emit_backend(snapshot: &mut Snapshot, backend: &BackendResolution<'_>) {
+fn emit_backend(
+    snapshot: &mut Snapshot,
+    backend: &BackendResolution<'_>,
+    dialables: &[GatewayBackendResolution<'_>],
+) {
+    if let BackendOutcome::Dialable { key, index } = &backend.outcome {
+        // The index is resolve's, into the one resolution per object.
+        if let Some(dialable) = dialables.get(*index) {
+            emit_dialable_backend(snapshot, key, dialable);
+        }
+        return;
+    }
     let BackendOutcome::Resolved {
         key,
         service,
@@ -394,17 +454,157 @@ fn emit_backend(snapshot: &mut Snapshot, backend: &BackendResolution<'_>) {
         bk,
         pb::BackendUpsert {
             name: key.clone(),
-            endpoints: endpoints
-                .iter()
-                .map(|e| pb::Endpoint {
-                    name: e.name.clone(),
-                    address: e.address.clone(),
-                    port: u32::from(e.port),
-                })
-                .collect(),
-            protocol: protocol as i32,
+            kind: Some(pb::backend_upsert::Kind::EndpointSet(pb::EndpointSet {
+                endpoints: endpoints
+                    .iter()
+                    .map(|e| pb::Endpoint {
+                        name: e.name.clone(),
+                        address: e.address.clone(),
+                        port: u32::from(e.port),
+                    })
+                    .collect(),
+                protocol: protocol as i32,
+            })),
         },
     );
+}
+
+/// Emit one `GatewayBackend` into this Gateway's slice: the backend
+/// itself, plus the secrets it names.
+///
+/// Only a `Resolved` object emits. An invalid one emits nothing —
+/// there is no host to dial — and the route ref that named it
+/// answers 500 while its status says why.
+///
+/// The material is emitted per Gateway, into the slice of the one
+/// whose route referenced it, so a credential reaches the data
+/// planes that need it and no others. A reference whose material has
+/// not arrived emits the backend without it: the store resolves it
+/// to nothing, the dial fails, and it recovers when the secret
+/// lands, without another translate pass having to notice.
+fn emit_dialable_backend(
+    snapshot: &mut Snapshot,
+    key: &str,
+    dialable: &GatewayBackendResolution<'_>,
+) {
+    let GatewayBackendOutcome::Resolved(resolved) = &dialable.outcome else {
+        return;
+    };
+    let bk = BackendKey::new(key);
+    if snapshot.backends.contains_key(&bk) {
+        return;
+    }
+
+    let tls = resolved.tls.as_ref().map(|tls| {
+        if let Some(ca) = &tls.ca {
+            emit_tls_secret(snapshot, ca);
+        }
+        pb::BackendTls {
+            ca: tls.ca.as_ref().map(|ca| pb::SecretKey {
+                namespace: ca.namespace.clone(),
+                name: ca.name.clone(),
+            }),
+            sni: tls.sni.clone().unwrap_or_default(),
+            alpn: tls.alpn.iter().map(|a| *a as i32).collect(),
+            insecure_skip_verify: tls.insecure_skip_verify,
+        }
+    });
+
+    let auth = resolved.auth.as_ref().map(|auth| {
+        emit_credential_secret(snapshot, auth.credential());
+        let secret_key = |c: &CredentialRef| pb::SecretKey {
+            namespace: c.namespace.clone(),
+            name: c.name.clone(),
+        };
+        pb::BackendAuth {
+            kind: Some(match auth {
+                ResolvedBackendAuth::ApiKey {
+                    credential,
+                    header,
+                    prefix,
+                } => pb::backend_auth::Kind::ApiKey(pb::ApiKeyAuth {
+                    secret: Some(secret_key(credential)),
+                    data_key: credential.key.clone(),
+                    header: header.clone(),
+                    prefix: prefix.clone(),
+                }),
+                ResolvedBackendAuth::OAuth2 {
+                    credential,
+                    token_url,
+                    client_id,
+                    scopes,
+                    client_auth_method,
+                } => pb::backend_auth::Kind::Oauth2(pb::OAuth2Auth {
+                    token_url: token_url.clone(),
+                    client_id: client_id.clone(),
+                    secret: Some(secret_key(credential)),
+                    data_key: credential.key.clone(),
+                    scopes: scopes.clone(),
+                    client_auth_method: *client_auth_method as i32,
+                }),
+            }),
+        }
+    });
+
+    snapshot.backends.insert(
+        bk,
+        pb::BackendUpsert {
+            name: key.to_string(),
+            kind: Some(pb::backend_upsert::Kind::Dialable(pb::Dialable {
+                host: resolved.host.clone(),
+                port: u32::from(resolved.port),
+                path_prefix: resolved.path_prefix.clone().unwrap_or_default(),
+                tls,
+                auth,
+            })),
+        },
+    );
+}
+
+/// Emit the credential one auth block spends, when it is there. A
+/// Secret that is absent, or that carries no such data key, emits
+/// nothing at all rather than an empty credential the upstream would
+/// reject: the reference stays unresolved until the material lands.
+///
+/// Only the referenced data key travels. The rest of the Secret is
+/// none of the data plane's business, and every byte of it that stays
+/// here is one that cannot leak from there. Which is why this merges
+/// rather than replaces: one Secret can hold the credentials of
+/// several backends under several data keys, and each reference
+/// contributes the one key it named.
+fn emit_credential_secret(snapshot: &mut Snapshot, credential: &CredentialRef) {
+    let CredentialOutcome::Present(value) = &credential.outcome else {
+        tracing::warn!(
+            credential = %credential.id(),
+            "backend credential not present yet"
+        );
+        return;
+    };
+    let entry = snapshot
+        .secrets
+        .entry(SecretKey::new(
+            credential.namespace.clone(),
+            credential.name.clone(),
+        ))
+        .or_insert_with(|| pb::SecretUpsert {
+            namespace: credential.namespace.clone(),
+            name: credential.name.clone(),
+            r#type: pb::SecretType::Opaque as i32,
+            data: HashMap::new(),
+        });
+    // A Secret already carrying a certificate keeps it: the wire has
+    // one shape per secret, and [`emit_tls_secret`] says which wins.
+    if entry.r#type == pb::SecretType::Tls as i32 {
+        tracing::warn!(
+            credential = %credential.id(),
+            "Secret is named both as a certificate and as a credential; \
+             the credential is not published. Use separate Secrets."
+        );
+        return;
+    }
+    entry
+        .data
+        .insert(credential.key.clone(), value.expose().to_vec());
 }
 
 /// Translate one `HttpRouteRulesMatches` to the proto. Path,
@@ -833,6 +1033,30 @@ mod tests {
         }
     }
 
+    /// A Secret carrying credentials under operator-chosen data
+    /// keys. `Opaque` is what secret tooling produces; nothing in the
+    /// control plane reads the type.
+    fn credential_secret<'a>(
+        ns: &str,
+        name: &str,
+        data: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Secret {
+        Secret {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            data: Some(
+                data.into_iter()
+                    .map(|(k, v)| (k.to_string(), ByteString(v.as_bytes().to_vec())))
+                    .collect(),
+            ),
+            type_: Some("Opaque".into()),
+            ..Default::default()
+        }
+    }
+
     fn http_listener(name: &str, port: i32, hostname: Option<&str>) -> GatewayListeners {
         GatewayListeners {
             name: name.into(),
@@ -1155,6 +1379,7 @@ mod tests {
     #[test]
     fn duplicate_hostname_on_shared_port_first_wins() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1223,6 +1448,7 @@ mod tests {
     #[test]
     fn route_without_section_fans_out_across_listeners_on_port() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1273,6 +1499,7 @@ mod tests {
     #[test]
     fn route_with_section_name_only_under_named_listener() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1322,6 +1549,7 @@ mod tests {
     #[test]
     fn route_appears_in_each_parent_slice() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![
                 gw("demo", "gw1", "zd", vec![http_listener("http", 80, None)]),
@@ -1355,6 +1583,7 @@ mod tests {
     #[test]
     fn multiple_rules_yield_multiple_routes_in_one_slice() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1385,6 +1614,7 @@ mod tests {
     #[test]
     fn cross_namespace_backendref_is_dropped() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1435,6 +1665,7 @@ mod tests {
     #[test]
     fn headless_service_produces_no_backend() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1463,6 +1694,7 @@ mod tests {
         // Route references "svc" but no such Service exists. The Store
         // will stash the route until the backend appears.
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1525,8 +1757,19 @@ mod tests {
         }
     }
 
+    /// The endpoint set of an emitted backend. Panics for a
+    /// dialable one, which is what a test asserting on endpoints or
+    /// on the app protocol means to say.
+    fn endpoint_set(be: &pb::BackendUpsert) -> &pb::EndpointSet {
+        match be.kind.as_ref().expect("backend carries a kind") {
+            pb::backend_upsert::Kind::EndpointSet(set) => set,
+            pb::backend_upsert::Kind::Dialable(_) => panic!("expected an endpoint set"),
+        }
+    }
+
     fn per_pod_state(endpoint_slices: Vec<EndpointSlice>) -> K8sState {
         K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1560,7 +1803,7 @@ mod tests {
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let backend = s.backends.get(&BackendKey::new("demo/svc:8080")).unwrap();
-        let endpoints: Vec<(&str, &str, u32)> = backend
+        let endpoints: Vec<(&str, &str, u32)> = endpoint_set(backend)
             .endpoints
             .iter()
             .map(|e| (e.name.as_str(), e.address.as_str(), e.port))
@@ -1585,7 +1828,7 @@ mod tests {
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let backend = s.backends.get(&BackendKey::new("demo/svc:8080")).unwrap();
-        assert!(backend.endpoints.is_empty());
+        assert!(endpoint_set(backend).endpoints.is_empty());
     }
 
     #[test]
@@ -1609,6 +1852,7 @@ mod tests {
     #[test]
     fn core_filters_synthesize_extension_objects() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1739,6 +1983,7 @@ mod tests {
         // Core filter, user ref, core filter: the refs land in filter
         // order, and only the core filters synthesize objects.
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1786,6 +2031,7 @@ mod tests {
         // a route attached to two listeners emits two route upserts
         // but one synthesized object.
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1844,6 +2090,7 @@ mod tests {
             )
         };
         let state = |value: &str| K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1977,6 +2224,7 @@ mod tests {
         // Listener has no hostname; route has two hostnames.
         // Expect: one HttpRouteUpsert with 2 HttpMatches (one per host).
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2015,6 +2263,7 @@ mod tests {
         // have the slice if no other resources contribute, but the
         // Gateway's Bind + Listener still come from the Gateway pass).
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2047,6 +2296,7 @@ mod tests {
         // Listener hostname: a.example.com. Route has no hostnames.
         // Expect: one HttpMatch with host = a.example.com.
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2078,6 +2328,7 @@ mod tests {
         // Route hostname "*.example.com" travels as-is into HttpMatch.host
         // for the resolver to wildcard-match at request time.
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2110,6 +2361,7 @@ mod tests {
     #[test]
     fn exact_path_match_translates_to_exact_kind() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2159,6 +2411,7 @@ mod tests {
         // `gateway-cp-client::convert::path_match`.
         let pattern = r"^/api/v\d+$";
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2271,6 +2524,7 @@ mod tests {
 
     fn single_route_state(m: HttpRouteRulesMatches) -> K8sState {
         K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2405,6 +2659,7 @@ mod tests {
     /// for assertion.
     fn translate_app_protocol(app_protocol: Option<&str>, port: i32) -> pb::BackendProtocol {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2431,7 +2686,7 @@ mod tests {
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let be = s.backends.values().next().expect("one backend emitted");
-        pb::BackendProtocol::try_from(be.protocol).expect("known proto enum")
+        pb::BackendProtocol::try_from(endpoint_set(be).protocol).expect("known proto enum")
     }
 
     #[test]
@@ -2744,6 +2999,7 @@ mod tests {
         // declares port 8080. Backend still emits (via ClusterIP);
         // protocol falls back to HTTP/1.1.
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2774,11 +3030,414 @@ mod tests {
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let be = s.backends.values().next().expect("backend emitted");
         assert_eq!(
-            pb::BackendProtocol::try_from(be.protocol).unwrap(),
+            pb::BackendProtocol::try_from(endpoint_set(be).protocol).unwrap(),
             pb::BackendProtocol::Http1,
             "unmatched port must fall back to H1"
         );
     }
+    // ---------- GatewayBackend ----------
+
+    fn dialable_ref(name: &str) -> HttpRouteRulesBackendRefs {
+        HttpRouteRulesBackendRefs {
+            name: name.into(),
+            port: None,
+            namespace: None,
+            group: Some("gateway.linkerd.io".into()),
+            kind: Some("GatewayBackend".into()),
+            weight: None,
+            filters: None,
+        }
+    }
+
+    fn gateway_backend(ns: &str, name: &str, base_url: &str) -> crd::GatewayBackend {
+        crd::GatewayBackend {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                ..Default::default()
+            },
+            spec: crd::GatewayBackendSpec {
+                base_url: base_url.into(),
+                tls: None,
+                auth: None,
+            },
+            status: None,
+        }
+    }
+
+    /// A Gateway with one HTTP listener and a route whose only
+    /// backendRef is the named `GatewayBackend`.
+    fn dialable_state(backends: Vec<crd::GatewayBackend>, secrets: Vec<Secret>) -> K8sState {
+        K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw("demo", "api", "zd", vec![http_listener("h", 80, None)])],
+            http_routes: vec![http_route(
+                "demo",
+                "r",
+                vec![parent_ref("api", Some("demo"), None)],
+                vec![rule(Some("/"), vec![dialable_ref("provider")], vec![])],
+            )],
+            services: vec![],
+            endpoint_slices: vec![],
+            secrets,
+            extensions: vec![],
+            gateway_backends: backends,
+        }
+    }
+
+    fn dialable(be: &pb::BackendUpsert) -> &pb::Dialable {
+        match be.kind.as_ref().expect("backend carries a kind") {
+            pb::backend_upsert::Kind::Dialable(d) => d,
+            pb::backend_upsert::Kind::EndpointSet(_) => panic!("expected a dialable backend"),
+        }
+    }
+
+    #[test]
+    fn dialable_backend_emits_the_url_in_parts() {
+        let state = dialable_state(
+            vec![gateway_backend(
+                "demo",
+                "provider",
+                "https://api.example.com/v1",
+            )],
+            vec![],
+        );
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        let be = s
+            .backends
+            .get(&BackendKey::new("demo/provider"))
+            .expect("backend emitted");
+        let d = dialable(be);
+        assert_eq!(d.host, "api.example.com");
+        assert_eq!(d.port, 443);
+        assert_eq!(d.path_prefix, "/v1");
+        assert!(d.auth.is_none());
+        // https, so TLS is originated with the defaults.
+        let tls = d.tls.as_ref().expect("tls originated");
+        assert!(tls.ca.is_none());
+        assert_eq!(tls.sni, "");
+        assert_eq!(
+            tls.alpn,
+            vec![pb::AlpnProtocol::H2 as i32, pb::AlpnProtocol::Http11 as i32]
+        );
+
+        // The rule carries the same key, so the DP joins them up.
+        let route = s.routes.values().next().expect("route emitted");
+        assert_eq!(route.backend_refs[0].name, "demo/provider");
+    }
+
+    #[test]
+    fn a_cleartext_dialable_backend_originates_no_tls() {
+        let state = dialable_state(
+            vec![gateway_backend(
+                "demo",
+                "provider",
+                "http://mock.demo.svc:8080",
+            )],
+            vec![],
+        );
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let be = s.backends.get(&BackendKey::new("demo/provider")).unwrap();
+        let d = dialable(be);
+        assert_eq!((d.host.as_str(), d.port), ("mock.demo.svc", 8080));
+        assert!(d.tls.is_none());
+        assert_eq!(d.path_prefix, "", "no path means no prefix");
+    }
+
+    #[test]
+    fn an_invalid_backend_emits_nothing_but_keeps_the_ref() {
+        let state = dialable_state(
+            vec![gateway_backend("demo", "provider", "api.example.com")],
+            vec![],
+        );
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert!(
+            s.backends.is_empty(),
+            "there is no host to dial, so nothing is published"
+        );
+        // The ref still goes out: the runtime answers 500 for it,
+        // which is the honest answer while the object is broken.
+        let route = s.routes.values().next().expect("route emitted");
+        assert_eq!(route.backend_refs[0].name, "demo/provider");
+    }
+
+    #[test]
+    fn an_api_key_travels_as_one_data_key() {
+        let mut backend = gateway_backend("demo", "provider", "https://api.example.com");
+        backend.spec.auth = Some(crd::BackendAuth {
+            r#type: crd::BackendAuthType::ApiKey,
+            api_key: Some(crd::ApiKeyAuth {
+                secret_ref: crd::SecretKeyReference {
+                    name: "provider-key".into(),
+                    key: "apiKey".into(),
+                },
+                header: Some("x-api-key".into()),
+                prefix: Some(String::new()),
+            }),
+            oauth2: None,
+        });
+        let state = dialable_state(
+            vec![backend],
+            vec![credential_secret(
+                "demo",
+                "provider-key",
+                [("apiKey", "s3cr3t")],
+            )],
+        );
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        let be = s.backends.get(&BackendKey::new("demo/provider")).unwrap();
+        let auth = dialable(be).auth.as_ref().expect("auth emitted");
+        let pb::backend_auth::Kind::ApiKey(api_key) = auth.kind.as_ref().unwrap() else {
+            panic!("expected an api key");
+        };
+        assert_eq!(api_key.header, "x-api-key");
+        assert_eq!(api_key.prefix, "");
+        let secret = api_key.secret.as_ref().unwrap();
+        assert_eq!(
+            (
+                secret.namespace.as_str(),
+                secret.name.as_str(),
+                api_key.data_key.as_str()
+            ),
+            ("demo", "provider-key", "apiKey")
+        );
+
+        let secret = s
+            .secrets
+            .get(&SecretKey::new("demo", "provider-key"))
+            .expect("credential published");
+        assert_eq!(secret.r#type, pb::SecretType::Opaque as i32);
+        assert_eq!(
+            secret.data.keys().collect::<Vec<_>>(),
+            vec!["apiKey"],
+            "only the referenced data key travels"
+        );
+        assert_eq!(secret.data["apiKey"], b"s3cr3t");
+    }
+
+    #[test]
+    fn a_missing_credential_still_publishes_the_backend() {
+        let mut backend = gateway_backend("demo", "provider", "https://api.example.com");
+        backend.spec.auth = Some(crd::BackendAuth {
+            r#type: crd::BackendAuthType::ApiKey,
+            api_key: Some(crd::ApiKeyAuth {
+                secret_ref: crd::SecretKeyReference {
+                    name: "provider-key".into(),
+                    key: "apiKey".into(),
+                },
+                header: None,
+                prefix: None,
+            }),
+            oauth2: None,
+        });
+        let state = dialable_state(vec![backend], vec![]);
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        // The backend and its auth block go out; the material does
+        // not exist to publish. The store resolves the credential to
+        // nothing, the dial fails, and it recovers when the Secret
+        // lands.
+        let be = s.backends.get(&BackendKey::new("demo/provider")).unwrap();
+        assert!(dialable(be).auth.is_some());
+        assert!(s.secrets.is_empty());
+    }
+
+    #[test]
+    fn ca_only_trust_roots_travel_with_an_empty_key() {
+        let mut backend = gateway_backend("demo", "provider", "https://api.example.com");
+        backend.spec.tls = Some(crd::BackendTls {
+            ca: Some(crd::LocalSecretReference {
+                name: "provider-ca".into(),
+            }),
+            sni: Some("edge.example.com".into()),
+            alpn: Some(vec![crd::AlpnProtocol::Http11]),
+            insecure_skip_verify: false,
+        });
+        let state = dialable_state(
+            vec![backend],
+            vec![tls_secret("demo", "provider-ca", "ca-cert", "")],
+        );
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        let be = s.backends.get(&BackendKey::new("demo/provider")).unwrap();
+        let tls = dialable(be).tls.as_ref().unwrap();
+        let ca = tls.ca.as_ref().expect("ca named");
+        assert_eq!(
+            (ca.namespace.as_str(), ca.name.as_str()),
+            ("demo", "provider-ca")
+        );
+        assert_eq!(tls.sni, "edge.example.com");
+        assert_eq!(tls.alpn, vec![pb::AlpnProtocol::Http11 as i32]);
+
+        let secret = s
+            .secrets
+            .get(&SecretKey::new("demo", "provider-ca"))
+            .expect("ca published");
+        assert_eq!(secret.r#type, pb::SecretType::Tls as i32);
+        assert_eq!(secret.data["tls.crt"], b"ca-cert");
+        assert!(
+            secret.data["tls.key"].is_empty(),
+            "an empty key is how CA-only material travels"
+        );
+    }
+
+    #[test]
+    fn a_certificateless_secret_leaves_the_reference_unresolved() {
+        let mut backend = gateway_backend("demo", "provider", "https://api.example.com");
+        backend.spec.tls = Some(crd::BackendTls {
+            ca: Some(crd::LocalSecretReference {
+                name: "provider-ca".into(),
+            }),
+            ..Default::default()
+        });
+        // The shape of a credential Secret: typed for TLS, carrying
+        // no certificate. Publishing it would have the DP reject the
+        // upsert and skip the rest of its batch.
+        let state = dialable_state(
+            vec![backend],
+            vec![tls_secret("demo", "provider-ca", "", "")],
+        );
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert!(s.secrets.is_empty());
+        let be = s.backends.get(&BackendKey::new("demo/provider")).unwrap();
+        assert!(dialable(be).tls.as_ref().unwrap().ca.is_some());
+    }
+
+    #[test]
+    fn dialable_and_service_keys_cannot_collide() {
+        let mut state = dialable_state(
+            vec![gateway_backend(
+                "demo",
+                "provider",
+                "https://api.example.com",
+            )],
+            vec![],
+        );
+        // Same namespace and name as the GatewayBackend, reached by
+        // a second rule as a Service.
+        state.services = vec![service_with_ports(
+            "demo",
+            "provider",
+            Some("10.0.0.1"),
+            &[(8080, None)],
+        )];
+        state.http_routes[0].spec.rules.as_mut().unwrap().push(rule(
+            Some("/svc"),
+            vec![backend_ref("provider", 8080)],
+            vec![],
+        ));
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        assert!(s.backends.contains_key(&BackendKey::new("demo/provider")));
+        assert!(
+            s.backends
+                .contains_key(&BackendKey::new("demo/provider:8080"))
+        );
+        assert_eq!(s.backends.len(), 2);
+    }
+
+    #[test]
+    fn two_backends_sharing_a_secret_each_get_their_data_key() {
+        let with_key = |name: &str, key: &str| {
+            let mut backend = gateway_backend("demo", name, "https://api.example.com");
+            backend.spec.auth = Some(crd::BackendAuth {
+                r#type: crd::BackendAuthType::ApiKey,
+                api_key: Some(crd::ApiKeyAuth {
+                    secret_ref: crd::SecretKeyReference {
+                        name: "shared".into(),
+                        key: key.into(),
+                    },
+                    header: None,
+                    prefix: None,
+                }),
+                oauth2: None,
+            });
+            backend
+        };
+        let mut state = dialable_state(
+            vec![with_key("provider", "first"), with_key("other", "second")],
+            vec![credential_secret(
+                "demo",
+                "shared",
+                [("first", "one"), ("second", "two")],
+            )],
+        );
+        state.http_routes[0].spec.rules.as_mut().unwrap().push(rule(
+            Some("/other"),
+            vec![dialable_ref("other")],
+            vec![],
+        ));
+
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let secret = s
+            .secrets
+            .get(&SecretKey::new("demo", "shared"))
+            .expect("credential published");
+        let mut keys: Vec<&str> = secret.data.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["first", "second"],
+            "each reference contributes the key it named"
+        );
+    }
+
+    /// The wire carries one shape per secret, so a Secret named both
+    /// as a certificate and as a credential keeps the certificate —
+    /// whichever reference is emitted first.
+    #[test]
+    fn a_certificate_wins_over_a_credential_in_the_same_secret() {
+        let mut backend = gateway_backend("demo", "provider", "https://api.example.com");
+        backend.spec.tls = Some(crd::BackendTls {
+            ca: Some(crd::LocalSecretReference {
+                name: "shared".into(),
+            }),
+            ..Default::default()
+        });
+        backend.spec.auth = Some(crd::BackendAuth {
+            r#type: crd::BackendAuthType::ApiKey,
+            api_key: Some(crd::ApiKeyAuth {
+                secret_ref: crd::SecretKeyReference {
+                    name: "shared".into(),
+                    key: "apiKey".into(),
+                },
+                header: None,
+                prefix: None,
+            }),
+            oauth2: None,
+        });
+        let mut shared = tls_secret("demo", "shared", "ca-cert", "");
+        shared
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("apiKey".into(), ByteString(b"s3cr3t".to_vec()));
+
+        let state = dialable_state(vec![backend], vec![shared]);
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+
+        let secret = s.secrets.get(&SecretKey::new("demo", "shared")).unwrap();
+        assert_eq!(secret.r#type, pb::SecretType::Tls as i32);
+        assert!(
+            !secret.data.contains_key("apiKey"),
+            "the credential does not ride along inside TLS material"
+        );
+    }
+
     // ---------- Catch-all for rules with no matches ----------
 
     #[test]
@@ -2789,6 +3448,7 @@ mod tests {
         let mut r = rule(None, vec![backend_ref("svc", 8080)], vec![]);
         r.matches = None;
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2859,6 +3519,7 @@ mod tests {
     #[test]
     fn extension_ref_translates_and_emits_the_object() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2914,6 +3575,7 @@ mod tests {
     #[test]
     fn missing_extension_object_keeps_the_ref_and_emits_nothing() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2950,6 +3612,7 @@ mod tests {
     #[test]
     fn foreign_extension_ref_is_dropped() {
         let state = K8sState {
+            gateway_backends: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",

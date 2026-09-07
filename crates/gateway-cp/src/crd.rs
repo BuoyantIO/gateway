@@ -1,7 +1,14 @@
-//! The `Extension` custom resource: the cluster-facing form of the
-//! gateway's `Extension` config object. Typed fields are the ones the
-//! gateway host acts on; `config` is opaque and belongs to the class.
+//! `Extension` is a filter implementation a route names. Typed fields
+//! are the ones the gateway host acts on; `config` is opaque and
+//! belongs to the class.
+//!
+//! `GatewayBackend` is a destination outside the cluster, named by a
+//! route's `backendRefs` where a Service would otherwise go. It says
+//! where to dial (`baseURL`), what to trust on the way, and what
+//! credential to present. Everything here is the operator's stated
+//! intent; what it resolves to lives in [`crate::resolve`].
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -53,6 +60,189 @@ pub enum RequestBodyLimit {
     None,
     Stream,
     Buffer,
+}
+
+/// A destination the gateway reaches by dialing a host, rather than
+/// by balancing over endpoints the cluster resolves for it.
+///
+/// One object is one upstream: a URL, optional transport settings,
+/// and at most one credential. A route names it from `backendRefs`
+/// with `group: gateway.linkerd.io, kind: GatewayBackend` and no
+/// `port` — the port is part of `baseURL`
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "gateway.linkerd.io",
+    version = "v1alpha1",
+    kind = "GatewayBackend",
+    status = "GatewayBackendStatus",
+    namespaced
+)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayBackendSpec {
+    /// Absolute `http` or `https` URL of the upstream. The scheme
+    /// decides whether the gateway originates TLS and supplies the
+    /// default port (80 / 443); a path is prepended to the request
+    /// path on the way upstream, for a provider that serves its API
+    /// under a subpath (`/v1`).
+    #[serde(rename = "baseURL")]
+    pub base_url: String,
+    /// Transport settings for the TLS the `https` scheme already
+    /// implies. Absent means the defaults: the platform trust store,
+    /// the URL's host as SNI, and both HTTP versions offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<BackendTls>,
+    /// The credential the gateway presents on every request it
+    /// forwards here. Absent sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<BackendAuth>,
+}
+
+/// Client-side TLS settings for a `GatewayBackend`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendTls {
+    /// A Secret in this object's namespace carrying the CA chain
+    /// under `tls.crt`, which becomes the *only* trust root. Absent
+    /// uses the platform trust store, which is what a public
+    /// provider chains to. A `kubernetes.io/tls` Secret has that key
+    /// by construction; its private key is ignored here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<LocalSecretReference>,
+    /// Name sent as SNI and verified against the upstream
+    /// certificate. Absent uses the `baseURL` host, which is also
+    /// the only thing to go on when that host is a literal IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Protocols offered in the handshake, in preference order, and
+    /// therefore what decides the HTTP version upstream. Absent
+    /// offers both; an explicitly empty list offers no ALPN at all,
+    /// which settles on HTTP/1.1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<Vec<AlpnProtocol>>,
+    /// Accept any certificate, from anyone, for any name. For
+    /// development and integration testing against an endpoint whose
+    /// chain the gateway has no way to trust; never in production,
+    /// and it overrides `ca`.
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// An ALPN protocol identifier, as it is written in the handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum AlpnProtocol {
+    #[serde(rename = "h2")]
+    H2,
+    #[serde(rename = "http/1.1")]
+    Http11,
+}
+
+/// How the gateway authenticates itself to a `GatewayBackend`.
+///
+/// `type` names the scheme and the field of the same name carries
+/// it, so what an operator wrote is a statement rather than
+/// something inferred from which fields they filled in.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendAuth {
+    pub r#type: BackendAuthType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<ApiKeyAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth2: Option<OAuth2Auth>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum BackendAuthType {
+    ApiKey,
+    #[serde(rename = "OAuth2")]
+    OAuth2,
+}
+
+/// A credential the operator provisioned, sent verbatim in one
+/// header. The defaults are what most providers ask for:
+/// `Authorization: Bearer <key>`.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyAuth {
+    /// The Secret holding the credential, and the data key inside it.
+    pub secret_ref: SecretKeyReference,
+    /// Header the credential is sent in. Absent sends
+    /// `Authorization`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// Prepended to the credential inside the header value. Absent
+    /// sends `Bearer `; an explicitly empty string sends the
+    /// credential with nothing in front of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+/// The `OAuth2` client-credentials grant (RFC 6749 4.4): the gateway
+/// presents its own credentials to a token endpoint and sends the
+/// access token it gets back to the upstream. Nothing about the
+/// request being proxied takes part.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuth2Auth {
+    /// Absolute `http` or `https` URL of the token endpoint. Often
+    /// not on the backend's own host: the service that issues the
+    /// token is frequently not the one that accepts it.
+    #[serde(rename = "tokenURL")]
+    pub token_url: String,
+    /// The gateway's client identifier. Public by construction, so
+    /// it is config rather than a secret reference.
+    pub client_id: String,
+    /// The Secret holding the client secret, and the data key inside
+    /// it.
+    pub client_secret_ref: SecretKeyReference,
+    /// Scopes asked for. Absent asks for none, which is what a
+    /// provider that scopes by client identity expects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// How the client secret is presented to the token endpoint
+    /// (RFC 6749 2.3.1). Absent uses Basic, the method the RFC says
+    /// a client SHOULD use and a server MUST support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth_method: Option<ClientAuthMethod>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum ClientAuthMethod {
+    /// HTTP Basic, with the client id as the user and the client
+    /// secret as the password.
+    ClientSecretBasic,
+    /// `client_id` and `client_secret` as fields of the form body.
+    ClientSecretPost,
+}
+
+/// A Secret in the referring object's namespace. Cross-namespace
+/// references would need a `ReferenceGrant`, which this
+/// implementation does not support yet.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct LocalSecretReference {
+    pub name: String,
+}
+
+/// One data key inside a Secret in the referring object's namespace.
+///
+/// Any Secret type will do — what a secret is taken to be is decided
+/// by the key named here, not by how it was provisioned — so the
+/// `Opaque` Secret an operator's secret tooling produces is read as
+/// it is.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct SecretKeyReference {
+    pub name: String,
+    /// Data key holding the credential.
+    pub key: String,
+}
+
+/// Status of one `GatewayBackend`. Conditions follow the Gateway API
+/// convention: `Accepted` says the object itself is usable,
+/// `ResolvedRefs` says everything it names was found.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct GatewayBackendStatus {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
 }
 
 /// `config` accepts any object: `x-kubernetes-preserve-unknown-fields`.

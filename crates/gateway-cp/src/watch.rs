@@ -1,12 +1,27 @@
 //! kube watch loop.
 //!
-//! Six `kube_runtime::reflector` instances keep an in-memory view of
-//! `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`,
+//! Eight `kube_runtime::reflector` instances keep an in-memory view
+//! of `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`,
 //! `discovery/v1 EndpointSlice` (filtered to slices carrying the
-//! `kubernetes.io/service-name` label), and `core/v1 Secret`
-//! (filtered to `type: kubernetes.io/tls`). A single `tokio::select!`
-//! over the watcher streams drives the loop: each relevant event
-//! triggers one pass (resolve, translate, publish, status, infra).
+//! `kubernetes.io/service-name` label), `core/v1 Secret`, and our own
+//! `Extension` and `GatewayBackend`. A single `tokio::select!` over
+//! the watcher streams drives the loop: each relevant event triggers
+//! one pass (resolve, translate, publish, status, infra).
+//!
+//! Secrets are watched whatever their type. A certificate arrives as
+//! `kubernetes.io/tls` by convention, but a credential a
+//! `GatewayBackend` names is whatever the operator's secret tooling
+//! produced — usually `Opaque` — and requiring them to retype it
+//! would be a contract about provisioning rather than about the
+//! gateway. Nothing here reads `type`; what a secret is taken to be
+//! is decided by the data keys the reference asks for.
+//!
+//! The cost is worth stating: this reflector holds every
+//! Secret in the cluster, and every Secret write drives a pass. If
+//! that becomes a problem, the narrowing that keeps the contract
+//! intact is a field selector excluding the types nothing here can
+//! reference (`kubernetes.io/service-account-token`,
+//! `helm.sh/release.v1`), not a rule operators have to follow.
 //!
 //! Not every event is relevant. A status-only write does not bump
 //! `metadata.generation` and changes nothing the pass reads, so it is
@@ -16,7 +31,8 @@
 //! the same objects are filtered the same way.
 //!
 //! Per kind:
-//! - `GatewayClass`, `HTTPRoute`: skip unless the generation changed.
+//! - `GatewayClass`, `HTTPRoute`, `Extension`, `GatewayBackend`:
+//!   skip unless the generation changed.
 //! - `Gateway`: skip unless the generation or the annotations changed
 //!   (the provisioner reads the self-managed opt-out annotation).
 //! - `Service`, `Secret`, `EndpointSlice`: never skipped. Service
@@ -47,7 +63,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use tokio::sync::watch as tokio_watch;
 
 use crate::admin::ReadyState;
-use crate::crd::Extension;
+use crate::crd::{Extension, GatewayBackend};
 use crate::infra::{self, InfraPublisher};
 use crate::resolve::{SERVICE_NAME_LABEL, resolve};
 use crate::server::ServerState;
@@ -56,7 +72,7 @@ use crate::translator::{K8sState, translate_resolution};
 
 /// The resource kinds the loop watches, in reflector order. Also the
 /// initial pending set for the readiness endpoint.
-pub const WATCHED_KINDS: [&str; 7] = [
+pub const WATCHED_KINDS: [&str; 8] = [
     "GatewayClass",
     "Gateway",
     "HTTPRoute",
@@ -64,6 +80,7 @@ pub const WATCHED_KINDS: [&str; 7] = [
     "EndpointSlice",
     "Secret",
     "Extension",
+    "GatewayBackend",
 ];
 
 #[derive(Debug, Error)]
@@ -72,15 +89,15 @@ pub enum WatchError {
     Kube(#[from] kube::Error),
 }
 
-/// Run the watch loop until `shutdown` resolves. Sets up six
-/// reflectors against the cluster `client` and drives them under one
-/// `select!`.
+/// Run the watch loop until `shutdown` resolves. Sets up one
+/// reflector per watched kind against the cluster `client` and
+/// drives them all under one `select!`.
 ///
 /// # Errors
 /// Returns `WatchError::Kube` only for setup failures. Per-event
 /// watcher errors are transient and handled by `kube_runtime::watcher`
 /// internally; we log and continue.
-#[allow(clippy::similar_names)] // gc/gw/hr/svc/sec bindings are intentionally parallel
+#[allow(clippy::similar_names)] // gc/gw/hr/svc/sec/gb bindings are intentionally parallel
 #[allow(clippy::too_many_arguments)] // the loop is the wiring point for every channel
 pub async fn run(
     client: kube::Client,
@@ -122,19 +139,24 @@ pub async fn run(
 
     let (sec_store, sec_writer) = reflector::store::<Secret>();
     let sec_api: Api<Secret> = Api::all(client.clone());
-    let sec_config = Config::default().fields("type=kubernetes.io/tls");
     let mut sec_stream =
-        reflector::reflector(sec_writer, watcher::watcher(sec_api, sec_config)).boxed();
+        reflector::reflector(sec_writer, watcher::watcher(sec_api, Config::default())).boxed();
 
     let (ext_store, ext_writer) = reflector::store::<Extension>();
-    let ext_api: Api<Extension> = Api::all(client);
+    let ext_api: Api<Extension> = Api::all(client.clone());
     let mut ext_stream =
         reflector::reflector(ext_writer, watcher::watcher(ext_api, Config::default())).boxed();
+
+    let (gb_store, gb_writer) = reflector::store::<GatewayBackend>();
+    let gb_api: Api<GatewayBackend> = Api::all(client);
+    let mut gb_stream =
+        reflector::reflector(gb_writer, watcher::watcher(gb_api, Config::default())).boxed();
 
     let mut gc_filter = EventFilter::generation_only();
     let mut gw_filter = EventFilter::generation_and_annotations();
     let mut hr_filter = EventFilter::generation_only();
     let mut ext_filter = EventFilter::generation_only();
+    let mut gb_filter = EventFilter::generation_only();
 
     let mut sync = SyncTracker::new();
 
@@ -153,6 +175,7 @@ pub async fn run(
             ev = es_stream.next() => { sync.mark("EndpointSlice", ev.as_ref()); EventFilter::always("EndpointSlice", ev) }
             ev = sec_stream.next() => { sync.mark("Secret", ev.as_ref()); EventFilter::always("Secret", ev) }
             ev = ext_stream.next() => { sync.mark("Extension", ev.as_ref()); ext_filter.relevant("Extension", ev) }
+            ev = gb_stream.next() => { sync.mark("GatewayBackend", ev.as_ref()); gb_filter.relevant("GatewayBackend", ev) }
         };
         if !relevant {
             continue;
@@ -160,6 +183,7 @@ pub async fn run(
 
         let k8s = collect_state(
             &gc_store, &gw_store, &hr_store, &svc_store, &es_store, &sec_store, &ext_store,
+            &gb_store,
         );
         let resolution = resolve(&k8s, &controller_name);
         let world = translate_resolution(&resolution);
@@ -249,6 +273,7 @@ impl SyncTracker {
 
 /// Walk each reflector store once and clone the resources into a
 /// `K8sState` the translator can consume.
+#[allow(clippy::too_many_arguments)] // one parameter per watched kind
 fn collect_state(
     gc: &ReflectorStore<GatewayClass>,
     gw: &ReflectorStore<Gateway>,
@@ -257,6 +282,7 @@ fn collect_state(
     es: &ReflectorStore<EndpointSlice>,
     sec: &ReflectorStore<Secret>,
     ext: &ReflectorStore<Extension>,
+    gb: &ReflectorStore<GatewayBackend>,
 ) -> K8sState {
     K8sState {
         gateway_classes: gc.state().iter().map(|a| (**a).clone()).collect(),
@@ -266,6 +292,7 @@ fn collect_state(
         endpoint_slices: es.state().iter().map(|a| (**a).clone()).collect(),
         secrets: sec.state().iter().map(|a| (**a).clone()).collect(),
         extensions: ext.state().iter().map(|a| (**a).clone()).collect(),
+        gateway_backends: gb.state().iter().map(|a| (**a).clone()).collect(),
     }
 }
 

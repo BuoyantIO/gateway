@@ -29,7 +29,11 @@ use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
-use super::build::{StatusWork, reconcile_gateway_class_status, reconcile_gateway_status};
+use super::build::{
+    StatusWork, reconcile_gateway_backend_status, reconcile_gateway_class_status,
+    reconcile_gateway_status,
+};
+use crate::crd::GatewayBackend;
 
 const RETRY_INITIAL: Duration = Duration::from_millis(500);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -115,6 +119,25 @@ async fn write_all(client: &Client, work: &StatusWork) -> Result<(), kube::Error
         .await;
         if let Err(e) = result {
             tracing::warn!(error = %e, kind = "Gateway", namespace, name = observed.name_any(),
+                "status write failed; continuing with the rest");
+            first_err.get_or_insert(e);
+        }
+    }
+
+    for (observed, desired) in &work.gateway_backends {
+        let namespace = observed.namespace().unwrap_or_default();
+        let api: Api<GatewayBackend> = Api::namespaced(client.clone(), &namespace);
+        let result = write_object(
+            &api,
+            observed,
+            desired.clone(),
+            |gb| &mut gb.status,
+            reconcile_gateway_backend_status,
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, kind = "GatewayBackend", namespace,
+                name = observed.name_any(),
                 "status write failed; continuing with the rest");
             first_err.get_or_insert(e);
         }
@@ -312,6 +335,7 @@ mod tests {
                 // No status yet: written once.
                 (changed, gw_status("True", &t(200))),
             ],
+            gateway_backends: vec![],
         };
         write_all(&client, &work).await.unwrap();
 
@@ -343,6 +367,7 @@ mod tests {
         let work = StatusWork {
             gateway_classes: vec![],
             gateways: vec![(gw(None), gw_status("True", &t(200)))],
+            gateway_backends: vec![],
         };
         write_all(&client, &work).await.unwrap();
         let seen = requests.lock().unwrap().clone();
@@ -386,6 +411,7 @@ mod tests {
                 (gw(None), gw_status("True", &t(200))),
                 (other, gw_status("True", &t(200))),
             ],
+            gateway_backends: vec![],
         };
         let result = write_all(&client, &work).await;
         assert!(result.is_err(), "the failed write must surface for retry");
