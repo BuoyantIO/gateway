@@ -1520,6 +1520,7 @@ async fn forward(
     };
     *req.uri_mut() = upstream_uri;
     *req.version_mut() = upstream.version();
+    tracing::debug!(uri = %req.uri(), version = ?req.version(), "forwarding upstream");
 
     // Strip hop-by-hop headers before crossing the proxy hop. This is
     // load-bearing for H2: a stale `Connection` / `Transfer-Encoding`
