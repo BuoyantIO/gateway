@@ -1,0 +1,23 @@
+apiVersion: inference-d.io/v1alpha1
+kind: InferencePolicy
+metadata: {name: split, namespace: default}
+spec:
+  rules:
+  - name: split-between-dummy-and-databricks
+    matches:
+    # Either client-facing name enters the split; drop `matches` entirely to
+    # spread every request in the pool.
+    - model: [dummy, qwen-2.5, Qwen/Qwen2.5-32B-Instruct-Turbo]
+    route:
+      consider:
+      - name: local-dummy
+        weight: 1
+        backends: {type: Local, names: [dummy]}
+        models: {names: [dummy]}
+      - name: provider-databricks
+        weight: 1
+        backends: {type: Provider, names: [databricks]}
+        models: {names: [qwen-2.5]}
+      select:
+      - {type: Local,    minimize: PredictedTTFT}
+      - {type: Provider, order: [databricks]}

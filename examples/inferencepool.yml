@@ -1,0 +1,11 @@
+apiVersion: inference-d.io/v1alpha1
+kind: InferencePool
+metadata:
+  name: inference-all
+  namespace: default
+spec:
+  destinations:
+    - {kind: InferenceWorkerSet, name: dummy}
+    - {kind: InferenceProvider,  name: databricks}
+  policyRef:
+    name: split

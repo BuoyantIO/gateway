@@ -20,7 +20,7 @@ startup), creates kind cluster `gateway-e2e` (kubectl context
 
 ## 2. Get kinference into the cluster
 
-From the `llm-monitor` repo root:
+From the `llm-monitor` repo root, on the branch `alpeb/pick-path`:
 
 ```bash
 make -C k8s/kinference build TARGET=local TAG=dev
@@ -42,7 +42,7 @@ make -C k8s/kinference crds TARGET=local KUBE_CONTEXT=kind-gateway-e2e
 ```
 
 ```bash
-make -C k8s/kinference deploy TARGET=local TAG=dev KUBE_CONTEXT=kind-gateway-e2e
+make -C k8s/kinference deploy TARGET=local TAG=dev KUBE_CONTEXT=kind-gateway-e2e DEMO_MANIFESTS=
 ```
 
 The picker now listens at `kinference.default.svc:50051`. The gateway's
@@ -51,17 +51,13 @@ replica deployed here, or a single pod's DNS name. The picker holds
 per-request state, so a Service balancing across replicas would break
 any request whose calls land on different ones.
 
-## 3. Dummy worker + demo config
+## 3. Dummy worker
 
 Still from the `llm-monitor` repo root. The dummy vLLM is CPU-only
 and answers nonsense:
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f k8s/examples/dummy-vllm/dummy-vllm.yaml
-```
-
-```bash
-kubectl --context kind-gateway-e2e apply -f k8s/examples/demo-configs/
 ```
 
 Wait for the vLLM pod to become Ready (it downloads
@@ -71,56 +67,37 @@ SmolLM2-135M on first start), then check kinference sees the worker:
 kubectl --context kind-gateway-e2e logs deploy/kinference | tail -20
 ```
 
-## 4. Gateway objects
+## 4. Demo config
 
-The route's `backendRef` names the `dummy-vllm` Service — the rule's
-refs are the allowlist the selector's pick is validated against.
+Now back into the current repo. First set the proper values for the following env vars:
+
+- `DATABRICKS_SUBDOMAIN`
+- `DATABRICKS_CLIENT_ID`
+- `DATABRICKS_SECRET`
 
 ```bash
-kubectl --context kind-gateway-e2e apply -f - <<'EOF'
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: llm-gw
-  namespace: default
-spec:
-  gatewayClassName: buoyant-gateway
-  listeners:
-    - name: http
-      protocol: HTTP
-      port: 80
----
-apiVersion: gateway.linkerd.io/v1alpha1
-kind: Extension
-metadata:
-  name: chat-picker
-  namespace: default
-spec:
-  class: kinference_selector
-  config:
-    service: kinference.default.svc:50051
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: chat
-  namespace: default
-spec:
-  parentRefs:
-    - name: llm-gw
-  rules:
-    - matches:
-        - path: { type: PathPrefix, value: / }
-      filters:
-        - type: ExtensionRef
-          extensionRef:
-            group: gateway.linkerd.io
-            kind: Extension
-            name: chat-picker
-      backendRefs:
-        - name: dummy-vllm
-          port: 8000
-EOF
+kubectl --context kind-gateway-e2e apply -f examples/inferencepool.yml
+kubectl --context kind-gateway-e2e apply -f examples/inferenceworkerset-dummy.yml
+kubectl --context kind-gateway-e2e apply -f examples/inferenceprovider-databricks.yml
+envsubst < examples/gatewaybackend-databricks.yml | kubectl --context kind-gateway-e2e apply -f -
+kubectl --context kind-gateway-e2e apply -f examples/inferencepolicy-split.yml
+```
+
+Set up the secret to authenticate against Databricks:
+
+```bash
+kubectl -n default create secret generic databricks-oauth --from-literal=client-secret=${DATABRICKS_SECRET}
+```
+
+## 5. Gateway objects
+
+We have not yet support for referring InferencePool in the HTTPRoute, so the route's `backendRef` names the `dummy-vllm` Service and the `databricks`
+GatewayBackend directly, and we set the pool name as a default in the Extension object.
+
+```bash
+kubectl --context kind-gateway-e2e apply -f examples/gateway.yml
+kubectl --context kind-gateway-e2e apply -f examples/extension.yml
+kubectl --context kind-gateway-e2e apply -f examples/httproute.yml
 ```
 
 Optional: turn on the extension's per-request debug logs:
@@ -129,26 +106,30 @@ Optional: turn on the extension's per-request debug logs:
 kubectl --context kind-gateway-e2e -n default annotate gateway llm-gw gateway.buoyant.io/dp-log-filter='info,extension=debug' --overwrite
 ```
 
-## 5. Test the traffic
+## 6. Test the traffic
 
 ```bash
 GW=$(kubectl --context kind-gateway-e2e -n default get svc llm-gw-gatewayd -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 ```
 
+Repeat this request a few times; it should land on the local vLLM about half
+the time and on Databricks the other half (note that you need to warm up the
+Databricks endpoint beforehand):
+
 ```bash
 curl -sN "http://$GW/v1/chat/completions" \
   -H 'content-type: application/json' \
   -H 'x-request-id: manual-1' \
-  -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "max_tokens": 64, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "say hi"}]}'
+  -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "max_tokens": 64, "messages": [{"role": "user", "content": "say hi"}]}'
 ```
 
-## 6. Observe the gateway deployment logs for the kinference extension doing its magic:
+## 7. Observe the gateway deployment logs for the kinference extension doing its magic:
 
 ```bash
 kubectl --context kind-gateway-e2e logs  deploy/llm-gw-gatewayd      -f
 ```
 
-## 7. Teardown
+## 8. Teardown
 
 ```bash
 just down

@@ -1,0 +1,12 @@
+apiVersion: gateway.linkerd.io/v1alpha1
+kind: Extension
+metadata:
+  name: chat-picker
+  namespace: default
+spec:
+  class: bllmp_selector
+  config:
+    service: bllmp.default.svc:50051
+    pool: 
+        namespace: default
+        name: inference-all
