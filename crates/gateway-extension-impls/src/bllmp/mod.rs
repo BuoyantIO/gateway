@@ -1,6 +1,6 @@
 //! The bllmp selector: streams the request body to a Buoyant LLM
-//! Picker, dispatches to the endpoint it picks with the body it
-//! returns, and reports how the request went.
+//! Picker, dispatches to the endpoint or provider backend it picks
+//! with the body it returns, and reports how the request went.
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
@@ -203,6 +203,7 @@ impl ExtensionBuilder for BllmpSelectorBuilder {
             dispatched_at: None,
             upstream_status: 0,
             ttft_reported: false,
+            provider: false,
             itl: usage::Itl::default(),
             capture: usage::Capture::default(),
         })
@@ -227,6 +228,11 @@ struct BllmpSelector {
     dispatched_at: Option<Instant>,
     upstream_status: i32,
     ttft_reported: bool,
+    /// Whether the pick chose a provider backend. A provider is the
+    /// picker's blind spot — it cannot see one fail — so a
+    /// synthesized 5xx ending aborts as `BACKEND_UNRESOLVED` rather
+    /// than `NOT_DISPATCHED`.
+    provider: bool,
     itl: usage::Itl,
     capture: usage::Capture,
 }
@@ -307,7 +313,7 @@ impl Extension for BllmpSelector {
     }
 
     async fn select(&mut self, _held: Held<'_>, cx: &mut Cx) -> Result<Selected, Error> {
-        use proto::pick_response::Outcome;
+        use proto::pick_response::{Destination, Outcome};
 
         let push = self
             .push
@@ -365,6 +371,10 @@ impl Extension for BllmpSelector {
         self.response_id = pick.response_id;
         self.dispatched_at = Some(Instant::now());
 
+        // Remembered for the terminal abort: a provider failure ends
+        // as a synthesized 5xx wherever it surfaces — here, in the
+        // host's validation, or at the dial.
+        self.provider = matches!(pick.destination, Some(Destination::Provider(_)));
         let target = pick_target(pick.destination, cx)?;
 
         tracing::debug!(target: LOG,
@@ -469,15 +479,29 @@ impl Extension for BllmpSelector {
                 itl_bucket_counts: counts,
             }));
         } else {
+            use proto::abort_request::Reason;
+            // Only a 5xx the gateway synthesized blames the provider;
+            // a non-5xx ending (a body limit, an idle client) is not
+            // the backend's fault and must not poison the picker's
+            // view of it.
+            let (reason, detail) = if self.provider && end.status.is_server_error() {
+                (
+                    Reason::BackendUnresolved,
+                    format!("dispatch failed; the client was answered {}", end.status),
+                )
+            } else {
+                (Reason::NotDispatched, String::new())
+            };
             tracing::debug!(target: LOG,
                 response_id,
                 complete = end.complete,
-                "bllmp: aborting undispatched pick"
+                ?reason,
+                "bllmp: aborting pick"
             );
             self.reporter.send(Report::Abort(AbortRequest {
                 response_id,
-                reason: proto::abort_request::Reason::NotDispatched as i32,
-                detail: String::new(),
+                reason: reason as i32,
+                detail,
                 client_request_id: self.client_request_id.clone(),
             }));
         }
@@ -524,8 +548,21 @@ fn pick_target(
                 addr,
             })
         }
-        Some(Destination::Provider(_)) => {
-            Err("picker chose a provider backend; provider dispatch is not wired".into())
+        Some(Destination::Provider(provider)) => {
+            let backend_ref = provider
+                .backend_ref
+                .ok_or("provider pick without a backend_ref")?;
+            // The key a provider backend is registered under:
+            // `namespace/name` from the control plane, a bare name in
+            // a flat static config, which has no namespaces. Whether
+            // the rule lists that key, and lists it as dialable, is
+            // the host's check, made on every selection.
+            let name = if backend_ref.namespace.is_empty() {
+                backend_ref.name
+            } else {
+                format!("{}/{}", backend_ref.namespace, backend_ref.name)
+            };
+            Ok(Target::Backend { name })
         }
         None => Err("picker returned OK without a destination".into()),
     }
@@ -680,6 +717,7 @@ qos: Batch
             dispatched_at: None,
             upstream_status: 0,
             ttft_reported: false,
+            provider: false,
             itl: usage::Itl::default(),
             capture: usage::Capture::default(),
         }
@@ -739,5 +777,114 @@ qos: Batch
         }
         let err = outcome.expect_err("a full push channel must not block forever");
         assert!(err.to_string().contains("stalled"), "{err}");
+    }
+
+    // ---- pick_target: provider destinations ----
+
+    fn provider_pick(ns: &str, name: &str) -> proto::pick_response::Destination {
+        proto::pick_response::Destination::Provider(proto::ProviderTarget {
+            backend_ref: Some(proto::BackendRef {
+                namespace: ns.into(),
+                name: name.into(),
+            }),
+        })
+    }
+
+    /// The key joins the way the control plane registers a provider
+    /// backend. Whether the rule lists it, and lists it as dialable,
+    /// is the host's check, not mapped here.
+    #[test]
+    fn provider_pick_joins_a_namespaced_ref() {
+        let target = pick_target(Some(provider_pick("prod", "openai")), &Cx::new()).expect("maps");
+        assert!(matches!(target, Target::Backend { name } if name == "prod/openai"));
+    }
+
+    #[test]
+    fn provider_pick_keeps_a_flat_ref_bare() {
+        let target = pick_target(Some(provider_pick("", "openai")), &Cx::new()).expect("maps");
+        assert!(matches!(target, Target::Backend { name } if name == "openai"));
+    }
+
+    #[test]
+    fn provider_pick_without_a_ref_fails() {
+        let destination = Some(proto::pick_response::Destination::Provider(
+            proto::ProviderTarget { backend_ref: None },
+        ));
+        assert!(pick_target(destination, &Cx::new()).is_err());
+    }
+
+    // ---- the terminal abort's reason ----
+
+    /// A reporter whose queue the test holds the other end of.
+    fn capturing_reporter() -> (Reporter, mpsc::Receiver<Report>) {
+        let (tx, rx) = mpsc::channel(8);
+        (Reporter { tx }, rx)
+    }
+
+    fn ended(status: StatusCode, upstream: bool) -> ResponseEnd {
+        ResponseEnd {
+            status,
+            body_bytes: 0,
+            complete: false,
+            upstream,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_armed_provider_abort_reports_backend_unresolved() {
+        let (reporter, mut rx) = capturing_reporter();
+        let mut ext = selector_for("127.0.0.1:1", None);
+        ext.reporter = reporter;
+        ext.response_id = 7;
+        ext.provider = true;
+        ext.on_response_end(&ended(StatusCode::BAD_GATEWAY, false), &mut Cx::new());
+        let Some(Report::Abort(abort)) = rx.try_recv().ok() else {
+            panic!("expected an abort");
+        };
+        assert_eq!(abort.response_id, 7);
+        assert_eq!(
+            abort.reason,
+            proto::abort_request::Reason::BackendUnresolved as i32
+        );
+        assert!(abort.detail.contains("502"), "{}", abort.detail);
+    }
+
+    /// A non-5xx ending is not the provider's fault: an armed reason
+    /// must not fire for a body limit or an idle client.
+    #[tokio::test]
+    async fn a_client_side_ending_does_not_blame_the_provider() {
+        let (reporter, mut rx) = capturing_reporter();
+        let mut ext = selector_for("127.0.0.1:1", None);
+        ext.reporter = reporter;
+        ext.response_id = 7;
+        ext.provider = true;
+        ext.on_response_end(&ended(StatusCode::PAYLOAD_TOO_LARGE, false), &mut Cx::new());
+        let Some(Report::Abort(abort)) = rx.try_recv().ok() else {
+            panic!("expected an abort");
+        };
+        assert_eq!(
+            abort.reason,
+            proto::abort_request::Reason::NotDispatched as i32
+        );
+        assert!(abort.detail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_local_pick_aborts_not_dispatched() {
+        let (reporter, mut rx) = capturing_reporter();
+        let mut ext = selector_for("127.0.0.1:1", None);
+        ext.reporter = reporter;
+        ext.response_id = 7;
+        ext.on_response_end(
+            &ended(StatusCode::INTERNAL_SERVER_ERROR, false),
+            &mut Cx::new(),
+        );
+        let Some(Report::Abort(abort)) = rx.try_recv().ok() else {
+            panic!("expected an abort");
+        };
+        assert_eq!(
+            abort.reason,
+            proto::abort_request::Reason::NotDispatched as i32
+        );
     }
 }
