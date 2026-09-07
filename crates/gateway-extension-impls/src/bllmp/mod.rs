@@ -11,7 +11,7 @@ mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gateway_config::extension::{ConfigValue, from_value};
@@ -43,6 +43,43 @@ const LOG: &str = "extension::bllmp_selector";
 /// Protocol cap: one oversized chunk fails the whole push.
 const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 const PUSH_CHANNEL_CAPACITY: usize = 4;
+
+// Deadlines. The streaming calls — PushBody while the body flows,
+// PullBody once it streams — get none: they last as long as the body
+// they carry, and a dead peer mid-stream is caught by h2 keepalive
+// on the channel instead. Everything a request waits on point-wise
+// is bounded below.
+
+/// TCP connect bound for the picker channel.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Keepalive ping cadence on the picker channel, and how long a ping
+/// may go unanswered before the connection is condemned.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for each call a request waits on: the `PushBody` tail
+/// after the body is fully sent, Pick, and opening the `PullBody`
+/// stream. Short in tests, where the deadline firing IS the test.
+#[cfg(not(test))]
+const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RPC_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Deadline for one report rpc; reports are best-effort and nothing
+/// waits on them.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle bound on handing one body chunk to the picker. Backpressure
+/// from a picker reading slowly is deliberate; a picker that stopped
+/// reading altogether is not, and without this it would hold the
+/// request forever.
+#[cfg(not(test))]
+const BODY_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const BODY_SEND_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Reports queued behind a slow picker before new ones are dropped.
+const REPORT_QUEUE_CAPACITY: usize = 256;
 
 /// The object's opaque config.
 #[derive(Deserialize)]
@@ -108,7 +145,11 @@ impl ExtensionClass for BllmpSelectorClass {
             .transpose()
             .map_err(|e| format!("`tenantHeader` is not a valid header name: {e}"))?;
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", cfg.service))
-            .map_err(|e| format!("`service` is not a valid gRPC target: {e}"))?;
+            .map_err(|e| format!("`service` is not a valid gRPC target: {e}"))?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true);
         // One channel per configured object: every call for a
         // request must reach the same picker instance.
         let client = PickerClient::new(endpoint.connect_lazy());
@@ -247,16 +288,21 @@ impl Extension for BllmpSelector {
         let mut rest = chunk;
         while !rest.is_empty() {
             let piece = rest.split_to(rest.len().min(MAX_CHUNK_BYTES));
-            // Awaited send: picker backpressure reaches the client.
-            if push.tx.send(BodyChunk { chunk: piece }).await.is_err() {
-                return Err("picker closed the body stream".into());
+            // Awaited send: picker backpressure reaches the client,
+            // bounded so a picker that stopped reading does not hold
+            // the request forever.
+            let send = push.tx.send(BodyChunk { chunk: piece });
+            match tokio::time::timeout(BODY_SEND_TIMEOUT, send).await {
+                Err(_) => return Err("picker stalled pulling the request body".into()),
+                Ok(Err(_)) => return Err("picker closed the body stream".into()),
+                Ok(Ok(())) => {}
             }
         }
         Ok(gateway_extension::Action::Continue)
     }
 
     async fn select(&mut self, _held: Held<'_>, cx: &mut Cx) -> Result<Selected, Error> {
-        use proto::pick_response::{Destination, Outcome};
+        use proto::pick_response::Outcome;
 
         let push = self
             .push
@@ -264,28 +310,33 @@ impl Extension for BllmpSelector {
             .ok_or("select without a pushed request body")?;
         // The half-close that marks the body complete.
         drop(push.tx);
-        let pushed = push
-            .task
-            .await
-            .map_err(|e| format!("push task failed: {e}"))?
-            .map_err(|s| format!("PushBody failed: {s}"))?;
+        let mut task = push.task;
+        let pushed = match tokio::time::timeout(RPC_TIMEOUT, &mut task).await {
+            Err(_) => {
+                task.abort();
+                return Err("PushBody timed out".into());
+            }
+            Ok(joined) => joined
+                .map_err(|e| format!("push task failed: {e}"))?
+                .map_err(|s| format!("PushBody failed: {s}"))?,
+        };
         tracing::debug!(target: LOG,
             stream_id = pushed.stream_id,
             bytes = pushed.total_bytes,
             "bllmp: body pushed"
         );
 
-        let pick = self
-            .client
-            .clone()
-            .pick(PickRequest {
-                body_stream_id: pushed.stream_id,
-                client_request_id: self.client_request_id.clone(),
-                inference_pool: self.prepared.pool.clone(),
-                qos_class: self.prepared.qos,
-                tenant: self.tenant.clone(),
-            })
+        let mut client = self.client.clone();
+        let pick = client.pick(PickRequest {
+            body_stream_id: pushed.stream_id,
+            client_request_id: self.client_request_id.clone(),
+            inference_pool: self.prepared.pool.clone(),
+            qos_class: self.prepared.qos,
+            tenant: self.tenant.clone(),
+        });
+        let pick = tokio::time::timeout(RPC_TIMEOUT, pick)
             .await
+            .map_err(|_| "Pick timed out")?
             .map_err(|s| format!("Pick failed: {s}"))?
             .into_inner();
 
@@ -309,35 +360,7 @@ impl Extension for BllmpSelector {
         self.response_id = pick.response_id;
         self.dispatched_at = Some(Instant::now());
 
-        let target = match pick.destination {
-            Some(Destination::Local(local)) => {
-                let addr: SocketAddr = local.endpoint.parse().map_err(|_| {
-                    format!("picker endpoint `{}` is not host:port", local.endpoint)
-                })?;
-                let backend = cx
-                    .targets()
-                    .backends()
-                    .iter()
-                    .find(|tb| {
-                        tb.endpoints()
-                            .iter()
-                            .any(|e| e.address == addr.ip() && e.port == addr.port())
-                    })
-                    .ok_or_else(|| {
-                        format!("picker chose {addr}, which no backendRef of the rule lists")
-                    })?;
-                Target::Endpoint {
-                    backend: backend.name().to_owned(),
-                    addr,
-                }
-            }
-            Some(Destination::Provider(_)) => {
-                return Err(
-                    "picker chose a provider backend; provider dispatch is not wired".into(),
-                );
-            }
-            None => return Err("picker returned OK without a destination".into()),
-        };
+        let target = pick_target(pick.destination, cx)?;
 
         tracing::debug!(target: LOG,
             response_id = pick.response_id,
@@ -345,13 +368,15 @@ impl Extension for BllmpSelector {
             body_total_bytes = pick.body_total_bytes,
             "bllmp: dispatching pick"
         );
-        let pull = self
-            .client
-            .clone()
-            .pull_body(PullBodyRequest {
-                response_id: pick.response_id,
-            })
+        // Bounded while opening the stream; the stream itself lasts
+        // as long as the body it carries.
+        let mut client = self.client.clone();
+        let pull = client.pull_body(PullBodyRequest {
+            response_id: pick.response_id,
+        });
+        let pull = tokio::time::timeout(RPC_TIMEOUT, pull)
             .await
+            .map_err(|_| "PullBody timed out")?
             .map_err(|s| format!("PullBody failed: {s}"))?
             .into_inner();
         let frames = pull.map(|item| match item {
@@ -463,6 +488,44 @@ impl Drop for BllmpSelector {
     }
 }
 
+/// The dispatch target a pick's destination names, validated against
+/// the rule's backendRefs.
+fn pick_target(
+    destination: Option<proto::pick_response::Destination>,
+    cx: &Cx,
+) -> Result<Target, Error> {
+    use proto::pick_response::Destination;
+
+    match destination {
+        Some(Destination::Local(local)) => {
+            let addr: SocketAddr = local
+                .endpoint
+                .parse()
+                .map_err(|_| format!("picker endpoint `{}` is not host:port", local.endpoint))?;
+            let backend = cx
+                .targets()
+                .backends()
+                .iter()
+                .find(|tb| {
+                    tb.endpoints()
+                        .iter()
+                        .any(|e| e.address == addr.ip() && e.port == addr.port())
+                })
+                .ok_or_else(|| {
+                    format!("picker chose {addr}, which no backendRef of the rule lists")
+                })?;
+            Ok(Target::Endpoint {
+                backend: backend.name().to_owned(),
+                addr,
+            })
+        }
+        Some(Destination::Provider(_)) => {
+            Err("picker chose a provider backend; provider dispatch is not wired".into())
+        }
+        None => Err("picker returned OK without a destination".into()),
+    }
+}
+
 fn clamp_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -483,25 +546,31 @@ enum Report {
 }
 
 /// Fire-and-forget report delivery; the client's stream never waits
-/// on a report rpc.
+/// on a report rpc. The queue is bounded and each rpc has a deadline,
+/// so a picker that stopped answering costs dropped reports, not
+/// memory.
 #[derive(Clone)]
 struct Reporter {
-    tx: mpsc::UnboundedSender<Report>,
+    tx: mpsc::Sender<Report>,
 }
 
 impl Reporter {
     fn spawn(client: PickerClient<Channel>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(REPORT_QUEUE_CAPACITY);
         tokio::spawn(async move {
             while let Some(report) = rx.recv().await {
                 let mut client = client.clone();
-                let result = match report {
-                    Report::First(r) => client.report_first_token(r).await.map(|_| ()),
-                    Report::Final(r) => client.report_final_token(r).await.map(|_| ()),
-                    Report::Abort(r) => client.abort(r).await.map(|_| ()),
+                let call = async {
+                    match report {
+                        Report::First(r) => client.report_first_token(r).await.map(|_| ()),
+                        Report::Final(r) => client.report_final_token(r).await.map(|_| ()),
+                        Report::Abort(r) => client.abort(r).await.map(|_| ()),
+                    }
                 };
-                if let Err(status) = result {
-                    tracing::debug!(target: LOG, %status, "bllmp report failed");
+                match tokio::time::timeout(REPORT_TIMEOUT, call).await {
+                    Err(_) => tracing::debug!(target: LOG, "bllmp report timed out"),
+                    Ok(Err(status)) => tracing::debug!(target: LOG, %status, "bllmp report failed"),
+                    Ok(Ok(())) => {}
                 }
             }
         });
@@ -509,7 +578,9 @@ impl Reporter {
     }
 
     fn send(&self, report: Report) {
-        let _ = self.tx.send(report);
+        if self.tx.try_send(report).is_err() {
+            tracing::debug!(target: LOG, "bllmp report dropped: queue full");
+        }
     }
 }
 
@@ -556,5 +627,107 @@ qos: Batch
     #[test]
     fn config_requires_service() {
         assert!(parse("pool: { namespace: n, name: p }").is_err());
+    }
+
+    /// A picker that accepts TCP and never speaks: the connection
+    /// never finishes its handshake, so every rpc against it hangs
+    /// until a deadline says otherwise.
+    async fn silent_picker() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                held.push(sock);
+            }
+        });
+        addr.to_string()
+    }
+
+    fn selector_for(service: &str) -> Box<dyn Extension> {
+        let config: ConfigValue = serde_yaml::from_str(&format!("service: {service}")).unwrap();
+        BllmpSelectorClass
+            .configure(&config)
+            .expect("valid config")
+            .build()
+    }
+
+    fn request_parts() -> http::request::Parts {
+        http::Request::builder()
+            .uri("/v1/chat")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    #[tokio::test]
+    async fn a_silent_picker_fails_select_within_its_deadline() {
+        let service = silent_picker().await;
+        let mut ext = selector_for(&service);
+        let mut cx = Cx::new();
+        let mut parts = request_parts();
+        ext.on_request_start(&mut parts, &mut cx).await.unwrap();
+
+        let selected =
+            tokio::time::timeout(Duration::from_secs(5), ext.select(Held::Nothing, &mut cx))
+                .await
+                .expect("select must fail by deadline, not hang");
+        let Err(err) = selected else {
+            panic!("a silent picker cannot answer");
+        };
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// The send timeout in isolation: a push channel whose receiver
+    /// is alive but never read fills up, and the next send must time
+    /// out rather than hold the request. (Through the real gRPC
+    /// stack the encoder buffers an unspecified amount ahead of the
+    /// channel, so the stall is staged here directly.)
+    #[tokio::test]
+    async fn a_picker_that_stops_reading_fails_the_body_send() {
+        let (tx, _rx) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
+        let task = tokio::spawn(async {
+            std::future::pending::<Result<PushBodyResponse, tonic::Status>>().await
+        });
+        let endpoint =
+            tonic::transport::Endpoint::from_shared("http://127.0.0.1:1".to_owned()).unwrap();
+        let client = PickerClient::new(endpoint.connect_lazy());
+        let mut ext = BllmpSelector {
+            client: client.clone(),
+            reporter: Reporter::spawn(client),
+            prepared: Arc::new(Prepared {
+                pool: None,
+                tenant_header: None,
+                qos: 0,
+            }),
+            push: Some(Push { tx, task }),
+            tenant: String::new(),
+            client_request_id: String::new(),
+            response_id: 0,
+            dispatched_at: None,
+            upstream_status: 0,
+            ttft_reported: false,
+            itl: usage::Itl::default(),
+            capture: usage::Capture::default(),
+        };
+
+        let mut cx = Cx::new();
+        let chunk = Bytes::from_static(b"{}");
+        let mut outcome = Ok(());
+        for _ in 0..=PUSH_CHANNEL_CAPACITY {
+            outcome = ext
+                .on_request_body(chunk.clone(), false, &mut cx)
+                .await
+                .map(|_| ());
+            if outcome.is_err() {
+                break;
+            }
+        }
+        let err = outcome.expect_err("a full push channel must not block forever");
+        assert!(err.to_string().contains("stalled"), "{err}");
     }
 }
