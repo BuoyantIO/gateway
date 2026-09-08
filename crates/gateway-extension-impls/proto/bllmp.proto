@@ -1,0 +1,369 @@
+syntax = "proto3";
+
+package bllmp.v1;
+
+/*
+Buoyant LLM Picker (bllmp) — router for inference requests.
+
+Given an inference request, Bllmp picks a model and a destination to best serve
+it, which can be a local inference engine pod or an off-cluster provider.  Bllmp
+rewrites the body to fit into the shape of the endpoint.
+
+Nothing here requires the caller to buffer the body: stream it in as it arrives,
+and stream it back out to forward upstream.
+
+Per-request flow:
+
+1. PushBody()         stream the body in, one BodyChunk per chunk, then
+                      half-close. Returns a stream_id.
+2. Pick()             make the routing decision for that stream_id. Dispatch to
+                      the returned destination promptly; delay degrades routing
+                      quality.
+3. PullBody()         stream the body back out. It may have been modified, but
+                      is always complete.
+4. ReportFirstToken() at the first response byte, with observed TTFT.
+5. ReportFinalToken() after the response completes, with the served model, token
+                      counts, and inter-token latency.
+6. Abort()            if the request dies after Pick() and will never dispatch.
+
+Body streaming has no sequence numbers, offsets, or resumption: ordering and
+completeness are properties of the underlying HTTP/2 stream. A clean half-close
+means the body is complete; a reset stream means it is not, and its bytes are
+discarded.
+
+Error model:
+
+Pick() reports routing outcomes in PickResponse.outcome and reserves gRPC status
+for transport and protocol failures. PushBody(), PullBody() and Abort() report
+failures as gRPC status directly:
+
+  NOT_FOUND (5)           unknown, expired, or already-released body
+  FAILED_PRECONDITION (9) Pick named a stream_id an earlier Pick consumed
+  RESOURCE_EXHAUSTED (8)  per-request or server-wide buffer budget exceeded, or
+                          a single chunk over the per-message decode limit
+  DEADLINE_EXCEEDED (4)   PushBody idle longer than the inter-chunk budget
+  INVALID_ARGUMENT (3)    malformed request; Pick with body_stream_id = 0; a
+                          PushBody whose byte count disagrees with its
+                          `bllmp-declared-length`
+
+Conformance:
+
+See the body push/pull conformance section at the end.
+*/
+
+service Picker {
+  rpc PushBody(stream BodyChunk) returns (PushBodyResponse);
+
+  rpc Pick(PickRequest) returns (PickResponse);
+  rpc PullBody(PullBodyRequest) returns (stream BodyChunk);
+
+  rpc ReportFirstToken(ReportFirstTokenRequest) returns (ReportFirstTokenResponse);
+  rpc ReportFinalToken(ReportFinalTokenRequest) returns (ReportFinalTokenResponse);
+
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+/*
+One slice of a request body, in either direction.
+
+A single field numbered 1, so a host framing these itself as
+`tag || varint(len) || bytes` keeps the tag to one byte (0x0A). Do not add
+fields; per-request metadata travels in gRPC call metadata instead.
+*/
+message BodyChunk {
+  bytes chunk = 1;
+}
+
+/*
+Reply to a completed PushBody stream. Two gRPC metadata headers are set on the
+PushBody call:
+- bllmp-client-request-id: Matches PickRequest.client_request_id.
+- bllmp-declared-length: The client's Content-Length when known. Absent for a
+  chunked upload.
+*/
+
+message PushBodyResponse {
+  uint64 stream_id = 1;
+  // Total bytes received. May differ from PickResponse.body_total_bytes, which
+  // counts the body handed back after any rewrite.
+  uint64 total_bytes = 2;
+}
+
+message PullBodyRequest {
+  uint64 response_id = 1;
+}
+
+message InferencePoolRef {
+  string namespace = 1;
+  string name = 2;
+  string resource_version = 3;
+}
+
+message PickRequest {
+  uint64 body_stream_id = 1;
+
+  // Optional request identifier. Used only for logging.
+  string client_request_id = 2;
+
+  // The pool this request was routed to, when the route's backendRef named one.
+  // Absent means "no pool named".
+  InferencePoolRef inference_pool = 3;
+
+  enum QosClass {
+    INTERACTIVE = 0;
+    BATCH = 1;
+    DEFERRABLE = 2;
+  }
+  QosClass qos_class = 4;
+
+  string tenant = 5;
+}
+
+message PickResponse {
+  enum Outcome {
+    UNSPECIFIED = 0;
+    OK = 1;
+    NO_WORKERS = 2; // No ready worker serves this model
+    DEGRADED = 3; // Choice made, but without a full prefix-cache signal
+    BAD_REQUEST = 4; // Body could not be parsed as an inference request
+    POLICY_REJECTED = 5;
+  }
+  Outcome outcome = 1;
+
+  oneof destination {
+    LocalTarget local = 2;
+    ProviderTarget provider = 7;
+  }
+
+  uint64 response_id = 3;
+  string reason = 4;
+
+  uint64 body_total_bytes = 5;
+  string requested_model = 6;
+}
+
+message LocalTarget {
+  string endpoint = 1;
+}
+
+message BackendRef {
+  string namespace = 1;
+  string name = 2;
+}
+
+message ProviderTarget {
+  BackendRef backend_ref = 1;
+}
+
+message ReportFirstTokenRequest {
+  uint64 response_id = 1;
+  uint32 observed_ttft_ms = 2;
+  int32 upstream_status = 3;
+}
+
+message ReportFirstTokenResponse {
+  bool acknowledged = 1;
+}
+
+message ReportFinalTokenRequest {
+  uint64 response_id = 1;
+  string model = 2;
+  uint32 prompt_tokens = 3;
+  uint32 completion_tokens = 4;
+  optional uint32 cached_tokens = 5; // not always reported
+
+  /*
+  Per-bucket counts of inter-token ARRIVAL gaps in milliseconds, index-aligned
+  to the layout named by `itl_bucket_layout`. Empty when the response produced
+  fewer than two chunks, leaving no gap to record.
+
+  Raw per-bucket counts rather than percentiles, because counts compose across
+  requests and percentiles do not.
+
+  Layout 1: 15 upper-inclusive buckets. A gap goes in the first bucket whose
+  upper edge is >= it; anything past the last edge lands in the overflow
+  bucket.
+
+    [ 0] [0, 5]        [ 5] (30, 40]      [10] (150, 200]
+    [ 1] (5, 10]       [ 6] (40, 50]      [11] (200, 300]
+    [ 2] (10, 15]      [ 7] (50, 75]      [12] (300, 500]
+    [ 3] (15, 20]      [ 8] (75, 100]     [13] (500, 1000]
+    [ 4] (20, 30]      [ 9] (100, 150]    [14] (1000, +inf)
+  */
+
+  repeated uint32 itl_bucket_counts = 6;
+  uint32 itl_bucket_layout = 7;
+}
+
+message ReportFinalTokenResponse {
+  bool acknowledged = 1;
+}
+
+message AbortRequest {
+  uint64 response_id = 1;
+
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    NOT_DISPATCHED = 1;
+    PULL_FAILED = 2;
+    BACKEND_UNRESOLVED = 3;
+    BACKEND_UNAUTHORIZED = 4;
+  }
+  Reason reason = 2;
+  string detail = 3;
+  string client_request_id = 4;
+}
+
+message AbortResponse {
+  bool released = 1;
+}
+
+/*
+Validate a Kubernetes bearer token.
+
+Treat the token as a credential: do not log it, do not put it in an error
+message, and do not include it in a trace attribute.
+
+Results may be cached, keyed on (token, audiences), with a TTL short enough
+that a revoked token stops working promptly. A cached negative is as useful as
+a cached positive.
+*/
+
+service TokenReview {
+  rpc ReviewToken(ReviewTokenRequest) returns (ReviewTokenResponse);
+}
+
+message ReviewTokenRequest {
+  string token = 1;
+  repeated string audiences = 2;
+}
+
+message ReviewTokenResponse {
+  bool authenticated = 1;
+  string username = 2;
+}
+
+/*
+Token-based rate limiting: reserve then reconcile.
+
+Conformance
+
+A `limit` of 0 means no window is enforced, so `remaining` carries no
+information. Omit rate-limit headers entirely in that case rather than
+reporting a budget of zero, which reads as throttled when it means the
+opposite.
+*/
+service RateLimiter {
+  rpc Reserve(ReserveRequest) returns (ReserveResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+}
+
+message ReserveRequest {
+  string tenant_id = 1;
+  int64 max_tokens = 2;
+}
+
+message ReserveResponse {
+  bool allowed = 1;
+  int64 request_id = 2;
+  int64 retry_after_ms = 3;
+  int64 limit = 4;
+  int64 remaining = 5;
+  int64 window_ms = 6;
+  DenialReason reason = 7;
+}
+
+enum DenialReason {
+  DENIAL_REASON_UNSPECIFIED = 0;
+  DENIAL_REASON_OVER_BUDGET = 1;
+  DENIAL_REASON_EXCEEDS_LIMIT = 2;
+}
+
+message CommitRequest {
+  int64 request_id = 1;
+  int64 actual_tokens = 2;
+}
+
+message CommitResponse {
+  CommitStatus status = 1;
+}
+
+enum CommitStatus {
+  COMMIT_STATUS_UNSPECIFIED = 0;
+  COMMIT_STATUS_OK = 1;
+  COMMIT_STATUS_NOT_FOUND = 2;
+}
+
+/*
+Body push/pull conformance check
+
+Clients MUST:
+
+- Complete a PushBody stream (clean half-close) before naming its stream_id in
+  Pick().
+- Treat a reset PushBody or PullBody stream as a failed request, and not reopen
+  or resume it. There is no resumption protocol.
+- Send `bllmp-declared-length` on PushBody when the length is known.
+- Keep chunks at 1 MiB or less. Boundaries carry no meaning, and one oversized
+  chunk fails the push with RESOURCE_EXHAUSTED even when the whole body is
+  within budget.
+- Treat PullBody as single-shot. A second PullBody for the same response_id
+  returns NOT_FOUND.
+- Send PickRequest.tenant on every Pick, using "" only when no tenant could be
+  determined. It has no presence bit, so "" is the only way to say "unknown" and
+  a server cannot tell it from a caller that forgot the field.
+- Send every call for one request to the SAME instance. stream_id and
+  response_id name process-local state, so a Pick sent elsewhere than its
+  PushBody returns NOT_FOUND. One long-lived connection per caller satisfies
+  this: gRPC runs over HTTP/2, and a Kubernetes Service balances connections
+  rather than requests. An instance dying mid-request surfaces as a connection
+  failure, and retrying starts over with a fresh PushBody elsewhere.
+
+Callers MAY do any of the following, and servers MUST tolerate them:
+
+- Take arbitrarily long over a PushBody stream. Its lifetime is the end client's
+  upload — minutes, for a large body over a slow link.
+- Consume a PullBody stream arbitrarily slowly, or stop entirely. Its pace is
+  set by the upstream inference server; slow consumption is backpressure.
+- Abandon a request at any point with no notice, including before Pick, between
+  Pick and PullBody, or mid-PullBody. Abort() is not always available: a proxy
+  whose own client disconnects mid-upload may have no hook to call it from, and
+  a failed PushBody leaves no stream_id to name.
+- Never call PullBody, ReportFirstToken, or ReportFinalToken for a given Pick.
+- Call Abort zero, one, or several times, including for an already-released id.
+- Keep many requests in flight over one connection, in any interleaving. There
+  is no ordering between distinct requests.
+- Omit PickRequest.inference_pool. A caller routing by Service or static address
+  has no pool to name and MUST NOT be required to invent one; servers treat it
+  as "pick across everything I serve".
+
+Callers handed a PickResponse.provider MUST:
+
+- Resolve ProviderTarget.backend_ref themselves. The server does not read
+  GatewayBackends and holds no credential; base URL, auth and TLS are the
+  caller's to apply.
+- Report a destination the server cannot see for itself, via Abort with
+  BACKEND_UNRESOLVED or BACKEND_UNAUTHORIZED. Without it a broken backend_ref or
+  a wrong Secret key is a silent black hole: the server keeps choosing that
+  provider, and every resource it can read looks healthy. This is the one place
+  the caller knows something the server structurally cannot.
+
+Servers MUST:
+
+- Discard the bytes of a reset PushBody stream. Only a clean half-close means
+  the body is complete, and a partial body MUST NOT be picked on.
+- Reject a PushBody whose byte count disagrees with its declared length, when
+  the caller sent one. A clean half-close proves the caller stopped, not that it
+  sent everything.
+- Reclaim buffered bodies by TTL, on their own initiative. Abort() shortens that
+  window; it is not what guarantees release.
+- Stream exactly PickResponse.body_total_bytes bytes from PullBody. Callers are
+  entitled to enforce this and fail the request on a mismatch.
+- Never assign 0 as a stream_id or response_id. 0 means "no id".
+- Treat an empty tenant as the value "" — a tenant that matches a rule naming
+  the empty string and nothing else. It MUST NOT match a rule written for a
+  named tenant, and MUST NOT be treated as matching every rule.
+- Honor `grpc-accept-encoding` if they compress responses at all. A caller
+  advertising only `identity` may be unable to decompress one.
+*/
+
