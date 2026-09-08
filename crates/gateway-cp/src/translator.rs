@@ -57,6 +57,7 @@ pub struct K8sState {
     pub secrets: Vec<Secret>,
     pub extensions: Vec<crd::Extension>,
     pub gateway_backends: Vec<crd::GatewayBackend>,
+    pub backend_bindings: Vec<crd::BackendBinding>,
 }
 
 /// Build per-Gateway snapshots from a static K8s state: resolve the
@@ -1380,6 +1381,7 @@ mod tests {
     fn duplicate_hostname_on_shared_port_first_wins() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1449,6 +1451,7 @@ mod tests {
     fn route_without_section_fans_out_across_listeners_on_port() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1500,6 +1503,7 @@ mod tests {
     fn route_with_section_name_only_under_named_listener() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1550,6 +1554,7 @@ mod tests {
     fn route_appears_in_each_parent_slice() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![
                 gw("demo", "gw1", "zd", vec![http_listener("http", 80, None)]),
@@ -1584,6 +1589,7 @@ mod tests {
     fn multiple_rules_yield_multiple_routes_in_one_slice() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1615,6 +1621,7 @@ mod tests {
     fn cross_namespace_backendref_is_dropped() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1666,6 +1673,7 @@ mod tests {
     fn headless_service_produces_no_backend() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1695,6 +1703,7 @@ mod tests {
         // will stash the route until the backend appears.
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1770,6 +1779,7 @@ mod tests {
     fn per_pod_state(endpoint_slices: Vec<EndpointSlice>) -> K8sState {
         K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1853,6 +1863,7 @@ mod tests {
     fn core_filters_synthesize_extension_objects() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -1984,6 +1995,7 @@ mod tests {
         // order, and only the core filters synthesize objects.
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2032,6 +2044,7 @@ mod tests {
         // but one synthesized object.
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2091,6 +2104,7 @@ mod tests {
         };
         let state = |value: &str| K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2225,6 +2239,7 @@ mod tests {
         // Expect: one HttpRouteUpsert with 2 HttpMatches (one per host).
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2264,6 +2279,7 @@ mod tests {
         // Gateway's Bind + Listener still come from the Gateway pass).
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2297,6 +2313,7 @@ mod tests {
         // Expect: one HttpMatch with host = a.example.com.
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2329,6 +2346,7 @@ mod tests {
         // for the resolver to wildcard-match at request time.
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2362,6 +2380,7 @@ mod tests {
     fn exact_path_match_translates_to_exact_kind() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2412,6 +2431,7 @@ mod tests {
         let pattern = r"^/api/v\d+$";
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2525,6 +2545,7 @@ mod tests {
     fn single_route_state(m: HttpRouteRulesMatches) -> K8sState {
         K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -2660,6 +2681,7 @@ mod tests {
     fn translate_app_protocol(app_protocol: Option<&str>, port: i32) -> pb::BackendProtocol {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -3000,6 +3022,7 @@ mod tests {
         // protocol falls back to HTTP/1.1.
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -3082,6 +3105,7 @@ mod tests {
             secrets,
             extensions: vec![],
             gateway_backends: backends,
+            backend_bindings: vec![],
         }
     }
 
@@ -3449,6 +3473,7 @@ mod tests {
         r.matches = None;
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -3520,6 +3545,7 @@ mod tests {
     fn extension_ref_translates_and_emits_the_object() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -3576,6 +3602,7 @@ mod tests {
     fn missing_extension_object_keeps_the_ref_and_emits_nothing() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",
@@ -3613,6 +3640,7 @@ mod tests {
     fn foreign_extension_ref_is_dropped() {
         let state = K8sState {
             gateway_backends: vec![],
+            backend_bindings: vec![],
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(
                 "demo",

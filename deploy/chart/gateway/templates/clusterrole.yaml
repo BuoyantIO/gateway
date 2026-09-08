@@ -19,13 +19,14 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
-  # Extension objects routes reference by extensionRef, and
-  # GatewayBackend objects they reference by backendRef.
+  # Extension objects routes reference by extensionRef, GatewayBackend
+  # objects they reference by backendRef, and BackendBinding objects
+  # that answer for backendRefs of foreign kinds.
   - apiGroups: ["gateway.linkerd.io"]
-    resources: ["extensions", "gatewaybackends"]
+    resources: ["extensions", "gatewaybackends", "backendbindings"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.linkerd.io"]
-    resources: ["gatewaybackends/status"]
+    resources: ["gatewaybackends/status", "backendbindings/status"]
     verbs: ["get", "patch", "update"]
   # Per-pod backend endpoints.
   - apiGroups: ["discovery.k8s.io"]

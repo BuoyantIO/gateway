@@ -71,8 +71,8 @@ Dependencies point in one direction, `gateway-config` and
 
 ### Config path (CP to DP)
 
-`watch.rs` runs six kube reflectors and drives one pass per relevant
-event. A pass is `resolve` then `translate` then `publish` then
+`watch.rs` runs one kube reflector per watched kind and drives one
+pass per relevant event. A pass is `resolve` then `translate` then `publish` then
 status then infra:
 
 - `resolve.rs` makes every accept/reject decision exactly once

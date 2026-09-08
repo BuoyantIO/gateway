@@ -30,10 +30,10 @@ use tokio::sync::watch;
 use tokio::time::sleep;
 
 use super::build::{
-    StatusWork, reconcile_gateway_backend_status, reconcile_gateway_class_status,
-    reconcile_gateway_status,
+    StatusWork, reconcile_backend_binding_status, reconcile_gateway_backend_status,
+    reconcile_gateway_class_status, reconcile_gateway_status,
 };
-use crate::crd::GatewayBackend;
+use crate::crd::{BackendBinding, GatewayBackend};
 
 const RETRY_INITIAL: Duration = Duration::from_millis(500);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -137,6 +137,25 @@ async fn write_all(client: &Client, work: &StatusWork) -> Result<(), kube::Error
         .await;
         if let Err(e) = result {
             tracing::warn!(error = %e, kind = "GatewayBackend", namespace,
+                name = observed.name_any(),
+                "status write failed; continuing with the rest");
+            first_err.get_or_insert(e);
+        }
+    }
+
+    for (observed, desired) in &work.backend_bindings {
+        let namespace = observed.namespace().unwrap_or_default();
+        let api: Api<BackendBinding> = Api::namespaced(client.clone(), &namespace);
+        let result = write_object(
+            &api,
+            observed,
+            desired.clone(),
+            |bb| &mut bb.status,
+            reconcile_backend_binding_status,
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, kind = "BackendBinding", namespace,
                 name = observed.name_any(),
                 "status write failed; continuing with the rest");
             first_err.get_or_insert(e);
@@ -336,6 +355,7 @@ mod tests {
                 (changed, gw_status("True", &t(200))),
             ],
             gateway_backends: vec![],
+            backend_bindings: vec![],
         };
         write_all(&client, &work).await.unwrap();
 
@@ -368,6 +388,7 @@ mod tests {
             gateway_classes: vec![],
             gateways: vec![(gw(None), gw_status("True", &t(200)))],
             gateway_backends: vec![],
+            backend_bindings: vec![],
         };
         write_all(&client, &work).await.unwrap();
         let seen = requests.lock().unwrap().clone();
@@ -412,6 +433,7 @@ mod tests {
                 (other, gw_status("True", &t(200))),
             ],
             gateway_backends: vec![],
+            backend_bindings: vec![],
         };
         let result = write_all(&client, &work).await;
         assert!(result.is_err(), "the failed write must surface for retry");

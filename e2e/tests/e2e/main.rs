@@ -4,6 +4,7 @@
 //! per-file binaries would serialize between files no matter the
 //! thread count.
 
+mod backend_binding;
 mod backend_protocol;
 mod drain;
 mod egress;
