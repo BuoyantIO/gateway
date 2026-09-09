@@ -994,6 +994,38 @@ pub async fn apply_backend_binding(client: &Client, object: &BackendBinding) -> 
     Ok(())
 }
 
+/// Merge-patch a `BackendBinding`'s whole spec. A merge patch
+/// replaces arrays wholesale, so a refs or extensions swap lands as
+/// written.
+///
+/// # Errors
+/// Returns an error if the patch call fails.
+pub async fn update_backend_binding_spec(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    spec: &BackendBindingSpec,
+) -> Result<()> {
+    let patch = serde_json::json!({ "spec": spec });
+    Api::<BackendBinding>::namespaced(client.clone(), ns)
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|| format!("updating BackendBinding {ns}/{name}"))?;
+    Ok(())
+}
+
+/// Delete a `BackendBinding`.
+///
+/// # Errors
+/// Returns an error if the delete call fails.
+pub async fn delete_backend_binding(client: &Client, ns: &str, name: &str) -> Result<()> {
+    Api::<BackendBinding>::namespaced(client.clone(), ns)
+        .delete(name, &DeleteParams::default())
+        .await
+        .with_context(|| format!("deleting BackendBinding {ns}/{name}"))?;
+    Ok(())
+}
+
 /// An `Opaque` Secret carrying one credential under `key` — the
 /// shape secret tooling produces, and the shape a `GatewayBackend`
 /// auth block names.
