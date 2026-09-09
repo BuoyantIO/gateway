@@ -318,12 +318,16 @@ fn gateway_backend_status(br: &GatewayBackendResolution<'_>, now: &Time) -> Gate
 }
 
 /// One condition, `Accepted`: can this spec stand in for a claimed
-/// ref. Whether the targets it names exist is decided where they are
-/// resolved, so no `ResolvedRefs` is claimed here.
+/// ref, and is it the claim's only claimant. Whether the targets it
+/// names exist is decided where they are resolved and not reported
+/// here yet.
 fn backend_binding_status(bb: &BackendBindingResolution<'_>, now: &Time) -> BackendBindingStatus {
     let generation = bb.object.metadata.generation;
     let (ok, reason, message) = match &bb.outcome {
-        BackendBindingOutcome::Accepted => (true, "Accepted", "binding is accepted".to_string()),
+        BackendBindingOutcome::Accepted { .. } => {
+            (true, "Accepted", "binding is accepted".to_string())
+        }
+        BackendBindingOutcome::Conflicted { message } => (false, "Conflicted", message.clone()),
         BackendBindingOutcome::Invalid { reason, message } => (false, *reason, message.clone()),
     };
     BackendBindingStatus {
@@ -961,6 +965,24 @@ mod tests {
         assert!(
             reconcile_backend_binding_status(desired, Some(&observed)).is_none(),
             "a later clock alone must not produce a write"
+        );
+    }
+
+    #[test]
+    fn a_conflicted_binding_is_not_accepted() {
+        let mut rival = binding_object(vec![service_binding_ref()]);
+        rival.metadata.name = Some("rival".into());
+        let mut state = fixture_state();
+        state.backend_bindings = vec![binding_object(vec![service_binding_ref()]), rival];
+
+        let status = binding_status(&state);
+        let accepted = find(&status.conditions, "Accepted");
+        assert_eq!(accepted.status, "False");
+        assert_eq!(accepted.reason, "Conflicted");
+        assert!(
+            accepted.message.contains("demo/rival"),
+            "the message names the other claimant: {}",
+            accepted.message
         );
     }
 }

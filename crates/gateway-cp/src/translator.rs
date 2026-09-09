@@ -338,23 +338,40 @@ fn emit_routes_under_edge(
             .map(|refs| refs.iter().filter_map(backend_ref_proto).collect())
             .unwrap_or_default();
 
-        let filters = rule
-            .filters
-            .as_deref()
-            .unwrap_or(&[])
+        // Binding-prepended extensions run ahead of the rule's own
+        // filters. `filter_idx` stays the position in the spec, so a
+        // binding coming or going never renames a synthesized
+        // extension.
+        let mut filters: Vec<pb::HttpFilter> = route
+            .rule_prepends
+            .get(rule_idx)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
-            .enumerate()
-            .filter_map(|(filter_idx, f)| {
-                translate_filter(
-                    f,
-                    route.route_ns,
-                    route.route_name,
-                    rule_idx,
-                    filter_idx,
-                    &mut snapshot.extensions,
-                )
+            .map(|p| pb::HttpFilter {
+                kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
+                    name: p.name.clone(),
+                    namespace: p.namespace.clone(),
+                })),
             })
             .collect();
+        filters.extend(
+            rule.filters
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .filter_map(|(filter_idx, f)| {
+                    translate_filter(
+                        f,
+                        route.route_ns,
+                        route.route_name,
+                        rule_idx,
+                        filter_idx,
+                        &mut snapshot.extensions,
+                    )
+                }),
+        );
 
         snapshot.routes.insert(
             route_key,
@@ -376,26 +393,28 @@ fn emit_routes_under_edge(
 ///
 /// A ref whose target is named but not usable keeps its ref anyway —
 /// a missing or headless Service, a `GatewayBackend` that is absent
-/// or invalid — because the runtime answers 500 for a ref it cannot
-/// resolve, and 500 is the honest answer while the object is being
-/// fixed. Refs that were rejected outright (cross-namespace, a
-/// Service with no port, a `GatewayBackend` with one, a foreign
-/// kind) emit nothing.
+/// or invalid, a foreign kind nothing claims — because the runtime
+/// answers 500 for a ref it cannot resolve, and 500 is the honest
+/// answer while the object is being fixed. Refs that were rejected
+/// outright (cross-namespace, a Service with no port, a
+/// `GatewayBackend` with one) emit nothing.
 fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> {
     let key = match &backend.outcome {
         BackendOutcome::Resolved { key, .. }
         | BackendOutcome::MissingService { key }
         | BackendOutcome::Headless { key }
         | BackendOutcome::Dialable { key, .. }
-        | BackendOutcome::MissingDialable { key } => key.clone(),
+        | BackendOutcome::MissingDialable { key }
+        | BackendOutcome::UnsupportedKind { key } => key.clone(),
         BackendOutcome::CrossNamespace
         | BackendOutcome::NoPort
-        | BackendOutcome::PortNotAllowed
-        | BackendOutcome::UnsupportedKind => return None,
+        | BackendOutcome::PortNotAllowed => {
+            return None;
+        }
     };
     Some(pb::BackendRef {
         name: key,
-        weight: backend.backend_ref.weight.unwrap_or(1).unsigned_abs(),
+        weight: backend.weight,
     })
 }
 
@@ -439,7 +458,7 @@ fn emit_backend(
     if snapshot.backends.contains_key(&bk) {
         return;
     }
-    let Some(port) = backend.backend_ref.port else {
+    let Some(port) = backend.port else {
         return;
     };
     let port_app_protocol = service
@@ -3668,5 +3687,186 @@ mod tests {
         let route = snapshot.routes.values().next().expect("one route");
         assert!(route.filters.is_empty(), "foreign refs drop with a warn");
         assert!(snapshot.extensions.is_empty());
+    }
+
+    // ----- BackendBinding substitution -----
+
+    /// A route backendRef of the foreign kind bindings claim here.
+    fn foreign_ref(name: &str, weight: Option<i32>) -> HttpRouteRulesBackendRefs {
+        HttpRouteRulesBackendRefs {
+            name: name.into(),
+            group: Some("inference-d.io".into()),
+            kind: Some("InferencePool".into()),
+            weight,
+            ..Default::default()
+        }
+    }
+
+    /// A binding claiming `inference-d.io/InferencePool claim_name`,
+    /// resolving to one Service target per (name, service, port).
+    fn binding(
+        ns: &str,
+        name: &str,
+        claim_name: &str,
+        targets: &[(&str, &str, u16)],
+        extensions: &[&str],
+    ) -> crate::crd::BackendBinding {
+        let spec = crate::crd::BackendBindingSpec {
+            claim: crate::crd::Claim {
+                group: "inference-d.io".into(),
+                kind: "InferencePool".into(),
+                name: claim_name.into(),
+            },
+            backend_refs: targets
+                .iter()
+                .map(|(ref_name, svc, port)| crate::crd::BindingBackendRef {
+                    name: (*ref_name).into(),
+                    target: crate::crd::BindingObjectReference {
+                        group: None,
+                        kind: None,
+                        namespace: None,
+                        name: (*svc).into(),
+                        port: Some(*port),
+                    },
+                })
+                .collect(),
+            extensions: extensions.iter().map(|e| (*e).to_string()).collect(),
+        };
+        let mut b = crate::crd::BackendBinding::new(name, spec);
+        b.metadata.namespace = Some(ns.into());
+        b
+    }
+
+    fn binding_state(routes: Vec<HTTPRoute>) -> K8sState {
+        K8sState {
+            gateway_classes: vec![gc("zd", OURS)],
+            gateways: vec![gw(
+                "demo",
+                "api",
+                "zd",
+                vec![http_listener("http", 80, None)],
+            )],
+            http_routes: routes,
+            services: vec![
+                service("demo", "workers", Some("10.0.0.1")),
+                service("demo", "scale", Some("10.0.0.2")),
+            ],
+            endpoint_slices: vec![],
+            secrets: vec![],
+            extensions: vec![extension_object("demo", "picker")],
+            gateway_backends: vec![],
+            backend_bindings: vec![],
+        }
+    }
+
+    /// The doc's core claim: the DP cannot tell a route resolved
+    /// through a binding from the same route written natively.
+    #[test]
+    fn a_substituted_route_is_indistinguishable_from_a_native_one() {
+        let native = binding_state(vec![http_route(
+            "demo",
+            "r",
+            vec![parent_ref("api", Some("demo"), None)],
+            vec![rule(
+                Some("/"),
+                vec![backend_ref("workers", 8000), backend_ref("scale", 8000)],
+                vec![extension_ref_filter(
+                    "gateway.linkerd.io",
+                    "Extension",
+                    "picker",
+                )],
+            )],
+        )]);
+
+        let mut substituted = binding_state(vec![http_route(
+            "demo",
+            "r",
+            vec![parent_ref("api", Some("demo"), None)],
+            vec![rule(Some("/"), vec![foreign_ref("pool", Some(2))], vec![])],
+        )]);
+        substituted.backend_bindings = vec![binding(
+            "demo",
+            "pool",
+            "pool",
+            &[("w", "workers", 8000), ("s", "scale", 8000)],
+            &["picker"],
+        )];
+
+        let id = ("demo".to_string(), "api".to_string());
+        let native_out = translate(&native, OURS);
+        let substituted_out = translate(&substituted, OURS);
+        assert!(
+            diff(
+                native_out.get(&id).unwrap(),
+                substituted_out.get(&id).unwrap()
+            )
+            .is_none(),
+            "switching between the two routes must diff to no-op"
+        );
+    }
+
+    #[test]
+    fn binding_extensions_prepend_without_renaming_synthesized_filters() {
+        let mut state = binding_state(vec![http_route(
+            "demo",
+            "r",
+            vec![parent_ref("api", Some("demo"), None)],
+            vec![rule(
+                Some("/"),
+                vec![foreign_ref("pool", None)],
+                vec![
+                    header_modifier_filter(),
+                    extension_ref_filter("gateway.linkerd.io", "Extension", "user"),
+                ],
+            )],
+        )]);
+        state.backend_bindings = vec![binding(
+            "demo",
+            "pool",
+            "pool",
+            &[("w", "workers", 8000)],
+            &["picker"],
+        )];
+
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        let names: Vec<&str> = route
+            .filters
+            .iter()
+            .map(|f| {
+                let pb::http_filter::Kind::ExtensionRef(er) = f.kind.as_ref().expect("kind set");
+                er.name.as_str()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["picker", "r~r0~f0", "user"],
+            "prepended first; spec filters keep their positional names"
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_foreign_ref_keeps_a_ref_nothing_can_register() {
+        let state = binding_state(vec![http_route(
+            "demo",
+            "r",
+            vec![parent_ref("api", Some("demo"), None)],
+            vec![rule(Some("/"), vec![foreign_ref("pool", None)], vec![])],
+        )]);
+
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        assert_eq!(route.backend_refs.len(), 1, "the share must not vanish");
+        assert_eq!(
+            route.backend_refs[0].name,
+            "demo/pool~inference-d.io~InferencePool"
+        );
+        assert_eq!(route.backend_refs[0].weight, 1);
+        assert!(
+            s.backends.is_empty(),
+            "no upsert can ever answer for the key; the DP answers 500"
+        );
     }
 }
