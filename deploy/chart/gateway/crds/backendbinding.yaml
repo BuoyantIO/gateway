@@ -61,9 +61,9 @@ spec:
                         minLength: 1
                       ref:
                         description: >-
-                          The target, in the binding's namespace.
-                          group and kind default to the core Service,
-                          exactly as in a route backendRef.
+                          The target. group and kind default to the
+                          core Service, exactly as in a route
+                          backendRef.
                         type: object
                         required: [name]
                         properties:
@@ -72,6 +72,14 @@ spec:
                           kind:
                             type: string
                           name:
+                            type: string
+                            minLength: 1
+                          namespace:
+                            description: >-
+                              Namespace of the target. Absent is the
+                              binding's own. Cross-namespace consent
+                              (a ReferenceGrant-style check) is not
+                              enforced yet.
                             type: string
                             minLength: 1
                           port:

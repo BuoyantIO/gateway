@@ -936,6 +936,7 @@ pub fn backend_binding(
                 .map(|(ref_name, service, port)| BindingBackendRef {
                     name: (*ref_name).into(),
                     target: BindingObjectReference {
+                        namespace: None,
                         group: None,
                         kind: None,
                         name: (*service).into(),

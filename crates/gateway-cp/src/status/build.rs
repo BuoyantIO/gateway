@@ -902,6 +902,7 @@ mod tests {
         crate::crd::BindingBackendRef {
             name: "workers".into(),
             target: crate::crd::BindingObjectReference {
+                namespace: None,
                 group: None,
                 kind: None,
                 name: "workers-svc".into(),

@@ -2923,6 +2923,7 @@ mod tests {
         crd::BindingBackendRef {
             name: name.into(),
             target: crd::BindingObjectReference {
+                namespace: None,
                 group: group.map(String::from),
                 kind: kind.map(String::from),
                 name: format!("{name}-target"),

@@ -311,6 +311,11 @@ pub struct BindingObjectReference {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     pub name: String,
+    /// Namespace of the target. Absent is the binding's own.
+    /// Cross-namespace consent (a `ReferenceGrant`-style check) is
+    /// not enforced yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Service port the traffic goes to. A `GatewayBackend` carries
     /// its port in `baseURL` and takes none here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -368,6 +373,7 @@ mod tests {
                         "group": "gateway.linkerd.io",
                         "kind": "GatewayBackend",
                         "name": "openai",
+                        "namespace": "egress",
                     },
                 },
             ],
@@ -381,6 +387,10 @@ mod tests {
         assert_eq!(
             spec.backend_refs[1].target.kind.as_deref(),
             Some("GatewayBackend")
+        );
+        assert_eq!(
+            spec.backend_refs[1].target.namespace.as_deref(),
+            Some("egress")
         );
         assert_eq!(spec.extensions, vec!["pool-picker"]);
         assert_eq!(serde_json::to_value(&spec).unwrap(), raw);
