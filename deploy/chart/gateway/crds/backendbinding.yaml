@@ -54,9 +54,11 @@ spec:
                     properties:
                       name:
                         description: >-
-                          The identity whatever picks among the
-                          binding's refs selects by. Unrelated to the
-                          target's own name.
+                          Identifies the entry within the binding, in
+                          status messages and as the stable key for
+                          anything per-entry added later. Unrelated
+                          to the target's own name; selection never
+                          consults it.
                         type: string
                         minLength: 1
                       ref:

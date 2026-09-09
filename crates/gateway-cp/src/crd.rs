@@ -291,10 +291,15 @@ pub struct Claim {
 }
 
 /// One destination a binding resolves to.
+///
+/// Selection never consults `name`: a picker addresses a local
+/// endpoint by ip:port and a provider by its target's
+/// namespace/name.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct BindingBackendRef {
-    /// The identity whatever picks among the binding's refs selects
-    /// by. Unrelated to the target's own name.
+    /// Identifies the entry within the binding — in status messages,
+    /// and as the stable key for anything per-entry added later.
+    /// Unrelated to the target's own name.
     pub name: String,
     /// The target, in the binding's namespace. Only kinds the gateway
     /// resolves natively: a core `Service` or a `GatewayBackend`.
