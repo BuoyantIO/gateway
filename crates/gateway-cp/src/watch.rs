@@ -1,10 +1,11 @@
 //! kube watch loop.
 //!
-//! Eight `kube_runtime::reflector` instances keep an in-memory view
+//! Nine `kube_runtime::reflector` instances keep an in-memory view
 //! of `GatewayClass`, `Gateway`, `HTTPRoute`, `core/v1 Service`,
 //! `discovery/v1 EndpointSlice` (filtered to slices carrying the
 //! `kubernetes.io/service-name` label), `core/v1 Secret`, and our own
-//! `Extension` and `GatewayBackend`. A single `tokio::select!` over
+//! `Extension`, `GatewayBackend` and `BackendBinding`. A single
+//! `tokio::select!` over
 //! the watcher streams drives the loop: each relevant event triggers
 //! one pass (resolve, translate, publish, status, infra).
 //!
@@ -31,8 +32,8 @@
 //! the same objects are filtered the same way.
 //!
 //! Per kind:
-//! - `GatewayClass`, `HTTPRoute`, `Extension`, `GatewayBackend`:
-//!   skip unless the generation changed.
+//! - `GatewayClass`, `HTTPRoute`, `Extension`, `GatewayBackend`,
+//!   `BackendBinding`: skip unless the generation changed.
 //! - `Gateway`: skip unless the generation or the annotations changed
 //!   (the provisioner reads the self-managed opt-out annotation).
 //! - `Service`, `Secret`, `EndpointSlice`: never skipped. Service
@@ -63,7 +64,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use tokio::sync::watch as tokio_watch;
 
 use crate::admin::ReadyState;
-use crate::crd::{Extension, GatewayBackend};
+use crate::crd::{BackendBinding, Extension, GatewayBackend};
 use crate::infra::{self, InfraPublisher};
 use crate::resolve::{SERVICE_NAME_LABEL, resolve};
 use crate::server::ServerState;
@@ -72,7 +73,7 @@ use crate::translator::{K8sState, translate_resolution};
 
 /// The resource kinds the loop watches, in reflector order. Also the
 /// initial pending set for the readiness endpoint.
-pub const WATCHED_KINDS: [&str; 8] = [
+pub const WATCHED_KINDS: [&str; 9] = [
     "GatewayClass",
     "Gateway",
     "HTTPRoute",
@@ -81,6 +82,7 @@ pub const WATCHED_KINDS: [&str; 8] = [
     "Secret",
     "Extension",
     "GatewayBackend",
+    "BackendBinding",
 ];
 
 #[derive(Debug, Error)]
@@ -97,8 +99,9 @@ pub enum WatchError {
 /// Returns `WatchError::Kube` only for setup failures. Per-event
 /// watcher errors are transient and handled by `kube_runtime::watcher`
 /// internally; we log and continue.
-#[allow(clippy::similar_names)] // gc/gw/hr/svc/sec/gb bindings are intentionally parallel
+#[allow(clippy::similar_names)] // gc/gw/hr/svc/sec/gb/bb bindings are intentionally parallel
 #[allow(clippy::too_many_arguments)] // the loop is the wiring point for every channel
+#[allow(clippy::too_many_lines)] // four lines of reflector setup per watched kind
 pub async fn run(
     client: kube::Client,
     controller_name: String,
@@ -148,15 +151,21 @@ pub async fn run(
         reflector::reflector(ext_writer, watcher::watcher(ext_api, Config::default())).boxed();
 
     let (gb_store, gb_writer) = reflector::store::<GatewayBackend>();
-    let gb_api: Api<GatewayBackend> = Api::all(client);
+    let gb_api: Api<GatewayBackend> = Api::all(client.clone());
     let mut gb_stream =
         reflector::reflector(gb_writer, watcher::watcher(gb_api, Config::default())).boxed();
+
+    let (bb_store, bb_writer) = reflector::store::<BackendBinding>();
+    let bb_api: Api<BackendBinding> = Api::all(client);
+    let mut bb_stream =
+        reflector::reflector(bb_writer, watcher::watcher(bb_api, Config::default())).boxed();
 
     let mut gc_filter = EventFilter::generation_only();
     let mut gw_filter = EventFilter::generation_and_annotations();
     let mut hr_filter = EventFilter::generation_only();
     let mut ext_filter = EventFilter::generation_only();
     let mut gb_filter = EventFilter::generation_only();
+    let mut bb_filter = EventFilter::generation_only();
 
     let mut sync = SyncTracker::new();
 
@@ -176,6 +185,7 @@ pub async fn run(
             ev = sec_stream.next() => { sync.mark("Secret", ev.as_ref()); EventFilter::always("Secret", ev) }
             ev = ext_stream.next() => { sync.mark("Extension", ev.as_ref()); ext_filter.relevant("Extension", ev) }
             ev = gb_stream.next() => { sync.mark("GatewayBackend", ev.as_ref()); gb_filter.relevant("GatewayBackend", ev) }
+            ev = bb_stream.next() => { sync.mark("BackendBinding", ev.as_ref()); bb_filter.relevant("BackendBinding", ev) }
         };
         if !relevant {
             continue;
@@ -183,7 +193,7 @@ pub async fn run(
 
         let k8s = collect_state(
             &gc_store, &gw_store, &hr_store, &svc_store, &es_store, &sec_store, &ext_store,
-            &gb_store,
+            &gb_store, &bb_store,
         );
         let resolution = resolve(&k8s, &controller_name);
         let world = translate_resolution(&resolution);
@@ -283,6 +293,7 @@ fn collect_state(
     sec: &ReflectorStore<Secret>,
     ext: &ReflectorStore<Extension>,
     gb: &ReflectorStore<GatewayBackend>,
+    bb: &ReflectorStore<BackendBinding>,
 ) -> K8sState {
     K8sState {
         gateway_classes: gc.state().iter().map(|a| (**a).clone()).collect(),
@@ -293,6 +304,7 @@ fn collect_state(
         secrets: sec.state().iter().map(|a| (**a).clone()).collect(),
         extensions: ext.state().iter().map(|a| (**a).clone()).collect(),
         gateway_backends: gb.state().iter().map(|a| (**a).clone()).collect(),
+        backend_bindings: bb.state().iter().map(|a| (**a).clone()).collect(),
     }
 }
 

@@ -10,6 +10,6 @@ pub mod build;
 pub mod writer;
 
 pub use build::{
-    StatusSet, StatusWork, build, build_work, reconcile_gateway_backend_status,
-    reconcile_gateway_class_status, reconcile_gateway_status,
+    StatusSet, StatusWork, build, build_work, reconcile_backend_binding_status,
+    reconcile_gateway_backend_status, reconcile_gateway_class_status, reconcile_gateway_status,
 };

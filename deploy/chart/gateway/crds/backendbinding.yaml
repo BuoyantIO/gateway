@@ -1,0 +1,141 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: backendbindings.gateway.linkerd.io
+spec:
+  group: gateway.linkerd.io
+  scope: Namespaced
+  names:
+    kind: BackendBinding
+    listKind: BackendBindingList
+    plural: backendbindings
+    singular: backendbinding
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [claim, backendRefs]
+              properties:
+                claim:
+                  description: >-
+                    The foreign backendRef this binding answers for,
+                    matched as opaque strings against route refs in
+                    the binding's own namespace. The claimed object is
+                    never read and need not exist. Empty fields are
+                    rejected on status, not by the schema.
+                  type: object
+                  required: [group, kind, name]
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                backendRefs:
+                  description: >-
+                    What the claimed ref resolves to. Only kinds the
+                    gateway resolves natively: a core Service or a
+                    GatewayBackend. An empty list or a foreign kind is
+                    rejected on status, not by the schema.
+                  type: array
+                  items:
+                    type: object
+                    required: [name, ref]
+                    properties:
+                      name:
+                        description: >-
+                          Identifies the entry within the binding, in
+                          status messages and as the stable key for
+                          anything per-entry added later. Unrelated
+                          to the target's own name; selection never
+                          consults it.
+                        type: string
+                        minLength: 1
+                      ref:
+                        description: >-
+                          The target. group and kind default to the
+                          core Service, exactly as in a route
+                          backendRef.
+                        type: object
+                        required: [name]
+                        properties:
+                          group:
+                            type: string
+                          kind:
+                            type: string
+                          name:
+                            type: string
+                            minLength: 1
+                          namespace:
+                            description: >-
+                              Namespace of the target. Absent is the
+                              binding's own. Cross-namespace consent
+                              (a ReferenceGrant-style check) is not
+                              enforced yet.
+                            type: string
+                            minLength: 1
+                          port:
+                            description: >-
+                              Service port the traffic goes to. A
+                              GatewayBackend carries its port in
+                              baseURL and takes none here.
+                            type: integer
+                            minimum: 1
+                            maximum: 65535
+                extensions:
+                  description: >-
+                    Extension objects in the binding's namespace,
+                    prepended in order to the filter chain of any rule
+                    whose ref this binding claims.
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+            status:
+              type: object
+              properties:
+                conditions:
+                  description: >-
+                    Accepted says the spec itself can stand in for a
+                    ref: the claim is complete and every target is of
+                    a native kind.
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status, reason, message, lastTransitionTime]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+      additionalPrinterColumns:
+        - name: Claim
+          type: string
+          jsonPath: .spec.claim.kind
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

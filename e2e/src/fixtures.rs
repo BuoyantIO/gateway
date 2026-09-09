@@ -22,7 +22,8 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
 use gateway_cp::crd::{
-    ApiKeyAuth, BackendAuth, BackendAuthType, Extension, ExtensionSpec, FailureMode,
+    ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding, BackendBindingSpec,
+    BindingBackendRef, BindingObjectReference, Claim, Extension, ExtensionSpec, FailureMode,
     GatewayBackend, GatewayBackendSpec, Limits, SecretKeyReference,
 };
 use k8s_openapi::ByteString;
@@ -907,6 +908,65 @@ pub async fn apply_gateway_backend(client: &Client, object: &GatewayBackend) -> 
         .with_context(|| {
             format!(
                 "creating GatewayBackend {}",
+                object.metadata.name.as_deref().unwrap_or("?")
+            )
+        })?;
+    Ok(())
+}
+
+/// A `BackendBinding` claiming `(group, kind, name)`, resolving to
+/// one Service ref per `(name, service, port)` entry. Empty `refs`
+/// builds the spec the control plane rejects with `NoBackendRefs`.
+pub fn backend_binding(
+    ns: &str,
+    name: &str,
+    claim: (&str, &str, &str),
+    refs: &[(&str, &str, u16)],
+) -> BackendBinding {
+    let mut object = BackendBinding::new(
+        name,
+        BackendBindingSpec {
+            claim: Claim {
+                group: claim.0.into(),
+                kind: claim.1.into(),
+                name: claim.2.into(),
+            },
+            backend_refs: refs
+                .iter()
+                .map(|(ref_name, service, port)| BindingBackendRef {
+                    name: (*ref_name).into(),
+                    target: BindingObjectReference {
+                        namespace: None,
+                        group: None,
+                        kind: None,
+                        name: (*service).into(),
+                        port: Some(*port),
+                    },
+                })
+                .collect(),
+            extensions: Vec::new(),
+        },
+    );
+    object.metadata.namespace = Some(ns.into());
+    object
+}
+
+/// Create a `BackendBinding`.
+///
+/// # Errors
+/// Returns an error if the create call fails.
+pub async fn apply_backend_binding(client: &Client, object: &BackendBinding) -> Result<()> {
+    let ns = object
+        .metadata
+        .namespace
+        .as_deref()
+        .context("BackendBinding has no namespace")?;
+    Api::<BackendBinding>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), object)
+        .await
+        .with_context(|| {
+            format!(
+                "creating BackendBinding {}",
                 object.metadata.name.as_deref().unwrap_or("?")
             )
         })?;

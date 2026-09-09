@@ -14,11 +14,11 @@ use gateway_api::apis::standard::gateways::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
-use crate::crd::{GatewayBackend, GatewayBackendStatus};
+use crate::crd::{BackendBinding, BackendBindingStatus, GatewayBackend, GatewayBackendStatus};
 use crate::resolve::{
-    AddressKind, CredentialOutcome, GatewayBackendOutcome, GatewayBackendResolution,
-    GatewayResolution, ListenerOutcome, ListenerResolution, Resolution, ResolvedBackendAuth,
-    ResolvedDialable,
+    AddressKind, BackendBindingOutcome, BackendBindingResolution, CredentialOutcome,
+    GatewayBackendOutcome, GatewayBackendResolution, GatewayResolution, ListenerOutcome,
+    ListenerResolution, Resolution, ResolvedBackendAuth, ResolvedDialable,
 };
 use crate::snapshot::GatewayId;
 
@@ -30,6 +30,8 @@ pub struct StatusSet {
     pub gateways: Vec<(GatewayId, GatewayStatus)>,
     /// `GatewayBackend` `(namespace, name)` -> desired status.
     pub gateway_backends: Vec<(GatewayId, GatewayBackendStatus)>,
+    /// `BackendBinding` `(namespace, name)` -> desired status.
+    pub backend_bindings: Vec<(GatewayId, BackendBindingStatus)>,
 }
 
 /// One translate pass's status work for the writer: each desired
@@ -41,6 +43,7 @@ pub struct StatusWork {
     pub gateway_classes: Vec<(GatewayClass, GatewayClassStatus)>,
     pub gateways: Vec<(Gateway, GatewayStatus)>,
     pub gateway_backends: Vec<(GatewayBackend, GatewayBackendStatus)>,
+    pub backend_bindings: Vec<(BackendBinding, BackendBindingStatus)>,
 }
 
 /// [`build`], with each desired status paired to a clone of the
@@ -61,6 +64,11 @@ pub fn build_work(resolution: &Resolution<'_>, now: &Time) -> StatusWork {
             .gateway_backends
             .iter()
             .map(|b| (b.object.clone(), gateway_backend_status(b, now)))
+            .collect(),
+        backend_bindings: resolution
+            .backend_bindings
+            .iter()
+            .map(|b| (b.object.clone(), backend_binding_status(b, now)))
             .collect(),
     }
 }
@@ -93,6 +101,16 @@ pub fn build(resolution: &Resolution<'_>, now: &Time) -> StatusSet {
                 )
             })
             .collect(),
+        backend_bindings: resolution
+            .backend_bindings
+            .iter()
+            .map(|b| {
+                (
+                    (b.namespace.clone(), b.name.clone()),
+                    backend_binding_status(b, now),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -121,6 +139,22 @@ pub fn reconcile_gateway_backend_status(
     mut desired: GatewayBackendStatus,
     observed: Option<&GatewayBackendStatus>,
 ) -> Option<GatewayBackendStatus> {
+    if let Some(observed) = observed {
+        carry_timestamps(&mut desired.conditions, &observed.conditions);
+        if *observed == desired {
+            return None;
+        }
+    }
+    Some(desired)
+}
+
+/// Decide whether the `BackendBinding` status needs a write:
+/// `Some(final)` with carried-forward timestamps, or `None` when
+/// semantically equal.
+pub fn reconcile_backend_binding_status(
+    mut desired: BackendBindingStatus,
+    observed: Option<&BackendBindingStatus>,
+) -> Option<BackendBindingStatus> {
     if let Some(observed) = observed {
         carry_timestamps(&mut desired.conditions, &observed.conditions);
         if *observed == desired {
@@ -280,6 +314,20 @@ fn gateway_backend_status(br: &GatewayBackendResolution<'_>, now: &Time) -> Gate
                 now,
             ),
         ],
+    }
+}
+
+/// One condition, `Accepted`: can this spec stand in for a claimed
+/// ref. Whether the targets it names exist is decided where they are
+/// resolved, so no `ResolvedRefs` is claimed here.
+fn backend_binding_status(bb: &BackendBindingResolution<'_>, now: &Time) -> BackendBindingStatus {
+    let generation = bb.object.metadata.generation;
+    let (ok, reason, message) = match &bb.outcome {
+        BackendBindingOutcome::Accepted => (true, "Accepted", "binding is accepted".to_string()),
+        BackendBindingOutcome::Invalid { reason, message } => (false, *reason, message.clone()),
+    };
+    BackendBindingStatus {
+        conditions: vec![condition("Accepted", ok, reason, &message, generation, now)],
     }
 }
 
@@ -825,6 +873,93 @@ mod tests {
         let desired = build(&resolution, &t(200)).gateway_backends.remove(0).1;
         assert!(
             reconcile_gateway_backend_status(desired, Some(&observed)).is_none(),
+            "a later clock alone must not produce a write"
+        );
+    }
+
+    fn binding_object(refs: Vec<crate::crd::BindingBackendRef>) -> crate::crd::BackendBinding {
+        crate::crd::BackendBinding {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some("pool".into()),
+                generation: Some(5),
+                ..Default::default()
+            },
+            spec: crate::crd::BackendBindingSpec {
+                claim: crate::crd::Claim {
+                    group: "inference-d.io".into(),
+                    kind: "InferencePool".into(),
+                    name: "pool".into(),
+                },
+                backend_refs: refs,
+                extensions: Vec::new(),
+            },
+            status: None,
+        }
+    }
+
+    fn service_binding_ref() -> crate::crd::BindingBackendRef {
+        crate::crd::BindingBackendRef {
+            name: "workers".into(),
+            target: crate::crd::BindingObjectReference {
+                namespace: None,
+                group: None,
+                kind: None,
+                name: "workers-svc".into(),
+                port: Some(8000),
+            },
+        }
+    }
+
+    fn binding_status(state: &K8sState) -> crate::crd::BackendBindingStatus {
+        let resolution = resolve(state, OURS);
+        build(&resolution, &t(100)).backend_bindings.remove(0).1
+    }
+
+    #[test]
+    fn a_valid_binding_is_accepted() {
+        let mut state = fixture_state();
+        state.backend_bindings = vec![binding_object(vec![service_binding_ref()])];
+
+        let status = binding_status(&state);
+        let accepted = find(&status.conditions, "Accepted");
+        assert_eq!(accepted.status, "True");
+        assert_eq!(accepted.observed_generation, Some(5));
+        assert_eq!(status.conditions.len(), 1, "no ResolvedRefs is claimed");
+    }
+
+    #[test]
+    fn each_binding_malformation_has_its_own_reason() {
+        let mut foreign = service_binding_ref();
+        foreign.target.group = Some("inference-d.io".into());
+        foreign.target.kind = Some("InferencePool".into());
+        let mut no_claim = binding_object(vec![service_binding_ref()]);
+        no_claim.spec.claim.group = String::new();
+
+        for (object, reason) in [
+            (no_claim, "InvalidClaim"),
+            (binding_object(vec![]), "NoBackendRefs"),
+            (binding_object(vec![foreign]), "InvalidBackendRef"),
+        ] {
+            let mut state = fixture_state();
+            state.backend_bindings = vec![object];
+            let status = binding_status(&state);
+            let accepted = find(&status.conditions, "Accepted");
+            assert_eq!(accepted.status, "False");
+            assert_eq!(accepted.reason, reason);
+        }
+    }
+
+    #[test]
+    fn an_unchanged_binding_status_is_not_rewritten() {
+        let mut state = fixture_state();
+        state.backend_bindings = vec![binding_object(vec![service_binding_ref()])];
+        let observed = binding_status(&state);
+
+        let resolution = resolve(&state, OURS);
+        let desired = build(&resolution, &t(200)).backend_bindings.remove(0).1;
+        assert!(
+            reconcile_backend_binding_status(desired, Some(&observed)).is_none(),
             "a later clock alone must not produce a write"
         );
     }

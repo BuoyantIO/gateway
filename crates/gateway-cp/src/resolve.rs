@@ -65,6 +65,15 @@ pub struct Resolution<'a> {
     /// and the status builder reads it directly, so an object ten
     /// routes reference is still decided once.
     pub gateway_backends: Vec<GatewayBackendResolution<'a>>,
+    /// Every `BackendBinding` in the cluster, decided once. The
+    /// status builder reads it directly.
+    pub backend_bindings: Vec<BackendBindingResolution<'a>>,
+    /// Accepted bindings by the claim they answer for:
+    /// (namespace, group, kind, name) → indices into
+    /// [`Self::backend_bindings`]. Rejected bindings never enter.
+    /// More than one index under a key is a conflict the entries do
+    /// not resolve among themselves.
+    pub bindings_by_claim: HashMap<(&'a str, &'a str, &'a str, &'a str), Vec<usize>>,
     pub routes: Vec<RouteResolution<'a>>,
 }
 
@@ -360,6 +369,28 @@ pub enum CredentialOutcome {
     KeyMissing,
 }
 
+/// One `BackendBinding`, decided once per pass.
+pub struct BackendBindingResolution<'a> {
+    pub object: &'a crd::BackendBinding,
+    pub namespace: String,
+    pub name: String,
+    pub outcome: BackendBindingOutcome,
+}
+
+pub enum BackendBindingOutcome {
+    /// The spec can stand in for a claimed ref: the claim is
+    /// complete and every target is of a native kind. Whether the
+    /// targets exist is decided where they are resolved, not here.
+    Accepted,
+    /// The spec cannot stand in for anything; the binding never
+    /// enters the claim index. `reason` is the status condition
+    /// reason.
+    Invalid {
+        reason: &'static str,
+        message: String,
+    },
+}
+
 /// Names of the `GatewayClass`es whose `controllerName` is ours.
 /// Shared with the infra provisioner so "owned Gateway" means the
 /// same thing on both paths.
@@ -397,6 +428,26 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         .enumerate()
         .map(|(idx, b)| ((b.namespace.as_str(), b.name.as_str()), idx))
         .collect();
+
+    let backend_bindings = resolve_backend_bindings(&state.backend_bindings);
+    // Keys borrow from the watched objects, not from the resolution
+    // entries, so the index and the entries move into `Resolution`
+    // together.
+    let mut bindings_by_claim: HashMap<(&str, &str, &str, &str), Vec<usize>> = HashMap::new();
+    for (idx, b) in backend_bindings.iter().enumerate() {
+        if !matches!(b.outcome, BackendBindingOutcome::Accepted) {
+            continue;
+        }
+        let object: &'a crd::BackendBinding = b.object;
+        let claim = &object.spec.claim;
+        let Some(ns) = object.metadata.namespace.as_deref() else {
+            continue;
+        };
+        bindings_by_claim
+            .entry((ns, &claim.group, &claim.kind, &claim.name))
+            .or_default()
+            .push(idx);
+    }
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
     for gw in &state.gateways {
@@ -461,6 +512,8 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         gateway_classes,
         gateways,
         gateway_backends,
+        backend_bindings,
+        bindings_by_claim,
         routes,
     }
 }
@@ -841,6 +894,65 @@ fn resolve_gateway_backends<'a>(
         });
     }
     out
+}
+
+/// Decide every `BackendBinding` once. Acceptance is about the spec
+/// alone — a complete claim and native-kind targets — so it needs
+/// nothing looked up.
+fn resolve_backend_bindings(objects: &[crd::BackendBinding]) -> Vec<BackendBindingResolution<'_>> {
+    let mut out = Vec::with_capacity(objects.len());
+    for object in objects {
+        let (Some(namespace), Some(name)) = (
+            object.metadata.namespace.as_deref(),
+            object.metadata.name.as_deref(),
+        ) else {
+            continue;
+        };
+        out.push(BackendBindingResolution {
+            object,
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            outcome: resolve_backend_binding(object),
+        });
+    }
+    out
+}
+
+fn resolve_backend_binding(object: &crd::BackendBinding) -> BackendBindingOutcome {
+    let spec = &object.spec;
+    let claim = &spec.claim;
+    if claim.group.is_empty() || claim.kind.is_empty() || claim.name.is_empty() {
+        return BackendBindingOutcome::Invalid {
+            reason: "InvalidClaim",
+            message: "claim group, kind and name must all be set".to_string(),
+        };
+    }
+    if spec.backend_refs.is_empty() {
+        return BackendBindingOutcome::Invalid {
+            reason: "NoBackendRefs",
+            message: "backendRefs is empty".to_string(),
+        };
+    }
+    for r in &spec.backend_refs {
+        let group = r.target.group.as_deref().unwrap_or("");
+        let kind = r.target.kind.as_deref().unwrap_or("Service");
+        match (group, kind) {
+            ("", "Service") | (GATEWAY_GROUP, "GatewayBackend") => {}
+            _ => {
+                return BackendBindingOutcome::Invalid {
+                    reason: "InvalidBackendRef",
+                    message: format!(
+                        "ref \"{}\" targets {}/{}; a binding resolves only to a core \
+                         Service or a GatewayBackend",
+                        r.name,
+                        if group.is_empty() { "core" } else { group },
+                        kind
+                    ),
+                };
+            }
+        }
+    }
+    BackendBindingOutcome::Accepted
 }
 
 fn resolve_gateway_backend<'a>(
@@ -2777,5 +2889,138 @@ mod tests {
             }]
         );
         assert!(r.gateways[1].addresses.is_empty());
+    }
+
+    // ----- BackendBinding -----
+
+    fn binding(
+        ns: &str,
+        name: &str,
+        claim: (&str, &str, &str),
+        refs: Vec<crd::BindingBackendRef>,
+    ) -> crd::BackendBinding {
+        crd::BackendBinding {
+            metadata: ObjectMeta {
+                namespace: Some(ns.into()),
+                name: Some(name.into()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: crd::BackendBindingSpec {
+                claim: crd::Claim {
+                    group: claim.0.into(),
+                    kind: claim.1.into(),
+                    name: claim.2.into(),
+                },
+                backend_refs: refs,
+                extensions: Vec::new(),
+            },
+            status: None,
+        }
+    }
+
+    fn binding_ref(name: &str, group: Option<&str>, kind: Option<&str>) -> crd::BindingBackendRef {
+        crd::BindingBackendRef {
+            name: name.into(),
+            target: crd::BindingObjectReference {
+                namespace: None,
+                group: group.map(String::from),
+                kind: kind.map(String::from),
+                name: format!("{name}-target"),
+                port: Some(80),
+            },
+        }
+    }
+
+    const CLAIM: (&str, &str, &str) = ("inference-d.io", "InferencePool", "pool");
+
+    #[test]
+    fn binding_outcomes_cover_every_case() {
+        let mut s = state(vec![], vec![]);
+        s.backend_bindings = vec![
+            binding(
+                "demo",
+                "ok",
+                CLAIM,
+                vec![
+                    binding_ref("workers", None, None),
+                    binding_ref("openai", Some(GATEWAY_GROUP), Some("GatewayBackend")),
+                ],
+            ),
+            binding(
+                "demo",
+                "no-claim",
+                ("", "InferencePool", "pool"),
+                vec![binding_ref("workers", None, None)],
+            ),
+            binding(
+                "demo",
+                "no-refs",
+                ("inference-d.io", "InferencePool", "empty"),
+                vec![],
+            ),
+            binding(
+                "demo",
+                "foreign-ref",
+                ("inference-d.io", "InferencePool", "chained"),
+                vec![binding_ref(
+                    "bad",
+                    Some("inference-d.io"),
+                    Some("InferencePool"),
+                )],
+            ),
+        ];
+        let r = resolve(&s, OURS);
+
+        let by_name: HashMap<&str, &BackendBindingResolution<'_>> = r
+            .backend_bindings
+            .iter()
+            .map(|b| (b.name.as_str(), b))
+            .collect();
+        assert!(matches!(
+            by_name["ok"].outcome,
+            BackendBindingOutcome::Accepted
+        ));
+        for (name, expected) in [
+            ("no-claim", "InvalidClaim"),
+            ("no-refs", "NoBackendRefs"),
+            ("foreign-ref", "InvalidBackendRef"),
+        ] {
+            match &by_name[name].outcome {
+                BackendBindingOutcome::Invalid { reason, .. } => assert_eq!(*reason, expected),
+                BackendBindingOutcome::Accepted => panic!("{name} must be rejected"),
+            }
+        }
+
+        // Only the accepted binding is reachable through its claim.
+        assert_eq!(r.bindings_by_claim.len(), 1);
+        let indices = &r.bindings_by_claim[&("demo", CLAIM.0, CLAIM.1, CLAIM.2)];
+        assert_eq!(indices.len(), 1);
+        assert_eq!(r.backend_bindings[indices[0]].name, "ok");
+    }
+
+    #[test]
+    fn claims_are_namespace_scoped_and_duplicates_share_a_key() {
+        let mut s = state(vec![], vec![]);
+        s.backend_bindings = vec![
+            binding("demo", "first", CLAIM, vec![binding_ref("w", None, None)]),
+            binding("demo", "second", CLAIM, vec![binding_ref("w", None, None)]),
+            binding(
+                "other",
+                "elsewhere",
+                CLAIM,
+                vec![binding_ref("w", None, None)],
+            ),
+        ];
+        let r = resolve(&s, OURS);
+
+        assert_eq!(
+            r.bindings_by_claim[&("demo", CLAIM.0, CLAIM.1, CLAIM.2)].len(),
+            2
+        );
+        assert_eq!(
+            r.bindings_by_claim[&("other", CLAIM.0, CLAIM.1, CLAIM.2)].len(),
+            1
+        );
     }
 }

@@ -7,6 +7,10 @@
 //! where to dial (`baseURL`), what to trust on the way, and what
 //! credential to present. Everything here is the operator's stated
 //! intent; what it resolves to lives in [`crate::resolve`].
+//!
+//! `BackendBinding` answers for a backendRef of a kind the gateway
+//! has no schema for: it claims the ref's (group, kind, name) and
+//! states what the ref resolves to in native kinds.
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
@@ -246,6 +250,92 @@ pub struct GatewayBackendStatus {
     pub conditions: Vec<Condition>,
 }
 
+/// The gateway's answer for a backendRef of a kind it does not know.
+///
+/// A route may carry a backendRef whose group/kind the gateway has no
+/// schema for. The controller owning that kind writes a
+/// `BackendBinding` claiming the ref's (group, kind, name); the
+/// gateway substitutes the binding's own backendRefs — native kinds
+/// only — for the foreign ref, and prepends the binding's extensions
+/// to the using rule's filter chain. The claimed object is never
+/// read and need not exist.
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "gateway.linkerd.io",
+    version = "v1alpha1",
+    kind = "BackendBinding",
+    status = "BackendBindingStatus",
+    namespaced
+)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendBindingSpec {
+    /// The foreign backendRef this binding answers for, matched as
+    /// opaque strings against route refs in the binding's own
+    /// namespace.
+    pub claim: Claim,
+    /// What the claimed ref resolves to.
+    pub backend_refs: Vec<BindingBackendRef>,
+    /// `Extension` objects in the binding's namespace, prepended in
+    /// order to the filter chain of any rule whose ref this binding
+    /// claims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+}
+
+/// The (group, kind, name) of a backendRef, held as opaque strings.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct Claim {
+    pub group: String,
+    pub kind: String,
+    pub name: String,
+}
+
+/// One destination a binding resolves to.
+///
+/// Selection never consults `name`: a picker addresses a local
+/// endpoint by ip:port and a provider by its target's
+/// namespace/name.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BindingBackendRef {
+    /// Identifies the entry within the binding — in status messages,
+    /// and as the stable key for anything per-entry added later.
+    /// Unrelated to the target's own name.
+    pub name: String,
+    /// The target, in the binding's namespace. Only kinds the gateway
+    /// resolves natively: a core `Service` or a `GatewayBackend`.
+    #[serde(rename = "ref")]
+    pub target: BindingObjectReference,
+}
+
+/// A typed reference to a native backend kind. `group` and `kind`
+/// default to the core `Service`, exactly as in a route backendRef.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct BindingObjectReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub name: String,
+    /// Namespace of the target. Absent is the binding's own.
+    /// Cross-namespace consent (a `ReferenceGrant`-style check) is
+    /// not enforced yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Service port the traffic goes to. A `GatewayBackend` carries
+    /// its port in `baseURL` and takes none here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// Status of one `BackendBinding`. `Accepted` says the spec itself
+/// can stand in for a ref: the claim is complete and every target is
+/// of a native kind.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+pub struct BackendBindingStatus {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+}
+
 /// `config` accepts any object: `x-kubernetes-preserve-unknown-fields`.
 fn preserve_unknown(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
@@ -274,6 +364,41 @@ mod tests {
         assert_eq!(spec.failure_mode, FailureMode::Open);
         assert_eq!(spec.limits.request_body, Some(RequestBodyLimit::Stream));
         assert_eq!(spec.config["pool"]["namespace"], "inference");
+    }
+
+    #[test]
+    fn binding_spec_round_trips() {
+        let raw = serde_json::json!({
+            "claim": { "group": "inference-d.io", "kind": "InferencePool", "name": "pool" },
+            "backendRefs": [
+                { "name": "workers", "ref": { "name": "bllmp-workers", "port": 8000 } },
+                {
+                    "name": "openai",
+                    "ref": {
+                        "group": "gateway.linkerd.io",
+                        "kind": "GatewayBackend",
+                        "name": "openai",
+                        "namespace": "egress",
+                    },
+                },
+            ],
+            "extensions": ["pool-picker"],
+        });
+        let spec: BackendBindingSpec = serde_json::from_value(raw.clone()).expect("valid spec");
+        assert_eq!(spec.claim.kind, "InferencePool");
+        assert_eq!(spec.backend_refs[0].name, "workers");
+        assert_eq!(spec.backend_refs[0].target.kind, None);
+        assert_eq!(spec.backend_refs[0].target.port, Some(8000));
+        assert_eq!(
+            spec.backend_refs[1].target.kind.as_deref(),
+            Some("GatewayBackend")
+        );
+        assert_eq!(
+            spec.backend_refs[1].target.namespace.as_deref(),
+            Some("egress")
+        );
+        assert_eq!(spec.extensions, vec!["pool-picker"]);
+        assert_eq!(serde_json::to_value(&spec).unwrap(), raw);
     }
 
     #[test]
