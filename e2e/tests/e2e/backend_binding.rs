@@ -11,7 +11,7 @@ use anyhow::Result;
 use gateway_cp::crd::BackendBinding;
 use gateway_e2e::fixtures::{
     apply_backend_binding, apply_extension, apply_gateway, apply_http_route, backend_binding,
-    extension,
+    delete_backend_binding, extension, update_backend_binding_spec,
 };
 use gateway_e2e::{Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed};
 use http::StatusCode;
@@ -189,5 +189,133 @@ async fn conflicting_claims_show_on_both_bindings() -> Result<()> {
     assert_eq!(reason, "Conflicted");
     let reason = wait_for_condition(&bindings, "second", "Accepted", "False").await?;
     assert_eq!(reason, "Conflicted");
+    Ok(())
+}
+
+// ----- lifecycle: objects arrive and leave in any order -----
+
+/// The route-first arrival order: the foreign ref answers 500 while
+/// nothing claims it, and heals once the binding lands.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test-e2e`"]
+async fn a_binding_created_after_the_route_heals_traffic() -> Result<()> {
+    let scope = Scope::new("binding").await?;
+    let ns = scope.name();
+    let client = scope.client();
+
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .path_prefix("/")
+            .foreign_backend(CLAIM.0, CLAIM.1, CLAIM.2)
+            .build(),
+    )
+    .await?;
+
+    wait_until_routed(&addr, "app.example", "/", StatusCode::INTERNAL_SERVER_ERROR).await?;
+
+    apply_backend_binding(
+        client,
+        &backend_binding(ns, "pool", CLAIM, &[("workers", "echo", 8080)], &[]),
+    )
+    .await?;
+    wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+    Ok(())
+}
+
+/// One spec edit shifts both the targets and the chain: the binding
+/// starts accepted but aimed at a Service that does not exist (500),
+/// and after the update serves through the echo with the new
+/// extension's header.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test-e2e`"]
+async fn a_binding_update_shifts_traffic_and_the_chain() -> Result<()> {
+    let scope = Scope::new("binding").await?;
+    let ns = scope.name();
+    let client = scope.client();
+    let bindings: Api<BackendBinding> = Api::namespaced(client.clone(), ns);
+
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+    for (name, value) in [("mark-a", "via-a"), ("mark-b", "via-b")] {
+        apply_extension(
+            client,
+            &extension(
+                ns,
+                name,
+                "request_header_modifier",
+                json!({ "add": [{ "name": "x-test-bound", "value": value }] }),
+            ),
+        )
+        .await?;
+    }
+    apply_backend_binding(
+        client,
+        &backend_binding(ns, "pool", CLAIM, &[("workers", "gone", 8080)], &["mark-a"]),
+    )
+    .await?;
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .path_prefix("/")
+            .foreign_backend(CLAIM.0, CLAIM.1, CLAIM.2)
+            .build(),
+    )
+    .await?;
+
+    // Accepted, but the target does not exist: the substituted ref
+    // rides unresolved and its share answers 500.
+    let reason = wait_for_condition(&bindings, "pool", "Accepted", "True").await?;
+    assert_eq!(reason, "Accepted");
+    wait_until_routed(&addr, "app.example", "/", StatusCode::INTERNAL_SERVER_ERROR).await?;
+
+    let updated = backend_binding(ns, "pool", CLAIM, &[("workers", "echo", 8080)], &["mark-b"]);
+    update_backend_binding_spec(client, ns, "pool", &updated.spec).await?;
+
+    let resp = wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+    assert_eq!(
+        resp.headers().get("x-echo-bound").unwrap(),
+        "via-b",
+        "the updated chain must run, not the original"
+    );
+    Ok(())
+}
+
+/// Deleting the binding degrades the route to the unclaimed 500 —
+/// garbage collection is just deletion — and restoring it heals.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test-e2e`"]
+async fn a_deleted_binding_degrades_and_restores() -> Result<()> {
+    let scope = Scope::new("binding").await?;
+    let ns = scope.name();
+    let client = scope.client();
+
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+    let binding = backend_binding(ns, "pool", CLAIM, &[("workers", "echo", 8080)], &[]);
+    apply_backend_binding(client, &binding).await?;
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .path_prefix("/")
+            .foreign_backend(CLAIM.0, CLAIM.1, CLAIM.2)
+            .build(),
+    )
+    .await?;
+    wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+
+    delete_backend_binding(client, ns, "pool").await?;
+    wait_until_routed(&addr, "app.example", "/", StatusCode::INTERNAL_SERVER_ERROR).await?;
+
+    apply_backend_binding(client, &binding).await?;
+    wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
     Ok(())
 }
