@@ -1,6 +1,11 @@
 //! The bllmp selector: streams the request body to a Buoyant LLM
 //! Picker, dispatches to the endpoint or provider backend it picks
 //! with the body it returns, and reports how the request went.
+//!
+//! A provider pick may also name the request line to dispatch on,
+//! replacing the client's; the picker routes to a model the client
+//! did not ask for, and the destination that wins may spell the same
+//! operation somewhere else.
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
@@ -19,6 +24,7 @@ use gateway_extension::{
     BodyMode, BodySource, Cx, Declarations, Error, Extension, ExtensionBuilder, ExtensionClass,
     Held, LocalResponse, ResponseEnd, ResponseMode, Selected, Selection, Target, async_trait,
 };
+use http::uri::PathAndQuery;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
 use serde::Deserialize;
@@ -562,10 +568,38 @@ fn pick_target(
             } else {
                 format!("{}/{}", backend_ref.namespace, backend_ref.name)
             };
-            Ok(Target::Backend { name })
+            Ok(Target::Backend {
+                name,
+                path: dispatch_path(&provider.path)?,
+            })
         }
         None => Err("picker returned OK without a destination".into()),
     }
+}
+
+/// The request line a provider pick dispatches on. The wire spells
+/// "leave it alone" as the empty field, so that collapses to `None`
+/// here, as it does in the picker that sends it.
+///
+/// The rest is parsed rather than carried through as a string: the
+/// picker validates only that the path starts with '/' and has no
+/// URL to check it against, so a value that cannot be a request
+/// target reaches us intact. Failing here answers the client a 500
+/// and arms the terminal abort with `BACKEND_UNRESOLVED`, which is
+/// the one signal that tells the picker its destination did not
+/// work; building an invalid uri at dispatch would fail the same
+/// request with nothing said back.
+fn dispatch_path(path: &str) -> Result<Option<PathAndQuery>, Error> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if !path.starts_with('/') {
+        return Err(format!("picker path `{path}` does not start with '/'").into());
+    }
+    let parsed = path
+        .parse::<PathAndQuery>()
+        .map_err(|e| format!("picker path `{path}` is not a valid request target: {e}"))?;
+    Ok(Some(parsed))
 }
 
 fn clamp_u32(n: u64) -> u32 {
@@ -782,11 +816,16 @@ qos: Batch
     // ---- pick_target: provider destinations ----
 
     fn provider_pick(ns: &str, name: &str) -> proto::pick_response::Destination {
+        provider_pick_on(ns, name, "")
+    }
+
+    fn provider_pick_on(ns: &str, name: &str, path: &str) -> proto::pick_response::Destination {
         proto::pick_response::Destination::Provider(proto::ProviderTarget {
             backend_ref: Some(proto::BackendRef {
                 namespace: ns.into(),
                 name: name.into(),
             }),
+            path: path.into(),
         })
     }
 
@@ -796,21 +835,73 @@ qos: Batch
     #[test]
     fn provider_pick_joins_a_namespaced_ref() {
         let target = pick_target(Some(provider_pick("prod", "openai")), &Cx::new()).expect("maps");
-        assert!(matches!(target, Target::Backend { name } if name == "prod/openai"));
+        assert!(matches!(target, Target::Backend { name, .. } if name == "prod/openai"));
     }
 
     #[test]
     fn provider_pick_keeps_a_flat_ref_bare() {
         let target = pick_target(Some(provider_pick("", "openai")), &Cx::new()).expect("maps");
-        assert!(matches!(target, Target::Backend { name } if name == "openai"));
+        assert!(matches!(target, Target::Backend { name, .. } if name == "openai"));
     }
 
     #[test]
     fn provider_pick_without_a_ref_fails() {
         let destination = Some(proto::pick_response::Destination::Provider(
-            proto::ProviderTarget { backend_ref: None },
+            proto::ProviderTarget {
+                backend_ref: None,
+                path: String::new(),
+            },
         ));
         assert!(pick_target(destination, &Cx::new()).is_err());
+    }
+
+    // ---- pick_target: the dispatch path ----
+
+    fn picked_path(path: &str) -> Option<PathAndQuery> {
+        let target =
+            pick_target(Some(provider_pick_on("prod", "openai", path)), &Cx::new()).expect("maps");
+        let Target::Backend { path, .. } = target else {
+            panic!("a provider pick is a dialable backend");
+        };
+        path
+    }
+
+    /// The wire spells "leave the request line alone" as the empty
+    /// field; nothing else means it.
+    #[test]
+    fn an_empty_pick_path_is_no_rewrite() {
+        assert!(picked_path("").is_none());
+    }
+
+    /// The whole request line is replaced, query included: a pick
+    /// that carries no query leaves the client none.
+    #[test]
+    fn a_pick_path_carries_its_query() {
+        assert_eq!(picked_path("/v1/messages").unwrap(), "/v1/messages");
+        assert_eq!(
+            picked_path("/v1/messages?beta=true").unwrap(),
+            "/v1/messages?beta=true"
+        );
+    }
+
+    /// The picker gates only on a leading '/' and has no url to check
+    /// the rest against, so both halves of that are ours to enforce.
+    #[test]
+    fn a_pick_path_that_is_not_a_request_target_fails() {
+        let err = pick_target(
+            Some(provider_pick_on("prod", "openai", "v1/messages")),
+            &Cx::new(),
+        )
+        .expect_err("a relative path is not a request line");
+        assert!(err.to_string().contains("does not start with '/'"), "{err}");
+
+        assert!(
+            pick_target(
+                Some(provider_pick_on("prod", "openai", "/v1/mes sages")),
+                &Cx::new()
+            )
+            .is_err()
+        );
     }
 
     // ---- the terminal abort's reason ----
@@ -1053,12 +1144,18 @@ qos: Batch
 
     #[tokio::test]
     async fn select_dispatches_a_provider_pick() {
-        let pick = ok_pick(provider_pick("prod", "openai"), 9);
+        let pick = ok_pick(provider_pick_on("prod", "openai", "/v1/messages"), 9);
         let (service, _aborts) = spawn_picker(pick, vec![Bytes::from_static(b"rewritten")]).await;
 
         let mut cx = Cx::new();
         let selection = dispatched(run_select(&service, &mut cx).await.1);
-        assert!(matches!(selection.target, Target::Backend { ref name } if name == "prod/openai"));
+        let Target::Backend { ref name, ref path } = selection.target else {
+            panic!("a provider pick is a dialable backend");
+        };
+        assert_eq!(name, "prod/openai");
+        // Over a real exchange, so the request line the picker chose
+        // survives the wire and not just the mapping.
+        assert_eq!(path.as_ref().expect("a path was picked"), "/v1/messages");
         let BodySource::Stream(body, len) = selection.body else {
             panic!("a pick's body streams back from the picker");
         };

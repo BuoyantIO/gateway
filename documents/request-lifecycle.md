@@ -278,9 +278,18 @@ may forward the original unchanged or return a `Replace`.
   not consulted: a selector may pick an endpoint that passive health
   tracking evicted, on the grounds that its information (live worker
   metrics) supersedes dial-failure counters.
-  `Target::Backend { name }` names a dialable backend, and produces
-  the same `Destination` the weighted pick would: same host, same
-  path prefix, same accounting entry.
+  `Target::Backend { name, path }` names a dialable backend, and
+  produces the same `Destination` the weighted pick would: same host,
+  same path prefix, same accounting entry. Its `path` is a request
+  line to dispatch on in place of the client's; `None` leaves the
+  client's alone. The replacement stands in for what the client sent,
+  so the backend's own prefix is still joined ahead of it, and it
+  replaces the client's path *and* query together: a selector
+  dispatching on a bare path leaves the client's query behind. It
+  exists for a picker whose chosen destination spells the same
+  operation somewhere else; a rewritten body cannot move the request
+  line. An endpoint pick carries none: that endpoint is a member of
+  the service the client addressed.
 - `Selected::Respond(LocalResponse)` — the client receives the
   response; no upstream is contacted. Reason `ok`, as in the request
   pass: shedding is the route working as configured.
@@ -325,7 +334,7 @@ place the two backend kinds differ:
 | authority | the chosen endpoint's `ip:port`, already resolved by the control plane | the backend's `host:port`, resolved by the client at dial time |
 | scheme | `http` | `https` when the backend has a TLS block, `http` otherwise |
 | `Host` | the client's, carried through: the endpoint is one member of the service the client addressed | not the client's: the backend answers for a different origin. The client's header is dropped, and on H1 the client fills in the one that matches the upstream URI (default port left off); on H2 the URI's authority becomes `:authority`, which needs no `Host` beside it |
-| path | forwarded untouched | the backend's prefix joined ahead of it. Trailing slashes on the prefix are dropped and the request path supplies the separator, so `/v1` and `/v1/` both send `/chat` to `/v1/chat` and `/` to `/v1/`; a prefix of only slashes adds nothing. The query is preserved |
+| path | forwarded untouched | the backend's prefix joined ahead of it. Trailing slashes on the prefix are dropped and the request path supplies the separator, so `/v1` and `/v1/` both send `/chat` to `/v1/chat` and `/` to `/v1/`; a prefix of only slashes adds nothing. The query is preserved, unless a selector replaced the request line, which replaces the query with it |
 | accounting | the endpoint's `EndpointInfo`, keyed by endpoint name | one logical endpoint keyed by the backend's own name |
 
 Nothing here imposes a response-header timeout: a backend that is

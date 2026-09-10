@@ -657,6 +657,15 @@ async fn serve_selected(
     };
     let _active = dest.info.acquire();
 
+    if let Err(reason) = apply_selected_path(&selection.target, &mut parts) {
+        return short_circuit(
+            &mut instances,
+            &mut cx,
+            synthesize_status(StatusCode::INTERNAL_SERVER_ERROR),
+            RequestOutcome::short_circuit(listener, route_name, reason),
+        );
+    }
+
     let upstream_body = match apply_body_source(selection.body, &mut parts, held_body) {
         Ok(body) => body,
         Err(e) => {
@@ -744,7 +753,7 @@ fn validate_target(
             };
             Some(Destination::at_endpoint(&endpoint, active.protocol(), info))
         }
-        Target::Backend { name } => {
+        Target::Backend { name, .. } => {
             let active = named_backend(route, name)?;
             let ActiveBackendKind::Dialable(dialable) = &active.kind else {
                 tracing::warn!(%name, "selector targeted an endpoint-set backend as dialable");
@@ -757,6 +766,39 @@ fn validate_target(
             ))
         }
     }
+}
+
+/// A selector may dispatch on a request line of its own, replacing
+/// the client's path *and* query wholesale: a picker that routes to a
+/// provider spelling the same operation elsewhere cannot say so by
+/// rewriting the body. The replacement stands in for what the client
+/// sent, so the backend's own path prefix is still joined ahead of it
+/// at dispatch, exactly as it would be for the path this displaces.
+///
+/// Only a dialable backend carries one; an endpoint pick is a member
+/// of the service the client addressed and keeps the client's line.
+fn apply_selected_path(target: &Target, parts: &mut http::request::Parts) -> Result<(), Reason> {
+    let Target::Backend {
+        path: Some(path), ..
+    } = target
+    else {
+        return Ok(());
+    };
+    let mut uri = parts.uri.clone().into_parts();
+    uri.path_and_query = Some(path.clone());
+    // Unreachable in practice: a path-and-query is legal beside any
+    // scheme/authority combination an inbound request can carry,
+    // including none at all. Dispatching on the line the selector
+    // replaced would route the request somewhere it asked us not to,
+    // so the request fails instead, as every other bad selection
+    // does.
+    let rewritten = Uri::from_parts(uri).map_err(|e| {
+        tracing::warn!(error = %e, %path, "selector path cannot be applied to the request uri");
+        Reason::Internal
+    })?;
+    tracing::debug!(uri = %rewritten, "selector replaced the request line");
+    parts.uri = rewritten;
+    Ok(())
 }
 
 /// The backend one of the rule's refs names, or `None` with the
@@ -2413,6 +2455,7 @@ mod tests {
         let route = selection_route(vec![ref_with_endpoint("be-a", 8080)]);
         let target = Target::Backend {
             name: "be-a".into(),
+            path: None,
         };
         assert!(validate_target(&target, &route, &lb).is_none());
     }
@@ -2536,6 +2579,54 @@ mod tests {
         assert_eq!(upstream_path(Some("/v1"), "/chat?a=1"), "/v1/chat?a=1");
         assert_eq!(upstream_path(Some("/v1/"), "/chat"), "/v1/chat");
         assert_eq!(upstream_path(Some("/v1"), "/"), "/v1/");
+    }
+
+    /// The request line a selector chose is the whole of it: the
+    /// client's query goes with the path it belonged to. Everything
+    /// else about the uri survives, so dispatch still builds the
+    /// same upstream target around it.
+    #[test]
+    fn a_selected_path_replaces_the_whole_request_line() {
+        let mut parts = request_parts("http://gateway.example.com/chat?keep=me");
+        apply_selected_path(
+            &Target::Backend {
+                name: "provider".into(),
+                path: Some("/messages?beta=true".parse().unwrap()),
+            },
+            &mut parts,
+        )
+        .expect("a path-and-query applies to any inbound uri");
+        assert_eq!(parts.uri, "http://gateway.example.com/messages?beta=true");
+    }
+
+    #[test]
+    fn a_selection_without_a_path_leaves_the_request_line_alone() {
+        let mut parts = request_parts("/chat?keep=me");
+        apply_selected_path(
+            &Target::Backend {
+                name: "provider".into(),
+                path: None,
+            },
+            &mut parts,
+        )
+        .expect("no path is not a failure");
+        assert_eq!(parts.uri, "/chat?keep=me");
+
+        // An endpoint pick is a member of the service the client
+        // addressed, so it never carries one to begin with.
+        apply_selected_path(
+            &Target::Endpoint {
+                backend: "be".into(),
+                addr: "127.0.0.1:8080".parse().unwrap(),
+            },
+            &mut parts,
+        )
+        .expect("an endpoint pick carries no path");
+        assert_eq!(parts.uri, "/chat?keep=me");
+    }
+
+    fn request_parts(uri: &str) -> http::request::Parts {
+        Request::builder().uri(uri).body(()).unwrap().into_parts().0
     }
 
     #[test]

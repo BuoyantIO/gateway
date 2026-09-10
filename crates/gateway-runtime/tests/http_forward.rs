@@ -77,10 +77,15 @@ async fn spawn_http_echo() -> u16 {
                         .map(str::to_owned)
                         .or_else(|| req.uri().authority().map(ToString::to_string))
                         .unwrap_or_default();
+                    let target = req
+                        .uri()
+                        .path_and_query()
+                        .map_or_else(|| path.clone(), ToString::to_string);
                     let body_text = format!("{method} {path}");
                     let mut builder = http::Response::builder()
                         .status(StatusCode::OK)
                         .header("x-server-version", server_version)
+                        .header("x-echo-target", target)
                         .header("x-echo-host", host);
                     for (k, v) in echoed {
                         builder = builder.header(k, v);
@@ -2366,8 +2371,9 @@ enum HeldSeen {
 enum PickPlan {
     /// Pick this endpoint and forward this body source.
     Target(SocketAddr, PickBody),
-    /// Pick the rule's ref by name, as a dialable backend.
-    Backend(PickBody),
+    /// Pick the rule's ref by name, as a dialable backend, with an
+    /// optional request line replacing the client's.
+    Backend(PickBody, Option<&'static str>),
     Respond,
     Fail,
 }
@@ -2424,9 +2430,10 @@ impl Extension for Picker {
                 },
                 body: pick_body(body, &held)?,
             })),
-            PickPlan::Backend(body) => Ok(Selected::Target(Selection {
+            PickPlan::Backend(body, path) => Ok(Selected::Target(Selection {
                 target: Target::Backend {
                     name: self.backend.to_owned(),
+                    path: path.map(|p| p.parse().expect("test path is a request target")),
                 },
                 body: pick_body(body, &held)?,
             })),
@@ -2927,7 +2934,7 @@ async fn a_selector_can_target_a_dialable_backend() {
     let (be_a, hits_a) = spawn_port_echo().await;
     let be_b = spawn_http_echo().await;
     let picked =
-        spawn_picked_dialable_route(be_a, be_b, PickPlan::Backend(PickBody::Forward)).await;
+        spawn_picked_dialable_route(be_a, be_b, PickPlan::Backend(PickBody::Forward, None)).await;
 
     let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
@@ -2949,6 +2956,69 @@ async fn a_selector_can_target_a_dialable_backend() {
     assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+/// A picker routes to a provider that spells the same operation
+/// somewhere else, so it dispatches on a request line of its own.
+/// The backend's prefix is still joined ahead of it: what the
+/// selector replaces is the client's path, not the backend's.
+#[tokio::test]
+async fn a_selector_can_replace_the_request_line() {
+    let (be_a, hits_a) = spawn_port_echo().await;
+    let be_b = spawn_http_echo().await;
+    let picked = spawn_picked_dialable_route(
+        be_a,
+        be_b,
+        PickPlan::Backend(PickBody::Forward, Some("/messages?beta=true")),
+    )
+    .await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "http://127.0.0.1:{}/chat?keep=me",
+            picked.bind_port
+        ))
+        .header("host", "gateway.example.com")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("x-echo-target").unwrap(),
+        "/v1/messages?beta=true"
+    );
+    assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// The replacement is the whole request line, query included: a
+/// selector that dispatches on a bare path leaves the client's query
+/// behind rather than carrying it onto a path that never had it.
+#[tokio::test]
+async fn a_replaced_request_line_drops_the_client_query() {
+    let (be_a, _hits_a) = spawn_port_echo().await;
+    let be_b = spawn_http_echo().await;
+    let picked = spawn_picked_dialable_route(
+        be_a,
+        be_b,
+        PickPlan::Backend(PickBody::Forward, Some("/messages")),
+    )
+    .await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "http://127.0.0.1:{}/chat?keep=me",
+            picked.bind_port
+        ))
+        .header("host", "gateway.example.com")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-echo-target").unwrap(), "/v1/messages");
+}
+
 #[tokio::test]
 async fn targeting_an_endpoint_set_as_dialable_fails_the_request() {
     let (be_a, hits_a) = spawn_port_echo().await;
@@ -2959,7 +3029,7 @@ async fn targeting_an_endpoint_set_as_dialable_fails_the_request() {
         be_a,
         be_b,
         BodyMode::None,
-        PickPlan::Backend(PickBody::Forward),
+        PickPlan::Backend(PickBody::Forward, None),
     )
     .await;
 

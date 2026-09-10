@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 use gateway_config::extension::FailureMode;
+use http::uri::PathAndQuery;
 use http::{HeaderMap, StatusCode};
 use http_body_util::combinators::BoxBody;
 
@@ -248,7 +249,12 @@ pub enum Target {
     /// An endpoint of a Service-backed backend.
     Endpoint { backend: String, addr: SocketAddr },
     /// A dialable backend; the host attaches auth and dials it.
-    Backend { name: String },
+    Backend {
+        name: String,
+        /// The request line to dispatch on, replacing the client's
+        /// path *and* query; `None` leaves the request line alone.
+        path: Option<PathAndQuery>,
+    },
 }
 
 /// The request body the host forwards upstream.
