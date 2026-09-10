@@ -164,11 +164,26 @@ pub struct RouteResolution<'a> {
     /// Emission edges: accepted listeners this route programs, with
     /// the precomputed hostname intersection.
     pub edges: Vec<RouteEdge<'a>>,
-    /// Backend resolution per rule, in rule order, refs in spec order.
+    /// Backend resolution per rule, in rule order, refs in spec
+    /// order. A claimed foreign ref contributes one entry per ref of
+    /// the binding that claims it, at the foreign ref's position.
     pub rule_backends: Vec<Vec<BackendResolution<'a>>>,
-    /// The route's `extensionRef` filters, resolved. Refs are
-    /// route-local; deduped by identity across rules.
+    /// Extensions prepended per rule, in rule order: the extension
+    /// chains of the bindings whose claims the rule's refs matched.
+    /// Emitted ahead of the rule's own filters.
+    pub rule_prepends: Vec<Vec<PrependedExtension>>,
+    /// The route's `extensionRef` filters plus the extensions of
+    /// every binding it resolves through, deduped by
+    /// (namespace, name).
     pub extensions: Vec<ExtRef<'a>>,
+}
+
+/// One extension a binding prepends to a using rule's filter chain.
+/// The namespace is the binding's, not the route's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrependedExtension {
+    pub namespace: String,
+    pub name: String,
 }
 
 /// One `extensionRef` of a route, resolved against the watched
@@ -200,10 +215,20 @@ pub struct RouteEdge<'a> {
 }
 
 pub struct BackendResolution<'a> {
+    /// The route spec ref this resolution came from. Entries
+    /// substituted from one claimed foreign ref all share it.
     pub backend_ref: &'a HttpRouteRulesBackendRefs,
+    /// The weight emitted on the wire: the spec ref's own, or its
+    /// share of a claimed ref's weight split across the binding's
+    /// refs.
+    pub weight: u32,
+    /// Service port of the target — the spec ref's, or the binding
+    /// ref's for a substituted entry.
+    pub port: Option<i32>,
     pub outcome: BackendOutcome<'a>,
 }
 
+#[derive(Clone)]
 pub enum BackendOutcome<'a> {
     /// Service present with a usable `ClusterIP`; an upsert is
     /// emitted carrying the per-pod endpoints derived from the
@@ -241,8 +266,11 @@ pub enum BackendOutcome<'a> {
     /// second one has no sensible reading.
     PortNotAllowed,
     /// A group/kind pair that is neither a core `Service` nor our
-    /// `GatewayBackend`: dropped entirely.
-    UnsupportedKind,
+    /// `GatewayBackend`, and no accepted binding claims it. The ref
+    /// is emitted under a key that can never register (`~` appears
+    /// in no real key), so its share of the rule's traffic answers
+    /// 500 instead of being redistributed to the sibling refs.
+    UnsupportedKind { key: String },
 }
 
 /// One usable pod address for a backend, derived from the Service's
@@ -369,19 +397,28 @@ pub enum CredentialOutcome {
     KeyMissing,
 }
 
-/// One `BackendBinding`, decided once per pass.
+/// One `BackendBinding`, decided once per pass. Routes whose refs
+/// the claim matches copy the per-ref resolutions from here, so a
+/// binding ten routes resolve through is still decided once.
 pub struct BackendBindingResolution<'a> {
     pub object: &'a crd::BackendBinding,
     pub namespace: String,
     pub name: String,
-    pub outcome: BackendBindingOutcome,
+    pub outcome: BackendBindingOutcome<'a>,
 }
 
-pub enum BackendBindingOutcome {
+pub enum BackendBindingOutcome<'a> {
     /// The spec can stand in for a claimed ref: the claim is
-    /// complete and every target is of a native kind. Whether the
-    /// targets exist is decided where they are resolved, not here.
-    Accepted,
+    /// complete, every target is of a native kind, and the port
+    /// rules hold. `refs` carries one resolution per backendRef, in
+    /// spec order — a target that does not exist stays unresolved
+    /// here (and 500s when routed to) rather than failing the
+    /// binding.
+    Accepted { refs: Vec<BindingRefResolution<'a>> },
+    /// Another accepted binding claims the same triple. No winner:
+    /// every claimant is conflicted, whatever the arrival order, and
+    /// none resolves. `message` names the others.
+    Conflicted { message: String },
     /// The spec cannot stand in for anything; the binding never
     /// enters the claim index. `reason` is the status condition
     /// reason.
@@ -389,6 +426,16 @@ pub enum BackendBindingOutcome {
         reason: &'static str,
         message: String,
     },
+}
+
+/// One backendRef of an accepted binding, resolved like a route's
+/// own ref: same keys, same outcomes.
+pub struct BindingRefResolution<'a> {
+    /// The entry's identity name from the spec.
+    pub name: String,
+    /// Service port of the target, `None` for a `GatewayBackend`.
+    pub port: Option<i32>,
+    pub outcome: BackendOutcome<'a>,
 }
 
 /// Names of the `GatewayClass`es whose `controllerName` is ours.
@@ -429,13 +476,18 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         .map(|(idx, b)| ((b.namespace.as_str(), b.name.as_str()), idx))
         .collect();
 
-    let backend_bindings = resolve_backend_bindings(&state.backend_bindings);
+    let mut backend_bindings = resolve_backend_bindings(
+        &state.backend_bindings,
+        &services_by_id,
+        &slices_by_service,
+        &dialables_by_id,
+    );
     // Keys borrow from the watched objects, not from the resolution
     // entries, so the index and the entries move into `Resolution`
     // together.
     let mut bindings_by_claim: HashMap<(&str, &str, &str, &str), Vec<usize>> = HashMap::new();
     for (idx, b) in backend_bindings.iter().enumerate() {
-        if !matches!(b.outcome, BackendBindingOutcome::Accepted) {
+        if !matches!(b.outcome, BackendBindingOutcome::Accepted { .. }) {
             continue;
         }
         let object: &'a crd::BackendBinding = b.object;
@@ -448,6 +500,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
             .or_default()
             .push(idx);
     }
+    demote_conflicting_claims(&mut backend_bindings, &bindings_by_claim);
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
     for gw in &state.gateways {
@@ -504,6 +557,8 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
                 &slices_by_service,
                 &dialables_by_id,
                 &extensions_by_id,
+                &backend_bindings,
+                &bindings_by_claim,
             ));
         }
     }
@@ -706,15 +761,36 @@ fn resolve_route_parent<'a>(
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
     dialables_by_id: &HashMap<(&str, &str), usize>,
     extensions_by_id: &HashMap<(&str, &str), &'a crate::crd::Extension>,
+    backend_bindings: &[BackendBindingResolution<'a>],
+    bindings_by_claim: &HashMap<(&str, &str, &str, &str), Vec<usize>>,
 ) -> RouteResolution<'a> {
-    let rule_backends = resolve_rule_backends(
+    let (rule_backends, rule_prepends) = resolve_rule_backends(
         hr,
         route_ns,
         services_by_id,
         slices_by_service,
         dialables_by_id,
+        backend_bindings,
+        bindings_by_claim,
     );
-    let extensions = resolve_route_extensions(hr, route_ns, extensions_by_id);
+    let mut extensions = resolve_route_extensions(hr, route_ns, extensions_by_id);
+    // The bindings' extensions join the route's own so their objects
+    // are emitted; the per-rule prepend lists carry the ordering.
+    let mut seen: std::collections::HashSet<(String, String)> = extensions
+        .iter()
+        .map(|e| (e.namespace.clone(), e.name.clone()))
+        .collect();
+    for p in rule_prepends.iter().flatten() {
+        if seen.insert((p.namespace.clone(), p.name.clone())) {
+            extensions.push(ExtRef {
+                namespace: p.namespace.clone(),
+                name: p.name.clone(),
+                object: extensions_by_id
+                    .get(&(p.namespace.as_str(), p.name.as_str()))
+                    .copied(),
+            });
+        }
+    }
 
     let Some((gw_idx, gateway)) = gateway else {
         return RouteResolution {
@@ -726,6 +802,7 @@ fn resolve_route_parent<'a>(
             outcome: RouteParentOutcome::NoMatchingParent,
             edges: Vec::new(),
             rule_backends,
+            rule_prepends,
             extensions,
         };
     };
@@ -793,6 +870,7 @@ fn resolve_route_parent<'a>(
         outcome,
         edges,
         rule_backends,
+        rule_prepends,
         extensions,
     }
 }
@@ -829,36 +907,110 @@ fn resolve_route_extensions<'a>(
     refs
 }
 
+/// Resolve every rule's backendRefs, substituting claimed foreign
+/// refs through their bindings. Returns the per-rule resolutions and
+/// the per-rule extension prepend lists the substitutions brought
+/// with them.
 fn resolve_rule_backends<'a>(
     hr: &'a HTTPRoute,
     route_ns: &str,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
     dialables_by_id: &HashMap<(&str, &str), usize>,
-) -> Vec<Vec<BackendResolution<'a>>> {
-    hr.spec
-        .rules
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .map(|rule| {
-            rule.backend_refs
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|br| BackendResolution {
-                    backend_ref: br,
-                    outcome: resolve_backend(
-                        br,
-                        route_ns,
-                        services_by_id,
-                        slices_by_service,
-                        dialables_by_id,
-                    ),
-                })
-                .collect()
-        })
-        .collect()
+    backend_bindings: &[BackendBindingResolution<'a>],
+    bindings_by_claim: &HashMap<(&str, &str, &str, &str), Vec<usize>>,
+) -> (
+    Vec<Vec<BackendResolution<'a>>>,
+    Vec<Vec<PrependedExtension>>,
+) {
+    let mut rule_backends = Vec::new();
+    let mut rule_prepends = Vec::new();
+    for rule in hr.spec.rules.as_deref().unwrap_or(&[]) {
+        let mut backends: Vec<BackendResolution<'a>> = Vec::new();
+        let mut prepends: Vec<PrependedExtension> = Vec::new();
+        for br in rule.backend_refs.as_deref().unwrap_or(&[]) {
+            if let Some(binding) =
+                claimed_binding(br, route_ns, backend_bindings, bindings_by_claim)
+            {
+                substitute_ref(br, binding, &mut backends, &mut prepends);
+                continue;
+            }
+            backends.push(BackendResolution {
+                backend_ref: br,
+                weight: br.weight.unwrap_or(1).unsigned_abs(),
+                port: br.port,
+                outcome: resolve_backend(
+                    br,
+                    route_ns,
+                    services_by_id,
+                    slices_by_service,
+                    dialables_by_id,
+                ),
+            });
+        }
+        rule_backends.push(backends);
+        rule_prepends.push(prepends);
+    }
+    (rule_backends, rule_prepends)
+}
+
+/// The one binding a foreign-kind ref resolves through: its claim
+/// matches the ref's (group, kind, name) in the route's namespace,
+/// and it is the only accepted claimant. A conflicted claim resolves
+/// nothing.
+fn claimed_binding<'a, 'b>(
+    br: &HttpRouteRulesBackendRefs,
+    route_ns: &str,
+    backend_bindings: &'b [BackendBindingResolution<'a>],
+    bindings_by_claim: &HashMap<(&str, &str, &str, &str), Vec<usize>>,
+) -> Option<&'b BackendBindingResolution<'a>> {
+    if !matches!(classify_ref(br), RefKind::Unsupported) {
+        return None;
+    }
+    let group = br.group.as_deref().unwrap_or("");
+    let kind = br.kind.as_deref().unwrap_or("Service");
+    let indices = bindings_by_claim.get(&(route_ns, group, kind, br.name.as_str()))?;
+    let [index] = indices.as_slice() else {
+        return None; // conflicted: every claimant was demoted
+    };
+    let binding = &backend_bindings[*index];
+    matches!(binding.outcome, BackendBindingOutcome::Accepted { .. }).then_some(binding)
+}
+
+/// Replace one claimed ref with the binding's refs: outcomes copied
+/// from the binding's one resolution, the foreign ref's weight split
+/// evenly with the remainder on the earlier refs, and the binding's
+/// extension chain recorded for the rule.
+fn substitute_ref<'a>(
+    br: &'a HttpRouteRulesBackendRefs,
+    binding: &BackendBindingResolution<'a>,
+    backends: &mut Vec<BackendResolution<'a>>,
+    prepends: &mut Vec<PrependedExtension>,
+) {
+    let BackendBindingOutcome::Accepted { refs } = &binding.outcome else {
+        return;
+    };
+    let weight = br.weight.unwrap_or(1).unsigned_abs();
+    let n = u32::try_from(refs.len()).unwrap_or(u32::MAX);
+    for (idx, r) in refs.iter().enumerate() {
+        let idx = u32::try_from(idx).unwrap_or(u32::MAX);
+        let share = weight / n + u32::from(idx < weight % n);
+        backends.push(BackendResolution {
+            backend_ref: br,
+            weight: share,
+            port: r.port,
+            outcome: r.outcome.clone(),
+        });
+    }
+    for name in &binding.object.spec.extensions {
+        let entry = PrependedExtension {
+            namespace: binding.namespace.clone(),
+            name: name.clone(),
+        };
+        if !prepends.contains(&entry) {
+            prepends.push(entry);
+        }
+    }
 }
 
 /// Resolve every `GatewayBackend` in the cluster: split its
@@ -896,10 +1048,55 @@ fn resolve_gateway_backends<'a>(
     out
 }
 
-/// Decide every `BackendBinding` once. Acceptance is about the spec
-/// alone — a complete claim and native-kind targets — so it needs
-/// nothing looked up.
-fn resolve_backend_bindings(objects: &[crd::BackendBinding]) -> Vec<BackendBindingResolution<'_>> {
+/// A claim with two accepted bindings has no winner: every claimant
+/// is demoted, whatever the arrival order, and route refs matching
+/// the claim stay unresolved. The message names the others.
+fn demote_conflicting_claims(
+    backend_bindings: &mut [BackendBindingResolution<'_>],
+    bindings_by_claim: &HashMap<(&str, &str, &str, &str), Vec<usize>>,
+) {
+    for indices in bindings_by_claim.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let mut names: Vec<String> = indices
+            .iter()
+            .map(|&i| {
+                format!(
+                    "{}/{}",
+                    backend_bindings[i].namespace, backend_bindings[i].name
+                )
+            })
+            .collect();
+        names.sort_unstable();
+        for &i in indices {
+            let own = format!(
+                "{}/{}",
+                backend_bindings[i].namespace, backend_bindings[i].name
+            );
+            let others: Vec<&str> = names
+                .iter()
+                .filter(|n| **n != own)
+                .map(String::as_str)
+                .collect();
+            backend_bindings[i].outcome = BackendBindingOutcome::Conflicted {
+                message: format!("the same claim is made by {}", others.join(", ")),
+            };
+        }
+    }
+}
+
+/// Decide every `BackendBinding` once: spec validation, then one
+/// resolution per backendRef through the same path a route's own
+/// refs take. A target that does not exist leaves its ref
+/// unresolved rather than failing the binding — it substitutes, the
+/// traffic 500s, and it heals when the object lands.
+fn resolve_backend_bindings<'a>(
+    objects: &'a [crd::BackendBinding],
+    services_by_id: &HashMap<(&str, &str), &'a Service>,
+    slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
+    dialables_by_id: &HashMap<(&str, &str), usize>,
+) -> Vec<BackendBindingResolution<'a>> {
     let mut out = Vec::with_capacity(objects.len());
     for object in objects {
         let (Some(namespace), Some(name)) = (
@@ -908,51 +1105,107 @@ fn resolve_backend_bindings(objects: &[crd::BackendBinding]) -> Vec<BackendBindi
         ) else {
             continue;
         };
+        let outcome = match validate_backend_binding(object) {
+            Err(invalid) => invalid,
+            Ok(()) => BackendBindingOutcome::Accepted {
+                refs: object
+                    .spec
+                    .backend_refs
+                    .iter()
+                    .map(|r| {
+                        let kind =
+                            classify_kind(r.target.group.as_deref(), r.target.kind.as_deref());
+                        let ns = r.target.namespace.as_deref().unwrap_or(namespace);
+                        let port = r.target.port.map(i32::from);
+                        BindingRefResolution {
+                            name: r.name.clone(),
+                            port,
+                            outcome: resolve_target(
+                                &kind,
+                                ns,
+                                &r.target.name,
+                                port,
+                                services_by_id,
+                                slices_by_service,
+                                dialables_by_id,
+                            ),
+                        }
+                    })
+                    .collect(),
+            },
+        };
         out.push(BackendBindingResolution {
             object,
             namespace: namespace.to_string(),
             name: name.to_string(),
-            outcome: resolve_backend_binding(object),
+            outcome,
         });
     }
     out
 }
 
-fn resolve_backend_binding(object: &crd::BackendBinding) -> BackendBindingOutcome {
+/// Spec-level acceptance: a complete claim, at least one ref, native
+/// kinds only, and the port rules — a Service target needs a port, a
+/// `GatewayBackend` target must not carry one. All statically
+/// checkable, so a violation cannot heal and belongs on `Accepted`.
+fn validate_backend_binding(
+    object: &crd::BackendBinding,
+) -> Result<(), BackendBindingOutcome<'static>> {
     let spec = &object.spec;
     let claim = &spec.claim;
     if claim.group.is_empty() || claim.kind.is_empty() || claim.name.is_empty() {
-        return BackendBindingOutcome::Invalid {
+        return Err(BackendBindingOutcome::Invalid {
             reason: "InvalidClaim",
             message: "claim group, kind and name must all be set".to_string(),
-        };
+        });
     }
     if spec.backend_refs.is_empty() {
-        return BackendBindingOutcome::Invalid {
+        return Err(BackendBindingOutcome::Invalid {
             reason: "NoBackendRefs",
             message: "backendRefs is empty".to_string(),
-        };
+        });
     }
     for r in &spec.backend_refs {
-        let group = r.target.group.as_deref().unwrap_or("");
-        let kind = r.target.kind.as_deref().unwrap_or("Service");
-        match (group, kind) {
-            ("", "Service") | (GATEWAY_GROUP, "GatewayBackend") => {}
-            _ => {
-                return BackendBindingOutcome::Invalid {
-                    reason: "InvalidBackendRef",
-                    message: format!(
-                        "ref \"{}\" targets {}/{}; a binding resolves only to a core \
-                         Service or a GatewayBackend",
-                        r.name,
-                        if group.is_empty() { "core" } else { group },
-                        kind
-                    ),
-                };
+        let invalid = |message: String| {
+            Err(BackendBindingOutcome::Invalid {
+                reason: "InvalidBackendRef",
+                message,
+            })
+        };
+        match classify_kind(r.target.group.as_deref(), r.target.kind.as_deref()) {
+            RefKind::Service => {
+                if r.target.port.is_none() {
+                    return invalid(format!(
+                        "ref \"{}\" targets a Service and needs a port",
+                        r.name
+                    ));
+                }
+            }
+            RefKind::GatewayBackend => {
+                if r.target.port.is_some() {
+                    return invalid(format!(
+                        "ref \"{}\" targets a GatewayBackend and must not carry a port; \
+                         the port belongs to baseURL",
+                        r.name
+                    ));
+                }
+            }
+            RefKind::Unsupported => {
+                return invalid(format!(
+                    "ref \"{}\" targets {}/{}; a binding resolves only to a core \
+                     Service or a GatewayBackend",
+                    r.name,
+                    r.target
+                        .group
+                        .as_deref()
+                        .filter(|g| !g.is_empty())
+                        .unwrap_or("core"),
+                    r.target.kind.as_deref().unwrap_or("Service"),
+                ));
             }
         }
     }
-    BackendBindingOutcome::Accepted
+    Ok(())
 }
 
 fn resolve_gateway_backend<'a>(
@@ -1165,14 +1418,19 @@ enum RefKind {
     Unsupported,
 }
 
-fn classify_ref(br: &HttpRouteRulesBackendRefs) -> RefKind {
-    let group = br.group.as_deref().unwrap_or("");
-    let kind = br.kind.as_deref().unwrap_or("Service");
-    match (group, kind) {
+/// One classification table for every typed reference to a backend:
+/// a route's backendRef and a binding's target run through the same
+/// rules.
+fn classify_kind(group: Option<&str>, kind: Option<&str>) -> RefKind {
+    match (group.unwrap_or(""), kind.unwrap_or("Service")) {
         ("", "Service") => RefKind::Service,
         (GATEWAY_GROUP, "GatewayBackend") => RefKind::GatewayBackend,
         _ => RefKind::Unsupported,
     }
+}
+
+fn classify_ref(br: &HttpRouteRulesBackendRefs) -> RefKind {
+    classify_kind(br.group.as_deref(), br.kind.as_deref())
 }
 
 fn resolve_backend<'a>(
@@ -1184,11 +1442,14 @@ fn resolve_backend<'a>(
 ) -> BackendOutcome<'a> {
     let kind = classify_ref(br);
     if matches!(kind, RefKind::Unsupported) {
+        // The caller has already ruled out a claim for this ref.
         tracing::warn!(
             name = %br.name, group = ?br.group, kind = ?br.kind,
-            "skipping backendRef of an unsupported kind"
+            "backendRef of an unsupported kind; its share answers 500"
         );
-        return BackendOutcome::UnsupportedKind;
+        return BackendOutcome::UnsupportedKind {
+            key: unresolved_key_string(route_ns, br),
+        };
     }
     // Cross-namespace is refused before anything else is looked at,
     // for either kind: it is a decision about the reference, not
@@ -1201,25 +1462,52 @@ fn resolve_backend<'a>(
         );
         return BackendOutcome::CrossNamespace;
     }
+    if matches!(kind, RefKind::GatewayBackend) && br.port.is_some() {
+        tracing::warn!(
+            name = %br.name, port = ?br.port,
+            "skipping GatewayBackend backendRef carrying a port; the port belongs to baseURL"
+        );
+        return BackendOutcome::PortNotAllowed;
+    }
+    if matches!(kind, RefKind::Service) && br.port.is_none() {
+        return BackendOutcome::NoPort;
+    }
+    resolve_target(
+        &kind,
+        backend_ns,
+        &br.name,
+        br.port,
+        services_by_id,
+        slices_by_service,
+        dialables_by_id,
+    )
+}
+
+/// Resolve one native-kind target to its outcome — the shared tail
+/// of a route backendRef and a binding ref, so both produce the same
+/// keys and the same decisions. The caller has already classified
+/// the kind and enforced the port rules.
+fn resolve_target<'a>(
+    kind: &RefKind,
+    ns: &str,
+    name: &str,
+    port: Option<i32>,
+    services_by_id: &HashMap<(&str, &str), &'a Service>,
+    slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
+    dialables_by_id: &HashMap<(&str, &str), usize>,
+) -> BackendOutcome<'a> {
     if matches!(kind, RefKind::GatewayBackend) {
-        if br.port.is_some() {
-            tracing::warn!(
-                name = %br.name, port = ?br.port,
-                "skipping GatewayBackend backendRef carrying a port; the port belongs to baseURL"
-            );
-            return BackendOutcome::PortNotAllowed;
-        }
-        let key = dialable_key_string(backend_ns, &br.name);
-        return match dialables_by_id.get(&(backend_ns, br.name.as_str())) {
+        let key = dialable_key_string(ns, name);
+        return match dialables_by_id.get(&(ns, name)) {
             Some(&index) => BackendOutcome::Dialable { key, index },
             None => BackendOutcome::MissingDialable { key },
         };
     }
-    let Some(port) = br.port else {
+    let Some(port) = port else {
         return BackendOutcome::NoPort;
     };
-    let key = backend_key_string(backend_ns, &br.name, port);
-    let Some(service) = services_by_id.get(&(backend_ns, br.name.as_str())) else {
+    let key = backend_key_string(ns, name, port);
+    let Some(service) = services_by_id.get(&(ns, name)) else {
         return BackendOutcome::MissingService { key };
     };
     let usable_ip = service
@@ -1231,7 +1519,7 @@ fn resolve_backend<'a>(
         return BackendOutcome::Headless { key };
     }
     let slices = slices_by_service
-        .get(&(backend_ns, br.name.as_str()))
+        .get(&(ns, name))
         .map_or(&[][..], Vec::as_slice);
     BackendOutcome::Resolved {
         key,
@@ -1517,6 +1805,18 @@ pub(crate) fn backend_key_string(svc_ns: &str, svc_name: &str, port: i32) -> Str
 /// always ends in `:port`.
 pub(crate) fn dialable_key_string(ns: &str, name: &str) -> String {
     format!("{ns}/{name}")
+}
+
+/// The key an unclaimed foreign-kind ref is emitted under. `~` is
+/// not a legal Kubernetes name character, so nothing can ever
+/// register this key and the ref's traffic share answers 500.
+fn unresolved_key_string(route_ns: &str, br: &HttpRouteRulesBackendRefs) -> String {
+    format!(
+        "{route_ns}/{}~{}~{}",
+        br.name,
+        br.group.as_deref().unwrap_or(""),
+        br.kind.as_deref().unwrap_or("Service"),
+    )
 }
 
 fn index_by_id<T>(
@@ -2382,7 +2682,7 @@ mod tests {
         ));
         assert!(matches!(
             &outcomes[4].outcome,
-            BackendOutcome::UnsupportedKind
+            BackendOutcome::UnsupportedKind { .. }
         ));
     }
 
@@ -2927,7 +3227,9 @@ mod tests {
                 group: group.map(String::from),
                 kind: kind.map(String::from),
                 name: format!("{name}-target"),
-                port: Some(80),
+                // A Service target needs a port; a GatewayBackend
+                // target must not carry one.
+                port: kind.is_none().then_some(80),
             },
         }
     }
@@ -2979,7 +3281,7 @@ mod tests {
             .collect();
         assert!(matches!(
             by_name["ok"].outcome,
-            BackendBindingOutcome::Accepted
+            BackendBindingOutcome::Accepted { .. }
         ));
         for (name, expected) in [
             ("no-claim", "InvalidClaim"),
@@ -2988,7 +3290,7 @@ mod tests {
         ] {
             match &by_name[name].outcome {
                 BackendBindingOutcome::Invalid { reason, .. } => assert_eq!(*reason, expected),
-                BackendBindingOutcome::Accepted => panic!("{name} must be rejected"),
+                _ => panic!("{name} must be rejected"),
             }
         }
 
@@ -3021,6 +3323,236 @@ mod tests {
         assert_eq!(
             r.bindings_by_claim[&("other", CLAIM.0, CLAIM.1, CLAIM.2)].len(),
             1
+        );
+    }
+
+    /// A route backendRef whose (group, kind, name) is `CLAIM`.
+    fn foreign_ref(weight: Option<i32>) -> HttpRouteRulesBackendRefs {
+        HttpRouteRulesBackendRefs {
+            name: CLAIM.2.into(),
+            group: Some(CLAIM.0.into()),
+            kind: Some(CLAIM.1.into()),
+            weight,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn binding_port_rules_are_enforced_at_acceptance() {
+        let mut service_without_port = binding_ref("workers", None, None);
+        service_without_port.target.port = None;
+        let mut dialable_with_port =
+            binding_ref("openai", Some(GATEWAY_GROUP), Some("GatewayBackend"));
+        dialable_with_port.target.port = Some(443);
+
+        let mut s = state(vec![], vec![]);
+        s.backend_bindings = vec![
+            binding("demo", "no-port", CLAIM, vec![service_without_port]),
+            binding(
+                "demo",
+                "extra-port",
+                ("inference-d.io", "InferencePool", "other"),
+                vec![dialable_with_port],
+            ),
+        ];
+        let r = resolve(&s, OURS);
+
+        for b in &r.backend_bindings {
+            match &b.outcome {
+                BackendBindingOutcome::Invalid { reason, .. } => {
+                    assert_eq!(*reason, "InvalidBackendRef");
+                }
+                _ => panic!("{} must be rejected", b.name),
+            }
+        }
+        assert!(r.bindings_by_claim.is_empty());
+    }
+
+    #[test]
+    fn binding_refs_resolve_like_route_refs() {
+        let mut cross_ns = binding_ref("remote", None, None);
+        cross_ns.target.namespace = Some("other".into());
+
+        let mut s = state(vec![], vec![]);
+        s.services = vec![
+            service("demo", "workers-target", Some("10.0.0.1")),
+            service("other", "remote-target", Some("10.0.0.2")),
+        ];
+        s.gateway_backends = vec![gateway_backend(
+            "demo",
+            "openai-target",
+            "https://api.example.com",
+        )];
+        s.backend_bindings = vec![binding(
+            "demo",
+            "pool",
+            CLAIM,
+            vec![
+                binding_ref("workers", None, None),
+                binding_ref("missing", None, None),
+                binding_ref("openai", Some(GATEWAY_GROUP), Some("GatewayBackend")),
+                cross_ns,
+            ],
+        )];
+        let r = resolve(&s, OURS);
+
+        let BackendBindingOutcome::Accepted { refs } = &r.backend_bindings[0].outcome else {
+            panic!("binding must be accepted");
+        };
+        assert!(matches!(
+            &refs[0].outcome,
+            BackendOutcome::Resolved { key, .. } if key == "demo/workers-target:80"
+        ));
+        assert!(matches!(
+            &refs[1].outcome,
+            BackendOutcome::MissingService { key } if key == "demo/missing-target:80"
+        ));
+        assert!(matches!(
+            &refs[2].outcome,
+            BackendOutcome::Dialable { key, .. } if key == "demo/openai-target"
+        ));
+        // The lookup namespace is the target's, not the binding's.
+        assert!(matches!(
+            &refs[3].outcome,
+            BackendOutcome::Resolved { key, .. } if key == "other/remote-target:80"
+        ));
+    }
+
+    #[test]
+    fn conflicting_claims_demote_every_claimant_in_any_order() {
+        for reversed in [false, true] {
+            let mut bindings = vec![
+                binding("demo", "first", CLAIM, vec![binding_ref("w", None, None)]),
+                binding("demo", "second", CLAIM, vec![binding_ref("w", None, None)]),
+            ];
+            if reversed {
+                bindings.reverse();
+            }
+            let mut s = state(vec![], vec![]);
+            s.backend_bindings = bindings;
+            s.http_routes = vec![route(
+                "demo",
+                "r",
+                vec![parent("gw", None)],
+                None,
+                vec![foreign_ref(None)],
+            )];
+            let r = resolve(&s, OURS);
+
+            for b in &r.backend_bindings {
+                let BackendBindingOutcome::Conflicted { message } = &b.outcome else {
+                    panic!("{} must be conflicted", b.name);
+                };
+                let other = if b.name == "first" {
+                    "demo/second"
+                } else {
+                    "demo/first"
+                };
+                assert_eq!(message, &format!("the same claim is made by {other}"));
+            }
+            // The claim resolves nothing: the ref keeps the key
+            // nothing can register, so its share answers 500.
+            assert!(matches!(
+                &r.routes[0].rule_backends[0][0].outcome,
+                BackendOutcome::UnsupportedKind { key }
+                    if key == "demo/pool~inference-d.io~InferencePool"
+            ));
+        }
+    }
+
+    #[test]
+    fn a_claimed_ref_substitutes_the_bindings_refs() {
+        let mut b = binding(
+            "demo",
+            "pool",
+            CLAIM,
+            vec![
+                binding_ref("workers", None, None),
+                binding_ref("missing", None, None),
+            ],
+        );
+        b.spec.extensions = vec!["picker".into()];
+
+        let mut s = state(vec![], vec![]);
+        s.services = vec![
+            service("demo", "workers-target", Some("10.0.0.1")),
+            service("demo", "native", Some("10.0.0.2")),
+        ];
+        s.backend_bindings = vec![b];
+        s.http_routes = vec![route(
+            "demo",
+            "r",
+            vec![parent("gw", None)],
+            None,
+            vec![foreign_ref(Some(6)), backend_ref("native", None, Some(80))],
+        )];
+        let r = resolve(&s, OURS);
+
+        let backends = &r.routes[0].rule_backends[0];
+        assert_eq!(backends.len(), 3, "one entry per binding ref, in place");
+        assert!(matches!(
+            &backends[0].outcome,
+            BackendOutcome::Resolved { key, .. } if key == "demo/workers-target:80"
+        ));
+        assert!(matches!(
+            &backends[1].outcome,
+            BackendOutcome::MissingService { .. }
+        ));
+        assert!(matches!(
+            &backends[2].outcome,
+            BackendOutcome::Resolved { key, .. } if key == "demo/native:80"
+        ));
+        assert_eq!(
+            backends.iter().map(|b| b.weight).collect::<Vec<_>>(),
+            vec![3, 3, 1],
+            "the foreign ref's weight splits across the binding's refs"
+        );
+
+        assert_eq!(
+            r.routes[0].rule_prepends[0],
+            vec![PrependedExtension {
+                namespace: "demo".into(),
+                name: "picker".into(),
+            }]
+        );
+        assert!(
+            r.routes[0]
+                .extensions
+                .iter()
+                .any(|e| e.namespace == "demo" && e.name == "picker"),
+            "the binding's extension joins the route's for emission"
+        );
+    }
+
+    #[test]
+    fn a_small_weight_splits_with_the_remainder_on_earlier_refs() {
+        let mut s = state(vec![], vec![]);
+        s.backend_bindings = vec![binding(
+            "demo",
+            "pool",
+            CLAIM,
+            vec![
+                binding_ref("a", None, None),
+                binding_ref("b", None, None),
+                binding_ref("c", None, None),
+            ],
+        )];
+        s.http_routes = vec![route(
+            "demo",
+            "r",
+            vec![parent("gw", None)],
+            None,
+            vec![foreign_ref(Some(2))],
+        )];
+        let r = resolve(&s, OURS);
+
+        assert_eq!(
+            r.routes[0].rule_backends[0]
+                .iter()
+                .map(|b| b.weight)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 0],
+            "the total share is preserved; later refs absorb the shortfall"
         );
     }
 }

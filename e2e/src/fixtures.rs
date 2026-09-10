@@ -468,6 +468,25 @@ impl HttpRouteBuilder {
 
     /// A `backendRefs` entry naming a `GatewayBackend`: our group
     /// and kind, and no port — the port is part of its `baseURL`.
+    /// A backendRef of a kind the gateway has no schema for — the
+    /// shape a `BackendBinding` claims.
+    pub fn foreign_backend(mut self, group: &str, kind: &str, name: &str) -> Self {
+        let br = HttpRouteRulesBackendRefs {
+            name: name.into(),
+            port: None,
+            namespace: None,
+            group: Some(group.into()),
+            kind: Some(kind.into()),
+            weight: None,
+            filters: None,
+        };
+        self.pending
+            .backend_refs
+            .get_or_insert_with(Vec::new)
+            .push(br);
+        self
+    }
+
     pub fn dialable_backend(mut self, name: &str) -> Self {
         let br = HttpRouteRulesBackendRefs {
             name: name.into(),
@@ -915,13 +934,15 @@ pub async fn apply_gateway_backend(client: &Client, object: &GatewayBackend) -> 
 }
 
 /// A `BackendBinding` claiming `(group, kind, name)`, resolving to
-/// one Service ref per `(name, service, port)` entry. Empty `refs`
-/// builds the spec the control plane rejects with `NoBackendRefs`.
+/// one Service ref per `(name, service, port)` entry, with
+/// `extensions` prepended to using rules. Empty `refs` builds the
+/// spec the control plane rejects with `NoBackendRefs`.
 pub fn backend_binding(
     ns: &str,
     name: &str,
     claim: (&str, &str, &str),
     refs: &[(&str, &str, u16)],
+    extensions: &[&str],
 ) -> BackendBinding {
     let mut object = BackendBinding::new(
         name,
@@ -944,7 +965,7 @@ pub fn backend_binding(
                     },
                 })
                 .collect(),
-            extensions: Vec::new(),
+            extensions: extensions.iter().map(|e| (*e).to_string()).collect(),
         },
     );
     object.metadata.namespace = Some(ns.into());
