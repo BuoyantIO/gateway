@@ -7,6 +7,25 @@ through. The control plane provisions the data plane from the
 Gateway; the harness only adds a fixed-`NodePort` Service over the
 provisioned pods so tests can reach them from the host.
 
+## Test backends
+
+All three live in the one `gateway-test-echo:e2e` image, selected by
+the container's `command`:
+
+- `echo` — replies `"{method} {path}"` and reflects `X-Test-*`
+  request headers as `X-Echo-*`. Most tests assert through it.
+- `grpc_echo` — the same idea over gRPC, behind a Service whose
+  `appProtocol: grpc` makes the gateway dial h2c.
+- `openai_mock` — a mock inference provider for the egress path. It
+  terminates the TLS the gateway originates, checks the credential
+  the `GatewayBackend` presents, and streams a completion as
+  `text/event-stream` with a configurable gap before the first token
+  (`ttft-ms`) and a configurable tail (`tokens`, `gap-ms`). A
+  plaintext side port serves `/__stats`, one record per request
+  saying what it saw and how much of the response it got to send;
+  `fixtures::provider_stats` reads it through the apiserver pod
+  proxy.
+
 ## Prerequisites
 
 - `docker`

@@ -19,10 +19,15 @@ path = "src/bin/echo.rs"
 name = "grpc_echo"
 path = "src/bin/grpc_echo.rs"
 
+[[bin]]
+name = "openai_mock"
+path = "src/bin/openai_mock.rs"
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
 gateway-api = "0.21"
+gateway-config = { path = "../crates/gateway-config" }
 gateway-cp = { path = "../crates/gateway-cp" }
 http = "1"
 http-body-util = "0.1"
@@ -30,12 +35,14 @@ hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 k8s-openapi = { version = "0.27", features = ["v1_33"] }
 kube = { version = "3.1", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 prost = "0.14"
-serde = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "signal", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 tokio-stream = "0.1"
 tonic = "0.14"
 tonic-prost = "0.14"

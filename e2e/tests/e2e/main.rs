@@ -13,6 +13,7 @@ mod extensions;
 mod filters;
 mod grpc;
 mod ha;
+mod inference;
 mod matches;
 mod metrics;
 mod probes;
