@@ -287,6 +287,7 @@ fn config(bind_port: u16, backends: Vec<Backend>, secrets: Vec<Secret>) -> Gatew
             backend_refs: vec![BackendRef {
                 name: b.name().to_string(),
                 weight: 1,
+                origin: None,
             }],
             filters: vec![],
         })

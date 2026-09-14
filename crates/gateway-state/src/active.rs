@@ -3,7 +3,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use gateway_config::backend::{
-    AlpnProtocol, ApiKeyAuth, BackendAuth, BackendProtocol, ClientAuthMethod, Endpoint, OAuth2Auth,
+    AlpnProtocol, ApiKeyAuth, BackendAuth, BackendOrigin, BackendProtocol, ClientAuthMethod,
+    Endpoint, OAuth2Auth,
 };
 use gateway_config::bind::BindProtocol;
 use gateway_config::extension::Extension;
@@ -87,6 +88,7 @@ pub struct ActiveBackendRef {
     /// destined to this ref is answered with a synthesized 500.
     pub backend: Option<Arc<ActiveBackend>>,
     pub weight: u32,
+    pub origin: Option<Arc<BackendOrigin>>,
 }
 
 /// A registered backend. The key is common to both kinds; what it

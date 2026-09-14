@@ -719,7 +719,14 @@ fn targets_from_route(route: &Arc<ActiveHttpRoute>) -> Targets {
         route
             .backends
             .iter()
-            .map(|br| TargetBackend::new(br.key.0.clone(), br.weight, br.backend.clone()))
+            .map(|br| {
+                TargetBackend::new(
+                    br.key.0.clone(),
+                    br.weight,
+                    br.backend.clone(),
+                    br.origin.clone(),
+                )
+            })
             .collect(),
     )
 }
@@ -2343,6 +2350,7 @@ mod tests {
                 }),
             })),
             weight: 1,
+            origin: None,
         }
     }
 
@@ -2440,6 +2448,7 @@ mod tests {
                 })
             }),
             weight,
+            origin: None,
         }
     }
 

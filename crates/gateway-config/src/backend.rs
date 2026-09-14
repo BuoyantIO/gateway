@@ -263,6 +263,29 @@ pub struct BackendRef {
     pub name: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// The route backendRef this ref stands for. `None` when the
+    /// config did not say — a hand-written data-plane config, or a
+    /// control plane older than the field.
+    #[serde(default)]
+    pub origin: Option<BackendOrigin>,
+}
+
+/// The object a route's backendRef named, as the route named it.
+/// Several refs share one origin when a claimed ref of a kind the
+/// gateway has no schema for was substituted by the refs standing in
+/// for it: the origin is then the claimed object, which is the only
+/// place its identity survives.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendOrigin {
+    /// `""` is the core group.
+    #[serde(default)]
+    pub group: String,
+    /// `""` is `Service`, as in the Gateway API.
+    #[serde(default)]
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
 }
 
 fn default_weight() -> u32 {

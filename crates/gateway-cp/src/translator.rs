@@ -335,7 +335,11 @@ fn emit_routes_under_edge(
         let backend_refs = route
             .rule_backends
             .get(rule_idx)
-            .map(|refs| refs.iter().filter_map(backend_ref_proto).collect())
+            .map(|refs| {
+                refs.iter()
+                    .filter_map(|br| backend_ref_proto(br, route.route_ns))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Binding-prepended extensions run ahead of the rule's own
@@ -398,7 +402,7 @@ fn emit_routes_under_edge(
 /// answer while the object is being fixed. Refs that were rejected
 /// outright (cross-namespace, a Service with no port, a
 /// `GatewayBackend` with one) emit nothing.
-fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> {
+fn backend_ref_proto(backend: &BackendResolution<'_>, route_ns: &str) -> Option<pb::BackendRef> {
     let key = match &backend.outcome {
         BackendOutcome::Resolved { key, .. }
         | BackendOutcome::MissingService { key }
@@ -412,9 +416,19 @@ fn backend_ref_proto(backend: &BackendResolution<'_>) -> Option<pb::BackendRef> 
             return None;
         }
     };
+    let spec = backend.backend_ref;
     Some(pb::BackendRef {
         name: key,
         weight: backend.weight,
+        // Verbatim, with the Gateway API defaults applied; no
+        // decision of its own. For a substituted ref this is the
+        // claimed object, the only place its identity survives.
+        origin: Some(pb::BackendOrigin {
+            group: spec.group.clone().unwrap_or_default(),
+            kind: spec.kind.clone().unwrap_or_else(|| "Service".to_string()),
+            namespace: route_ns.to_string(),
+            name: spec.name.clone(),
+        }),
     })
 }
 
@@ -3759,10 +3773,13 @@ mod tests {
         }
     }
 
-    /// The doc's core claim: the DP cannot tell a route resolved
-    /// through a binding from the same route written natively.
+    /// The doc's core claim, with its one deliberate exception: the
+    /// DP cannot tell a route resolved through a binding from the
+    /// same route written natively, save for each ref's origin —
+    /// where the claimed object's identity survives substitution,
+    /// and the only place the DP can read it.
     #[test]
-    fn a_substituted_route_is_indistinguishable_from_a_native_one() {
+    fn a_substituted_route_differs_from_a_native_one_only_in_its_origins() {
         let native = binding_state(vec![http_route(
             "demo",
             "r",
@@ -3795,13 +3812,76 @@ mod tests {
         let id = ("demo".to_string(), "api".to_string());
         let native_out = translate(&native, OURS);
         let substituted_out = translate(&substituted, OURS);
-        assert!(
-            diff(
-                native_out.get(&id).unwrap(),
-                substituted_out.get(&id).unwrap()
-            )
-            .is_none(),
-            "switching between the two routes must diff to no-op"
+        let one_route = |out: &HashMap<GatewayId, Snapshot>| {
+            out.get(&id)
+                .unwrap()
+                .routes
+                .values()
+                .next()
+                .expect("one route")
+                .clone()
+        };
+        let native = one_route(&native_out);
+        let substituted = one_route(&substituted_out);
+
+        assert_eq!(native.key, substituted.key);
+        assert_eq!(native.matches, substituted.matches);
+        assert_eq!(native.filters, substituted.filters);
+        let without_origins = |route: &pb::HttpRouteUpsert| {
+            route
+                .backend_refs
+                .iter()
+                .map(|br| pb::BackendRef {
+                    origin: None,
+                    ..br.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            without_origins(&native),
+            without_origins(&substituted),
+            "same keys, same weights"
+        );
+
+        // The one difference: a native ref names its own Service,
+        // while every ref substituted for the claimed pool names the
+        // pool the rule pointed at.
+        let origins = |route: &pb::HttpRouteUpsert| {
+            route
+                .backend_refs
+                .iter()
+                .map(|br| br.origin.clone().expect("every ref carries an origin"))
+                .map(|o| (o.group, o.kind, o.namespace, o.name))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            origins(&native),
+            vec![
+                (
+                    String::new(),
+                    "Service".into(),
+                    "demo".into(),
+                    "workers".into()
+                ),
+                (
+                    String::new(),
+                    "Service".into(),
+                    "demo".into(),
+                    "scale".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            origins(&substituted),
+            vec![
+                (
+                    "inference-d.io".into(),
+                    "InferencePool".into(),
+                    "demo".into(),
+                    "pool".into()
+                );
+                2
+            ]
         );
     }
 

@@ -110,6 +110,12 @@ mod tests {
             backend_refs: vec![v1::BackendRef {
                 name: "demo/api-svc:8080".into(),
                 weight: 1,
+                origin: Some(v1::BackendOrigin {
+                    group: String::new(),
+                    kind: "Service".into(),
+                    namespace: "demo".into(),
+                    name: "api-svc".into(),
+                }),
             }],
             filters: vec![v1::HttpFilter {
                 kind: Some(v1::http_filter::Kind::ExtensionRef(v1::ExtensionRef {

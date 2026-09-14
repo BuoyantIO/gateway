@@ -17,7 +17,8 @@ use bytes::Bytes;
 use gateway_config::extension::{ConfigValue, from_value};
 use gateway_extension::{
     BodyMode, BodySource, Cx, Declarations, Error, Extension, ExtensionBuilder, ExtensionClass,
-    Held, LocalResponse, ResponseEnd, ResponseMode, Selected, Selection, Target, async_trait,
+    Held, LocalResponse, ResponseEnd, ResponseMode, Selected, Selection, Target, TargetBackend,
+    async_trait,
 };
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
@@ -39,6 +40,9 @@ pub const BLLMP_SELECTOR: &str = "bllmp_selector";
 
 /// Log target, stable across crate moves: filter on `extension=debug`.
 const LOG: &str = "extension::bllmp_selector";
+
+/// The `kind` of a route backendRef that names a pool.
+const INFERENCE_POOL_KIND: &str = "InferencePool";
 
 /// Protocol cap: one oversized chunk fails the whole push.
 const MAX_CHUNK_BYTES: usize = 1024 * 1024;
@@ -86,21 +90,11 @@ struct Config {
     /// replica does not find it. Multiple replicas need affinity or
     /// shared picker state, neither of which exists yet.
     service: String,
-    /// Absent means the picker picks across everything it serves.
-    #[serde(default)]
-    pool: Option<PoolRef>,
     /// Request header carrying the tenant; `""` sent when absent.
     #[serde(default)]
     tenant_header: Option<String>,
     #[serde(default)]
     qos: Qos,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PoolRef {
-    namespace: String,
-    name: String,
 }
 
 #[derive(Deserialize, Clone, Copy, Default)]
@@ -123,7 +117,6 @@ impl Qos {
 
 /// Everything `configure` prepared, shared by every instance.
 struct Prepared {
-    pool: Option<InferencePoolRef>,
     tenant_header: Option<http::HeaderName>,
     qos: i32,
     /// [`RPC_TIMEOUT`] and [`BODY_SEND_TIMEOUT`] in production;
@@ -162,11 +155,6 @@ impl ExtensionClass for BllmpSelectorClass {
             client,
             reporter,
             prepared: Arc::new(Prepared {
-                pool: cfg.pool.map(|p| InferencePoolRef {
-                    namespace: p.namespace,
-                    name: p.name,
-                    resource_version: String::new(),
-                }),
                 tenant_header,
                 qos: cfg.qos.wire(),
                 rpc_timeout: RPC_TIMEOUT,
@@ -341,7 +329,7 @@ impl Extension for BllmpSelector {
         let pick = client.pick(PickRequest {
             body_stream_id: pushed.stream_id,
             client_request_id: self.client_request_id.clone(),
-            inference_pool: self.prepared.pool.clone(),
+            inference_pool: pool_from_targets(cx),
             qos_class: self.prepared.qos,
             tenant: self.tenant.clone(),
         });
@@ -517,6 +505,33 @@ impl Drop for BllmpSelector {
     }
 }
 
+/// The pool the request was routed to: the `InferencePool` the rule's
+/// backendRefs named, in the route's namespace. The pool is a kind
+/// the gateway has no schema for, so the rule's refs are the ones the
+/// `BackendBinding` claiming it resolved to; each of them still
+/// reports the claimed pool as its origin, which is where this reads
+/// it. `None` — no pool named — when the rule names none, and the
+/// picker then picks across everything it serves.
+///
+/// The group is not matched: the pool CRD lives under more than one
+/// of them and the claim is what gives the kind its meaning here.
+/// The first pool a rule names wins; a rule naming two is a config
+/// with no sensible reading.
+fn pool_from_targets(cx: &Cx) -> Option<InferencePoolRef> {
+    cx.targets()
+        .backends()
+        .iter()
+        .filter_map(TargetBackend::origin)
+        .find(|o| o.kind == INFERENCE_POOL_KIND)
+        .map(|o| InferencePoolRef {
+            namespace: o.namespace.clone(),
+            name: o.name.clone(),
+            // The picker resolves the pool itself; the gateway never
+            // reads the object and has no version to report.
+            resource_version: String::new(),
+        })
+}
+
 /// The dispatch target a pick's destination names, validated against
 /// the rule's backendRefs.
 fn pick_target(
@@ -637,7 +652,6 @@ mod tests {
     #[test]
     fn config_defaults() {
         let cfg = parse("service: bllmp.default.svc:50051").expect("minimal config");
-        assert!(cfg.pool.is_none());
         assert!(cfg.tenant_header.is_none());
         assert!(matches!(cfg.qos, Qos::Interactive));
     }
@@ -647,15 +661,11 @@ mod tests {
         let cfg = parse(
             "
 service: bllmp.default.svc:50051
-pool: { namespace: inference, name: p }
 tenantHeader: x-tenant
 qos: Batch
 ",
         )
         .expect("full config");
-        let pool = cfg.pool.expect("pool set");
-        assert_eq!(pool.namespace, "inference");
-        assert_eq!(pool.name, "p");
         assert_eq!(cfg.tenant_header.as_deref(), Some("x-tenant"));
         assert!(matches!(cfg.qos, Qos::Batch));
     }
@@ -663,12 +673,13 @@ qos: Batch
     #[test]
     fn config_rejects_unknown_fields() {
         assert!(parse("service: s\nserivce: typo").is_err());
-        assert!(parse("service: s\npool: { namespace: n, name: p, extra: 1 }").is_err());
+        // The pool is the route's to name, not the object's.
+        assert!(parse("service: s\npool: { namespace: n, name: p }").is_err());
     }
 
     #[test]
     fn config_requires_service() {
-        assert!(parse("pool: { namespace: n, name: p }").is_err());
+        assert!(parse("qos: Batch").is_err());
     }
 
     /// A picker that accepts TCP and never speaks: the connection
@@ -704,7 +715,6 @@ qos: Batch
             client: client.clone(),
             reporter: Reporter::spawn(client),
             prepared: Arc::new(Prepared {
-                pool: None,
                 tenant_header: None,
                 qos: 0,
                 rpc_timeout: TEST_TIMEOUT,
@@ -892,8 +902,8 @@ qos: Batch
 
     use std::net::IpAddr;
 
-    use gateway_config::backend::{BackendProtocol, Endpoint};
-    use gateway_extension::{TargetBackend, Targets};
+    use gateway_config::backend::{BackendOrigin, BackendProtocol, Endpoint};
+    use gateway_extension::Targets;
     use gateway_state::{ActiveBackend, ActiveBackendKind, ActiveEndpointSet, BackendKey};
 
     use proto::picker_server::{Picker as PickerService, PickerServer};
@@ -905,6 +915,7 @@ qos: Batch
         pick: PickResponse,
         body: Vec<Bytes>,
         aborts: mpsc::UnboundedSender<AbortRequest>,
+        picks: mpsc::UnboundedSender<PickRequest>,
     }
 
     #[tonic::async_trait]
@@ -926,8 +937,9 @@ qos: Batch
 
         async fn pick(
             &self,
-            _request: tonic::Request<PickRequest>,
+            request: tonic::Request<PickRequest>,
         ) -> Result<tonic::Response<PickResponse>, tonic::Status> {
+            let _ = self.picks.send(request.into_inner());
             Ok(tonic::Response::new(self.pick.clone()))
         }
 
@@ -978,21 +990,32 @@ qos: Batch
     }
 
     /// Serve a scripted picker on a loopback port. Returns its
-    /// `host:port` and the intake of aborts it was sent.
+    /// `host:port`, the intake of aborts it was sent, and the intake
+    /// of `Pick`s it answered.
     async fn spawn_picker(
         pick: PickResponse,
         body: Vec<Bytes>,
-    ) -> (String, mpsc::UnboundedReceiver<AbortRequest>) {
-        let (aborts, rx) = mpsc::unbounded_channel();
+    ) -> (
+        String,
+        mpsc::UnboundedReceiver<AbortRequest>,
+        mpsc::UnboundedReceiver<PickRequest>,
+    ) {
+        let (aborts, abort_rx) = mpsc::unbounded_channel();
+        let (picks, pick_rx) = mpsc::unbounded_channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(PickerServer::new(FakePicker { pick, body, aborts }))
+                .add_service(PickerServer::new(FakePicker {
+                    pick,
+                    body,
+                    aborts,
+                    picks,
+                }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
         });
-        (addr.to_string(), rx)
+        (addr.to_string(), abort_rx, pick_rx)
     }
 
     fn ok_pick(
@@ -1009,8 +1032,33 @@ qos: Batch
         }
     }
 
+    /// The origin a ref substituted from a claimed pool carries.
+    fn pool_origin(namespace: &str, name: &str) -> Arc<BackendOrigin> {
+        Arc::new(BackendOrigin {
+            group: "inference-d.io".into(),
+            kind: INFERENCE_POOL_KIND.into(),
+            namespace: namespace.into(),
+            name: name.into(),
+        })
+    }
+
+    /// The origin a ref naming a Service carries.
+    fn service_origin(namespace: &str, name: &str) -> Arc<BackendOrigin> {
+        Arc::new(BackendOrigin {
+            group: String::new(),
+            kind: "Service".into(),
+            namespace: namespace.into(),
+            name: name.into(),
+        })
+    }
+
     /// One endpoint-set ref, the shape a local pick resolves against.
-    fn endpoint_targets(name: &str, address: IpAddr, port: u16) -> Targets {
+    fn endpoint_targets(
+        name: &str,
+        address: IpAddr,
+        port: u16,
+        origin: Option<Arc<BackendOrigin>>,
+    ) -> Targets {
         Targets::new(vec![TargetBackend::new(
             name.to_owned(),
             1,
@@ -1026,6 +1074,7 @@ qos: Batch
                     protocol: BackendProtocol::Http1,
                 }),
             })),
+            origin,
         )])
     }
 
@@ -1054,7 +1103,8 @@ qos: Batch
     #[tokio::test]
     async fn select_dispatches_a_provider_pick() {
         let pick = ok_pick(provider_pick("prod", "openai"), 9);
-        let (service, _aborts) = spawn_picker(pick, vec![Bytes::from_static(b"rewritten")]).await;
+        let (service, _aborts, _picks) =
+            spawn_picker(pick, vec![Bytes::from_static(b"rewritten")]).await;
 
         let mut cx = Cx::new();
         let selection = dispatched(run_select(&service, &mut cx).await.1);
@@ -1072,13 +1122,14 @@ qos: Batch
         let destination = proto::pick_response::Destination::Local(proto::LocalTarget {
             endpoint: "10.0.0.9:8080".into(),
         });
-        let (service, _aborts) = spawn_picker(ok_pick(destination, 0), vec![]).await;
+        let (service, _aborts, mut picks) = spawn_picker(ok_pick(destination, 0), vec![]).await;
 
         let mut cx = Cx::new();
         cx.set_targets(endpoint_targets(
             "workers",
             "10.0.0.9".parse().unwrap(),
             8080,
+            Some(pool_origin("inference", "chat-pool")),
         ));
         let selection = dispatched(run_select(&service, &mut cx).await.1);
         let Target::Endpoint { backend, addr } = selection.target else {
@@ -1086,6 +1137,51 @@ qos: Batch
         };
         assert_eq!(backend, "workers");
         assert_eq!(addr, "10.0.0.9:8080".parse().unwrap());
+
+        // The pool the route named travelled with the Pick.
+        let asked = picks.try_recv().expect("the picker was asked to pick");
+        let pool = asked.inference_pool.expect("a pool was named");
+        assert_eq!(pool.namespace, "inference");
+        assert_eq!(pool.name, "chat-pool");
+    }
+
+    /// The pool is the rule's, not the object's: it is read off the
+    /// refs, the first `InferencePool` origin wins, and a rule naming
+    /// none leaves the picker to pick across everything it serves.
+    #[test]
+    fn the_pool_comes_from_the_rules_refs() {
+        let mut cx = Cx::new();
+        assert!(pool_from_targets(&cx).is_none(), "no refs, no pool");
+
+        cx.set_targets(Targets::new(vec![TargetBackend::new(
+            "demo/workers:8000".into(),
+            1,
+            None,
+            Some(service_origin("demo", "workers")),
+        )]));
+        assert!(
+            pool_from_targets(&cx).is_none(),
+            "a Service ref names no pool"
+        );
+
+        cx.set_targets(Targets::new(vec![
+            TargetBackend::new(
+                "demo/workers:8000".into(),
+                1,
+                None,
+                Some(pool_origin("demo", "chat-pool")),
+            ),
+            TargetBackend::new(
+                "demo/overflow:8000".into(),
+                1,
+                None,
+                Some(pool_origin("demo", "other-pool")),
+            ),
+        ]));
+        let pool = pool_from_targets(&cx).expect("the claimed pool");
+        assert_eq!(pool.namespace, "demo");
+        assert_eq!(pool.name, "chat-pool");
+        assert!(pool.resource_version.is_empty());
     }
 
     /// The loop the hand-held-channel tests cannot close: a provider
@@ -1094,7 +1190,7 @@ qos: Batch
     #[tokio::test]
     async fn a_failed_provider_dispatch_aborts_backend_unresolved() {
         let pick = ok_pick(provider_pick("prod", "openai"), 0);
-        let (service, mut aborts) = spawn_picker(pick, vec![]).await;
+        let (service, mut aborts, _picks) = spawn_picker(pick, vec![]).await;
 
         let mut cx = Cx::new();
         let (mut ext, selected) = run_select(&service, &mut cx).await;
@@ -1125,7 +1221,7 @@ qos: Batch
             body_total_bytes: 0,
             requested_model: String::new(),
         };
-        let (service, mut aborts) = spawn_picker(pick, vec![]).await;
+        let (service, mut aborts, _picks) = spawn_picker(pick, vec![]).await;
 
         let mut cx = Cx::new();
         let (mut ext, selected) = run_select(&service, &mut cx).await;

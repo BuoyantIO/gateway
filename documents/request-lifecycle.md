@@ -211,6 +211,14 @@ under `None` it is left unread). For these rules the weighted draw from route
 resolution is not consulted; the full `ActiveBackendRef` list becomes
 the allowlist, exposed to the selector via `Cx::targets`.
 
+Each target also carries its `origin`: the route backendRef it stands
+for, as the route named it (group, kind, namespace, name). It is the
+identity the resolved key cannot always carry, because a ref of a kind
+the gateway has no schema for is substituted at the control plane by
+the refs of the `BackendBinding` claiming it; each substituted ref
+reports the claimed object as its origin. That is how the bllmp
+selector names the `InferencePool` the rule was routed to.
+
 The host calls `select` exactly once, on the one declaring instance.
 The hook receives `Held`, which states what the host has of the
 request body at this point:

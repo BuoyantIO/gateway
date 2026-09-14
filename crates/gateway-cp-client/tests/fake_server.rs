@@ -156,6 +156,7 @@ fn route_upsert(bind: &str, listener: &str, name: &str, backend: &str) -> pb::Up
             backend_refs: vec![pb::BackendRef {
                 name: backend.into(),
                 weight: 1,
+                origin: None,
             }],
             filters: vec![],
         })),
