@@ -12,15 +12,14 @@ From the `gateway` repo root:
 just up
 ```
 
-Builds the DP/CP/echo images (the DP registers `kinference_selector` at
-startup), creates kind cluster `gateway-e2e` (kubectl context
-`kind-gateway-e2e`), installs the Gateway API CRDs, the chart (the
-`Extension` CRD ships in its `crds/`), and cloud-provider-kind so
+Builds the DP/CP/echo images (the DP registers `kinference_selector` at startup),
+creates kind cluster `gateway-e2e` (kubectl context `kind-gateway-e2e`),
+installs the Gateway API CRDs, the chart and cloud-provider-kind so
 `LoadBalancer` Services get host-routable IPs.
 
 ## 2. Get kinference into the cluster
 
-From the `llm-monitor` repo root, on the branch `alpeb/pick-path`:
+From the `llm-monitor` repo root, on the branch `alpeb/install-extension`:
 
 ```bash
 make -C k8s/kinference build TARGET=local TAG=dev
@@ -93,7 +92,6 @@ kubectl -n default create secret generic databricks-oauth --from-literal=client-
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f examples/gateway.yml
-kubectl --context kind-gateway-e2e apply -f examples/extension.yml
 kubectl --context kind-gateway-e2e apply -f examples/httproute.yml
 ```
 
