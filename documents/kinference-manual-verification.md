@@ -91,9 +91,6 @@ kubectl -n default create secret generic databricks-oauth --from-literal=client-
 
 ## 5. Gateway objects
 
-We have not yet support for referring InferencePool in the HTTPRoute, so the route's `backendRef` names the `dummy-vllm` Service and the `databricks`
-GatewayBackend directly, and we set the pool name as a default in the Extension object.
-
 ```bash
 kubectl --context kind-gateway-e2e apply -f examples/gateway.yml
 kubectl --context kind-gateway-e2e apply -f examples/extension.yml
