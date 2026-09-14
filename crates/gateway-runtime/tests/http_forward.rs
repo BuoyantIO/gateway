@@ -2371,8 +2371,8 @@ enum HeldSeen {
 enum PickPlan {
     /// Pick this endpoint and forward this body source.
     Target(SocketAddr, PickBody),
-    /// Pick the rule's ref by name, as a dialable backend, with an
-    /// optional request line replacing the client's.
+    /// Pick the rule's ref by name, as a dialable backend, first
+    /// rewriting the request line to this one if it is given.
     Backend(PickBody, Option<&'static str>),
     Respond,
     Fail,
@@ -2417,7 +2417,12 @@ impl ExtensionBuilder for PickerBuilder {
 
 #[async_trait]
 impl Extension for Picker {
-    async fn select(&mut self, held: Held<'_>, _cx: &mut Cx) -> Result<Selected, ExtensionError> {
+    async fn select(
+        &mut self,
+        parts: &mut http::request::Parts,
+        held: Held<'_>,
+        _cx: &mut Cx,
+    ) -> Result<Selected, ExtensionError> {
         *self.buffer_at_select.lock().unwrap() = match &held {
             Held::Buffered(bytes) => HeldSeen::Buffered(bytes.len()),
             Held::Untouched | Held::Nothing => HeldSeen::Empty,
@@ -2430,13 +2435,21 @@ impl Extension for Picker {
                 },
                 body: pick_body(body, &held)?,
             })),
-            PickPlan::Backend(body, path) => Ok(Selected::Target(Selection {
-                target: Target::Backend {
-                    name: self.backend.to_owned(),
-                    path: path.map(|p| p.parse().expect("test path is a request target")),
-                },
-                body: pick_body(body, &held)?,
-            })),
+            PickPlan::Backend(body, path) => {
+                if let Some(path) = path {
+                    // What a selector that dispatches elsewhere does
+                    // to the head, done by hand.
+                    let mut uri = parts.uri.clone().into_parts();
+                    uri.path_and_query = Some(path.parse().expect("test path is a request target"));
+                    parts.uri = http::Uri::from_parts(uri).expect("a request target applies");
+                }
+                Ok(Selected::Target(Selection {
+                    target: Target::Backend {
+                        name: self.backend.to_owned(),
+                    },
+                    body: pick_body(body, &held)?,
+                }))
+            }
             PickPlan::Respond => Ok(Selected::Respond(LocalResponse {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 headers: http::HeaderMap::new(),
