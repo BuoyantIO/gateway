@@ -19,7 +19,7 @@ installs the Gateway API CRDs, the chart and cloud-provider-kind so
 
 ## 2. Get kinference into the cluster
 
-From the `llm-monitor` repo root, on the branch `alpeb/install-extension`:
+From the `llm-monitor` repo root:
 
 ```bash
 make -C k8s/kinference build TARGET=local TAG=dev
