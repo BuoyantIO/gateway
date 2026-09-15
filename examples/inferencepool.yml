@@ -1,4 +1,4 @@
-apiVersion: inference-d.io/v1alpha1
+apiVersion: kinference.buoyant.io/v1alpha1
 kind: InferencePool
 metadata:
   name: inference-all

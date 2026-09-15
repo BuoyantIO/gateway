@@ -10,6 +10,6 @@ spec:
     - matches:
         - path: { type: PathPrefix, value: / }
       backendRefs:
-        - group: inference-d.io
+        - group: kinference.buoyant.io
           kind: InferencePool
           name: inference-all
