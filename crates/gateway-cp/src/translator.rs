@@ -3709,14 +3709,14 @@ mod tests {
     fn foreign_ref(name: &str, weight: Option<i32>) -> HttpRouteRulesBackendRefs {
         HttpRouteRulesBackendRefs {
             name: name.into(),
-            group: Some("inference-d.io".into()),
+            group: Some("kinference.buoyant.io".into()),
             kind: Some("InferencePool".into()),
             weight,
             ..Default::default()
         }
     }
 
-    /// A binding claiming `inference-d.io/InferencePool claim_name`,
+    /// A binding claiming `kinference.buoyant.io/InferencePool claim_name`,
     /// resolving to one Service target per (name, service, port).
     fn binding(
         ns: &str,
@@ -3727,7 +3727,7 @@ mod tests {
     ) -> crate::crd::BackendBinding {
         let spec = crate::crd::BackendBindingSpec {
             claim: crate::crd::Claim {
-                group: "inference-d.io".into(),
+                group: "kinference.buoyant.io".into(),
                 kind: "InferencePool".into(),
                 name: claim_name.into(),
             },
@@ -3875,7 +3875,7 @@ mod tests {
             origins(&substituted),
             vec![
                 (
-                    "inference-d.io".into(),
+                    "kinference.buoyant.io".into(),
                     "InferencePool".into(),
                     "demo".into(),
                     "pool".into()
@@ -3941,7 +3941,7 @@ mod tests {
         assert_eq!(route.backend_refs.len(), 1, "the share must not vanish");
         assert_eq!(
             route.backend_refs[0].name,
-            "demo/pool~inference-d.io~InferencePool"
+            "demo/pool~kinference.buoyant.io~InferencePool"
         );
         assert_eq!(route.backend_refs[0].weight, 1);
         assert!(

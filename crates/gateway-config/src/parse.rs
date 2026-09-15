@@ -292,7 +292,7 @@ gatewayConfig:
       failureMode: Open
       limits: { requestBody: Buffer, maxBufferBytes: 1048576 }
       config:
-        service: kinference.inference-d.svc:50051
+        service: kinference.kinference.svc:50051
         pool: { namespace: inference, name: my-pool }
 ",
         )
@@ -307,7 +307,7 @@ gatewayConfig:
         );
         assert_eq!(ext.limits.max_buffer_bytes, Some(1_048_576));
         // The opaque config keeps its nested shape verbatim.
-        assert_eq!(ext.config["service"], "kinference.inference-d.svc:50051");
+        assert_eq!(ext.config["service"], "kinference.kinference.svc:50051");
         assert_eq!(ext.config["pool"]["namespace"], "inference");
     }
 

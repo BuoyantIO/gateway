@@ -1171,7 +1171,7 @@ qos: Batch
     /// The origin a ref substituted from a claimed pool carries.
     fn pool_origin(namespace: &str, name: &str) -> Arc<BackendOrigin> {
         Arc::new(BackendOrigin {
-            group: "inference-d.io".into(),
+            group: "kinference.buoyant.io".into(),
             kind: INFERENCE_POOL_KIND.into(),
             namespace: namespace.into(),
             name: name.into(),

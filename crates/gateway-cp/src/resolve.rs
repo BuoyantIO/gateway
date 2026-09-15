@@ -3234,7 +3234,7 @@ mod tests {
         }
     }
 
-    const CLAIM: (&str, &str, &str) = ("inference-d.io", "InferencePool", "pool");
+    const CLAIM: (&str, &str, &str) = ("kinference.buoyant.io", "InferencePool", "pool");
 
     #[test]
     fn binding_outcomes_cover_every_case() {
@@ -3258,16 +3258,16 @@ mod tests {
             binding(
                 "demo",
                 "no-refs",
-                ("inference-d.io", "InferencePool", "empty"),
+                ("kinference.buoyant.io", "InferencePool", "empty"),
                 vec![],
             ),
             binding(
                 "demo",
                 "foreign-ref",
-                ("inference-d.io", "InferencePool", "chained"),
+                ("kinference.buoyant.io", "InferencePool", "chained"),
                 vec![binding_ref(
                     "bad",
-                    Some("inference-d.io"),
+                    Some("kinference.buoyant.io"),
                     Some("InferencePool"),
                 )],
             ),
@@ -3351,7 +3351,7 @@ mod tests {
             binding(
                 "demo",
                 "extra-port",
-                ("inference-d.io", "InferencePool", "other"),
+                ("kinference.buoyant.io", "InferencePool", "other"),
                 vec![dialable_with_port],
             ),
         ];
@@ -3455,7 +3455,7 @@ mod tests {
             assert!(matches!(
                 &r.routes[0].rule_backends[0][0].outcome,
                 BackendOutcome::UnsupportedKind { key }
-                    if key == "demo/pool~inference-d.io~InferencePool"
+                    if key == "demo/pool~kinference.buoyant.io~InferencePool"
             ));
         }
     }

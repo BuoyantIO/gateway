@@ -355,7 +355,7 @@ mod tests {
             "failureMode": "Open",
             "limits": { "requestBody": "Stream" },
             "config": {
-                "service": "kinference.inference-d.svc:50051",
+                "service": "kinference.kinference.svc:50051",
                 "pool": { "namespace": "inference", "name": "p" },
             },
         });
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn binding_spec_round_trips() {
         let raw = serde_json::json!({
-            "claim": { "group": "inference-d.io", "kind": "InferencePool", "name": "pool" },
+            "claim": { "group": "kinference.buoyant.io", "kind": "InferencePool", "name": "pool" },
             "backendRefs": [
                 { "name": "workers", "ref": { "name": "kinference-workers", "port": 8000 } },
                 {
