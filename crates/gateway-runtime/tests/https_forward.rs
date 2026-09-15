@@ -149,6 +149,7 @@ fn https_config(bind_port: u16, upstream_port: u16, with_secret: bool) -> Gatewa
             backend_refs: vec![gateway_config::backend::BackendRef {
                 name: "be".into(),
                 weight: 1,
+                origin: None,
             }],
             filters: vec![],
         }],
@@ -373,6 +374,7 @@ fn two_listener_config(bind_port: u16, upstream_port: u16) -> GatewayConfig {
                 backend_refs: vec![gateway_config::backend::BackendRef {
                     name: "be".into(),
                     weight: 1,
+                    origin: None,
                 }],
                 filters: vec![],
             }],

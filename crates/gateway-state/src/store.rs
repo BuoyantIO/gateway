@@ -1105,6 +1105,7 @@ impl Inner {
                 .map(|abr| BackendRef {
                     name: abr.key.0.clone(),
                     weight: abr.weight,
+                    origin: abr.origin.as_deref().cloned(),
                 })
                 .collect(),
             filters: active.filters.clone(),
@@ -1189,6 +1190,7 @@ impl Inner {
                     key: bkey,
                     backend,
                     weight: br.weight,
+                    origin: br.origin.clone().map(Arc::new),
                 }
             })
             .collect();
@@ -1555,6 +1557,7 @@ mod tests {
                 .map(|b| BackendRef {
                     name: (*b).into(),
                     weight: 1,
+                    origin: None,
                 })
                 .collect(),
             filters: vec![],
@@ -2115,6 +2118,7 @@ mod tests {
             backend_refs: vec![BackendRef {
                 name: "be".into(),
                 weight: 1,
+                origin: None,
             }],
             filters: vec![HttpFilter::ExtensionRef {
                 name: "add-hdr".into(),

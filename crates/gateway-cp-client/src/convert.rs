@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use gateway_config::backend::{
-    AlpnProtocol, ApiKeyAuth, Backend, BackendAuth, BackendProtocol, BackendRef, BackendTls,
-    ClientAuthMethod, DialableBackend, Endpoint, OAuth2Auth, StaticBackend, TrustRoots,
+    AlpnProtocol, ApiKeyAuth, Backend, BackendAuth, BackendOrigin, BackendProtocol, BackendRef,
+    BackendTls, ClientAuthMethod, DialableBackend, Endpoint, OAuth2Auth, StaticBackend, TrustRoots,
 };
 use gateway_config::bind::{Bind, BindProtocol};
 use gateway_config::extension::{ConfigValue, Extension, FailureMode, Limits, RequestBodyLimit};
@@ -459,6 +459,12 @@ fn backend_ref(msg: pb::BackendRef) -> BackendRef {
     BackendRef {
         name: msg.name,
         weight: msg.weight,
+        origin: msg.origin.map(|o| BackendOrigin {
+            group: o.group,
+            kind: o.kind,
+            namespace: o.namespace,
+            name: o.name,
+        }),
     }
 }
 

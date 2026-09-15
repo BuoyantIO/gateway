@@ -199,6 +199,7 @@ fn config(
                     backend_refs: vec![gateway_config::backend::BackendRef {
                         name: "provider".into(),
                         weight: 1,
+                        origin: None,
                     }],
                     filters,
                 }],

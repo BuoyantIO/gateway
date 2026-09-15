@@ -118,6 +118,7 @@ fn cfg_endpoints(bind_port: u16, ports: &[u16]) -> GatewayConfig {
                     backend_refs: vec![BackendRef {
                         name: "be".into(),
                         weight: 1,
+                        origin: None,
                     }],
                     filters: vec![],
                 }],

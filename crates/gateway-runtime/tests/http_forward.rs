@@ -125,6 +125,7 @@ fn http_route(name: &str, path_prefix: &str, backend: &str) -> HttpRoute {
         backend_refs: vec![BackendRef {
             name: backend.into(),
             weight: 1,
+            origin: None,
         }],
         filters: vec![],
     }
@@ -533,6 +534,7 @@ async fn header_routing_picks_header_rule_over_catchall() {
             backend_refs: vec![BackendRef {
                 name: "be-a".into(),
                 weight: 1,
+                origin: None,
             }],
             filters: vec![ext_ref("tag-a")],
         };
@@ -650,6 +652,7 @@ async fn regex_path_routes_matching_request() {
         backend_refs: vec![BackendRef {
             name: "be-regex".into(),
             weight: 1,
+            origin: None,
         }],
         filters: vec![ext_ref("tag-regex")],
     };
@@ -1060,6 +1063,7 @@ async fn weighted_refs_split_between_resolved_and_missing() {
     route.backend_refs.push(BackendRef {
         name: "ghost-be".into(),
         weight: 1,
+        origin: None,
     });
     let cfg = GatewayConfig {
         name: "test".into(),
@@ -2482,6 +2486,7 @@ fn selection_config(bind_port: u16, be_a: u16, be_b: Backend) -> GatewayConfig {
     route.backend_refs.push(BackendRef {
         name: "be-b".into(),
         weight: 1,
+        origin: None,
     });
     route.filters.push(HttpFilter::ExtensionRef {
         name: "picker".into(),
@@ -2884,10 +2889,12 @@ async fn weighted_refs_split_across_backend_kinds() {
             BackendRef {
                 name: "endpoints".into(),
                 weight: 1,
+                origin: None,
             },
             BackendRef {
                 name: "dialable".into(),
                 weight: 1,
+                origin: None,
             },
         ],
         filters: vec![],

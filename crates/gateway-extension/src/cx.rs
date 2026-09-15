@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use gateway_config::backend::Endpoint;
+use gateway_config::backend::{BackendOrigin, Endpoint};
 use gateway_state::ActiveBackend;
 
 /// Per-request context: host-populated state extensions read through
@@ -125,14 +125,21 @@ pub struct TargetBackend {
     name: String,
     weight: u32,
     backend: Option<Arc<ActiveBackend>>,
+    origin: Option<Arc<BackendOrigin>>,
 }
 
 impl TargetBackend {
-    pub fn new(name: String, weight: u32, backend: Option<Arc<ActiveBackend>>) -> Self {
+    pub fn new(
+        name: String,
+        weight: u32,
+        backend: Option<Arc<ActiveBackend>>,
+        origin: Option<Arc<BackendOrigin>>,
+    ) -> Self {
         Self {
             name,
             weight,
             backend,
+            origin,
         }
     }
 
@@ -142,6 +149,10 @@ impl TargetBackend {
 
     pub fn weight(&self) -> u32 {
         self.weight
+    }
+
+    pub fn origin(&self) -> Option<&BackendOrigin> {
+        self.origin.as_deref()
     }
 
     /// The endpoints behind this ref. Empty when the ref names a

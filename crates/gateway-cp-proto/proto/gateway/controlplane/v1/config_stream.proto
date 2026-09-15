@@ -225,6 +225,22 @@ message QueryParamMatch {
 message BackendRef {
   string name   = 1;
   uint32 weight = 2;
+  // The route's own backendRef this entry stands for, verbatim. A
+  // claimed foreign ref substitutes into one entry per ref of the
+  // binding that claims it, and every one of them carries the claim,
+  // so the data plane can still see the object the rule named.
+  BackendOrigin origin = 3;
+}
+
+// The (group, kind, namespace, name) of a route backendRef, with the
+// Gateway API defaults applied: empty `group` is the core group and
+// empty `kind` is `Service`. The namespace is always the route's —
+// a backendRef naming another one never reaches the wire.
+message BackendOrigin {
+  string group     = 1;
+  string kind      = 2;
+  string namespace = 3;
+  string name      = 4;
 }
 
 // One config carrier: every filter is a ref to an Extension object.

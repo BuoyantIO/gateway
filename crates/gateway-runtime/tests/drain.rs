@@ -85,6 +85,7 @@ fn bind(name: &str, port: u16, backend: &str) -> Bind {
                 backend_refs: vec![BackendRef {
                     name: backend.into(),
                     weight: 1,
+                    origin: None,
                 }],
                 filters: vec![],
             }],

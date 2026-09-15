@@ -188,6 +188,7 @@ mod tests {
                 backend_refs: vec![pb::BackendRef {
                     name: backend.into(),
                     weight: 1,
+                    origin: None,
                 }],
                 filters: vec![],
             })),
@@ -545,6 +546,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
                 backend_refs: vec![pb::BackendRef {
                     name: "be".into(),
                     weight: 1,
+                    origin: None,
                 }],
                 filters: vec![pb::HttpFilter {
                     kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
@@ -594,6 +596,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
                 backend_refs: vec![pb::BackendRef {
                     name: "be".into(),
                     weight: 1,
+                    origin: None,
                 }],
                 // Unknown / future filter variant — proto would set kind = None
                 // from the DP's perspective.

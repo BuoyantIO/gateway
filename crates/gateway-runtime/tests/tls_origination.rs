@@ -230,6 +230,7 @@ fn tls_config(bind_port: u16, upstream: TlsBackend) -> GatewayConfig {
                     backend_refs: vec![BackendRef {
                         name: "provider".into(),
                         weight: 1,
+                        origin: None,
                     }],
                     filters: vec![],
                 }],
