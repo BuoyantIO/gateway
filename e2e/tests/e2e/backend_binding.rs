@@ -18,7 +18,7 @@ use http::StatusCode;
 use kube::Api;
 use serde_json::json;
 
-const CLAIM: (&str, &str, &str) = ("inference-d.io", "InferencePool", "pool");
+const CLAIM: (&str, &str, &str) = ("kinference.buoyant.io", "InferencePool", "pool");
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_mins(1);

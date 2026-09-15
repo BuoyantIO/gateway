@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionSpec {
     /// The registered class that interprets `config` — e.g. the
-    /// built-in `request_header_modifier`, or `bllmp_selector`.
+    /// built-in `request_header_modifier`, or `kinference_selector`.
     pub class: String,
     #[serde(default)]
     pub failure_mode: FailureMode,
@@ -351,16 +351,16 @@ mod tests {
     #[test]
     fn spec_round_trips_with_unknown_config_keys() {
         let raw = serde_json::json!({
-            "class": "bllmp_selector",
+            "class": "kinference_selector",
             "failureMode": "Open",
             "limits": { "requestBody": "Stream" },
             "config": {
-                "service": "bllmp.inference-d.svc:50051",
+                "service": "kinference.kinference.svc:50051",
                 "pool": { "namespace": "inference", "name": "p" },
             },
         });
         let spec: ExtensionSpec = serde_json::from_value(raw).expect("valid spec");
-        assert_eq!(spec.class, "bllmp_selector");
+        assert_eq!(spec.class, "kinference_selector");
         assert_eq!(spec.failure_mode, FailureMode::Open);
         assert_eq!(spec.limits.request_body, Some(RequestBodyLimit::Stream));
         assert_eq!(spec.config["pool"]["namespace"], "inference");
@@ -369,9 +369,9 @@ mod tests {
     #[test]
     fn binding_spec_round_trips() {
         let raw = serde_json::json!({
-            "claim": { "group": "inference-d.io", "kind": "InferencePool", "name": "pool" },
+            "claim": { "group": "kinference.buoyant.io", "kind": "InferencePool", "name": "pool" },
             "backendRefs": [
-                { "name": "workers", "ref": { "name": "bllmp-workers", "port": 8000 } },
+                { "name": "workers", "ref": { "name": "kinference-workers", "port": 8000 } },
                 {
                     "name": "openai",
                     "ref": {

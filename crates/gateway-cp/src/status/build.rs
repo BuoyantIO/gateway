@@ -891,7 +891,7 @@ mod tests {
             },
             spec: crate::crd::BackendBindingSpec {
                 claim: crate::crd::Claim {
-                    group: "inference-d.io".into(),
+                    group: "kinference.buoyant.io".into(),
                     kind: "InferencePool".into(),
                     name: "pool".into(),
                 },
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn each_binding_malformation_has_its_own_reason() {
         let mut foreign = service_binding_ref();
-        foreign.target.group = Some("inference-d.io".into());
+        foreign.target.group = Some("kinference.buoyant.io".into());
         foreign.target.kind = Some("InferencePool".into());
         let mut no_claim = binding_object(vec![service_binding_ref()]);
         no_claim.spec.claim.group = String::new();

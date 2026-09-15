@@ -626,7 +626,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             body: Some(pb::upsert::Body::Extension(pb::ExtensionUpsert {
                 namespace: "ns".into(),
                 name: name.into(),
-                class: "bllmp_selector".into(),
+                class: "kinference_selector".into(),
                 failure_mode: pb::FailureMode::Open as i32,
                 limits: Some(pb::ExtensionLimits {
                     request_body: pb::RequestBodyLimit::Stream as i32,
@@ -645,7 +645,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             batch(
                 vec![extension_upsert(
                     "picker",
-                    "service: bllmp.svc:50051\npool: { namespace: inference, name: p }\n",
+                    "service: kinference.svc:50051\npool: { namespace: inference, name: p }\n",
                 )],
                 vec![],
             ),
@@ -655,7 +655,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
             .read()
             .extension(&gateway_state::ExtensionKey::new("ns", "picker"))
             .expect("extension present");
-        assert_eq!(ext.class, "bllmp_selector");
+        assert_eq!(ext.class, "kinference_selector");
         assert_eq!(
             ext.failure_mode,
             gateway_config::extension::FailureMode::Open
@@ -666,7 +666,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
         );
         assert!(ext.limits.max_buffer_bytes.is_none());
         // The opaque config parsed into a value, nested keys intact.
-        assert_eq!(ext.config["service"], "bllmp.svc:50051");
+        assert_eq!(ext.config["service"], "kinference.svc:50051");
         assert_eq!(ext.config["pool"]["namespace"], "inference");
     }
 

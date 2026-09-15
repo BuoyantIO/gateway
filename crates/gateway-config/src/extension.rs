@@ -35,7 +35,7 @@ pub struct Extension {
     /// Identity routes reference.
     pub name: String,
     /// The registered class that interprets `config` — e.g. the
-    /// built-in `request_header_modifier`, or `bllmp_selector`.
+    /// built-in `request_header_modifier`, or `kinference_selector`.
     /// Several objects may name one class, each with its own config.
     pub class: String,
     #[serde(default)]

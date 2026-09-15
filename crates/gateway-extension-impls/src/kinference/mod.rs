@@ -1,4 +1,4 @@
-//! The bllmp selector: streams the request body to a Buoyant LLM
+//! The kinference selector: streams the request body to a Buoyant LLM
 //! Picker, dispatches to the endpoint or provider backend it picks
 //! with the body it returns, and reports how the request went.
 //!
@@ -11,7 +11,7 @@
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
-    tonic::include_proto!("bllmp.v1");
+    tonic::include_proto!("kinference.v1");
 }
 
 mod usage;
@@ -44,10 +44,10 @@ use proto::{
 };
 
 /// The class name routes reference through `Extension` objects.
-pub const BLLMP_SELECTOR: &str = "bllmp_selector";
+pub const KINFERENCE_SELECTOR: &str = "kinference_selector";
 
 /// Log target, stable across crate moves: filter on `extension=debug`.
-const LOG: &str = "extension::bllmp_selector";
+const LOG: &str = "extension::kinference_selector";
 
 /// The `kind` of a route backendRef that names a pool.
 const INFERENCE_POOL_KIND: &str = "InferencePool";
@@ -133,10 +133,10 @@ struct Prepared {
     body_send_timeout: Duration,
 }
 
-/// `bllmp_selector` as an extension class.
-pub struct BllmpSelectorClass;
+/// `kinference_selector` as an extension class.
+pub struct KinferenceSelectorClass;
 
-impl ExtensionClass for BllmpSelectorClass {
+impl ExtensionClass for KinferenceSelectorClass {
     fn configure(&self, config: &ConfigValue) -> Result<Arc<dyn ExtensionBuilder>, Error> {
         let cfg: Config = from_value(config)?;
         if cfg.service.is_empty() {
@@ -158,8 +158,8 @@ impl ExtensionClass for BllmpSelectorClass {
         // request must reach the same picker instance.
         let client = PickerClient::new(endpoint.connect_lazy());
         let reporter = Reporter::spawn(client.clone());
-        tracing::info!(target: LOG, service = %cfg.service, "bllmp selector configured");
-        Ok(Arc::new(BllmpSelectorBuilder {
+        tracing::info!(target: LOG, service = %cfg.service, "kinference selector configured");
+        Ok(Arc::new(KinferenceSelectorBuilder {
             client,
             reporter,
             prepared: Arc::new(Prepared {
@@ -172,13 +172,13 @@ impl ExtensionClass for BllmpSelectorClass {
     }
 }
 
-struct BllmpSelectorBuilder {
+struct KinferenceSelectorBuilder {
     client: PickerClient<Channel>,
     reporter: Reporter,
     prepared: Arc<Prepared>,
 }
 
-impl ExtensionBuilder for BllmpSelectorBuilder {
+impl ExtensionBuilder for KinferenceSelectorBuilder {
     fn declares(&self) -> Declarations {
         Declarations {
             request_body: BodyMode::Stream,
@@ -188,7 +188,7 @@ impl ExtensionBuilder for BllmpSelectorBuilder {
     }
 
     fn build(&self) -> Box<dyn Extension> {
-        Box::new(BllmpSelector {
+        Box::new(KinferenceSelector {
             client: self.client.clone(),
             reporter: self.reporter.clone(),
             prepared: Arc::clone(&self.prepared),
@@ -212,7 +212,7 @@ struct Push {
     task: JoinHandle<Result<PushBodyResponse, tonic::Status>>,
 }
 
-struct BllmpSelector {
+struct KinferenceSelector {
     client: PickerClient<Channel>,
     reporter: Reporter,
     prepared: Arc<Prepared>,
@@ -234,7 +234,7 @@ struct BllmpSelector {
 }
 
 #[async_trait]
-impl Extension for BllmpSelector {
+impl Extension for KinferenceSelector {
     async fn on_request_start(
         &mut self,
         head: &mut http::request::Parts,
@@ -257,7 +257,9 @@ impl Extension for BllmpSelector {
         let (tx, rx) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
         let mut request = tonic::Request::new(ReceiverStream::new(rx));
         if let Ok(id) = tonic::metadata::MetadataValue::try_from(&self.client_request_id) {
-            request.metadata_mut().insert("bllmp-client-request-id", id);
+            request
+                .metadata_mut()
+                .insert("kinference-client-request-id", id);
         }
         if let Some(len) = head
             .headers
@@ -265,12 +267,14 @@ impl Extension for BllmpSelector {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| tonic::metadata::MetadataValue::try_from(v).ok())
         {
-            request.metadata_mut().insert("bllmp-declared-length", len);
+            request
+                .metadata_mut()
+                .insert("kinference-declared-length", len);
         }
         tracing::debug!(target: LOG,
             request_id = %self.client_request_id,
             tenant = %self.tenant,
-            "bllmp: opening PushBody"
+            "kinference: opening PushBody"
         );
         let mut client = self.client.clone();
         let task = tokio::spawn(async move {
@@ -335,7 +339,7 @@ impl Extension for BllmpSelector {
         tracing::debug!(target: LOG,
             stream_id = pushed.stream_id,
             bytes = pushed.total_bytes,
-            "bllmp: body pushed"
+            "kinference: body pushed"
         );
 
         let mut client = self.client.clone();
@@ -355,7 +359,7 @@ impl Extension for BllmpSelector {
         match Outcome::try_from(pick.outcome) {
             Ok(Outcome::Ok | Outcome::Degraded) => {}
             Ok(outcome @ (Outcome::NoWorkers | Outcome::BadRequest | Outcome::PolicyRejected)) => {
-                tracing::debug!(target: LOG, ?outcome, reason = %pick.reason, "bllmp: pick answered locally");
+                tracing::debug!(target: LOG, ?outcome, reason = %pick.reason, "kinference: pick answered locally");
                 let status = match outcome {
                     Outcome::NoWorkers => StatusCode::SERVICE_UNAVAILABLE,
                     Outcome::BadRequest => StatusCode::BAD_REQUEST,
@@ -390,7 +394,7 @@ impl Extension for BllmpSelector {
             response_id = pick.response_id,
             ?target,
             body_total_bytes = pick.body_total_bytes,
-            "bllmp: dispatching pick"
+            "kinference: dispatching pick"
         );
         // Bounded while opening the stream; the stream itself lasts
         // as long as the body it carries.
@@ -434,7 +438,7 @@ impl Extension for BllmpSelector {
                 response_id = self.response_id,
                 ttft_ms,
                 status = self.upstream_status,
-                "bllmp: first response chunk"
+                "kinference: first response chunk"
             );
             self.reporter.send(Report::First(ReportFirstTokenRequest {
                 response_id: self.response_id,
@@ -459,7 +463,7 @@ impl Extension for BllmpSelector {
             if prompt.is_none() && completion.is_none() && counts.is_empty() {
                 tracing::debug!(target: LOG,
                     response_id,
-                    "bllmp: no usage and no arrival gaps; skipping ReportFinalToken"
+                    "kinference: no usage and no arrival gaps; skipping ReportFinalToken"
                 );
                 return;
             }
@@ -472,7 +476,7 @@ impl Extension for BllmpSelector {
                 completion_tokens = completion.unwrap_or(0),
                 cached_tokens = cached.unwrap_or(0),
                 itl_samples = counts.iter().sum::<u32>(),
-                "bllmp: reporting final token"
+                "kinference: reporting final token"
             );
             self.reporter.send(Report::Final(ReportFinalTokenRequest {
                 response_id,
@@ -505,7 +509,7 @@ impl Extension for BllmpSelector {
                 response_id,
                 complete = end.complete,
                 ?reason,
-                "bllmp: aborting pick"
+                "kinference: aborting pick"
             );
             self.reporter.send(Report::Abort(AbortRequest {
                 response_id,
@@ -517,7 +521,7 @@ impl Extension for BllmpSelector {
     }
 }
 
-impl Drop for BllmpSelector {
+impl Drop for KinferenceSelector {
     fn drop(&mut self) {
         // Abandoned before selection: reset so the picker discards.
         if let Some(push) = self.push.take() {
@@ -643,7 +647,7 @@ fn dispatch_on(head: &mut http::request::Parts, path: &str) -> Result<(), Error>
     uri.path_and_query = Some(parsed);
     head.uri = Uri::from_parts(uri)
         .map_err(|e| format!("picker path `{path}` cannot be applied to the request uri: {e}"))?;
-    tracing::debug!(target: LOG, uri = %head.uri, "bllmp: dispatching on the picked request line");
+    tracing::debug!(target: LOG, uri = %head.uri, "kinference: dispatching on the picked request line");
     Ok(())
 }
 
@@ -689,8 +693,10 @@ impl Reporter {
                     }
                 };
                 match tokio::time::timeout(REPORT_TIMEOUT, call).await {
-                    Err(_) => tracing::debug!(target: LOG, "bllmp report timed out"),
-                    Ok(Err(status)) => tracing::debug!(target: LOG, %status, "bllmp report failed"),
+                    Err(_) => tracing::debug!(target: LOG, "kinference report timed out"),
+                    Ok(Err(status)) => {
+                        tracing::debug!(target: LOG, %status, "kinference report failed");
+                    }
                     Ok(Ok(())) => {}
                 }
             }
@@ -700,7 +706,7 @@ impl Reporter {
 
     fn send(&self, report: Report) {
         if self.tx.try_send(report).is_err() {
-            tracing::debug!(target: LOG, "bllmp report dropped: queue full");
+            tracing::debug!(target: LOG, "kinference report dropped: queue full");
         }
     }
 }
@@ -715,7 +721,7 @@ mod tests {
 
     #[test]
     fn config_defaults() {
-        let cfg = parse("service: bllmp.default.svc:50051").expect("minimal config");
+        let cfg = parse("service: kinference.default.svc:50051").expect("minimal config");
         assert!(cfg.tenant_header.is_none());
         assert!(matches!(cfg.qos, Qos::Interactive));
     }
@@ -724,7 +730,7 @@ mod tests {
     fn config_full() {
         let cfg = parse(
             "
-service: bllmp.default.svc:50051
+service: kinference.default.svc:50051
 tenantHeader: x-tenant
 qos: Batch
 ",
@@ -771,11 +777,11 @@ qos: Batch
     /// A selector wired by hand: the client points at `service`, and
     /// every deadline is [`TEST_TIMEOUT`]. `push` pre-seeds the
     /// in-flight `PushBody`, for tests that stage it directly.
-    fn selector_for(service: &str, push: Option<Push>) -> BllmpSelector {
+    fn selector_for(service: &str, push: Option<Push>) -> KinferenceSelector {
         let endpoint =
             tonic::transport::Endpoint::from_shared(format!("http://{service}")).unwrap();
         let client = PickerClient::new(endpoint.connect_lazy());
-        BllmpSelector {
+        KinferenceSelector {
             client: client.clone(),
             reporter: Reporter::spawn(client),
             prepared: Arc::new(Prepared {
@@ -1165,7 +1171,7 @@ qos: Batch
     /// The origin a ref substituted from a claimed pool carries.
     fn pool_origin(namespace: &str, name: &str) -> Arc<BackendOrigin> {
         Arc::new(BackendOrigin {
-            group: "inference-d.io".into(),
+            group: "kinference.buoyant.io".into(),
             kind: INFERENCE_POOL_KIND.into(),
             namespace: namespace.into(),
             name: name.into(),
@@ -1214,7 +1220,11 @@ qos: Batch
     async fn run_select(
         service: &str,
         cx: &mut Cx,
-    ) -> (BllmpSelector, http::request::Parts, Result<Selected, Error>) {
+    ) -> (
+        KinferenceSelector,
+        http::request::Parts,
+        Result<Selected, Error>,
+    ) {
         let mut ext = selector_for(service, None);
         let mut parts = request_parts();
         ext.on_request_start(&mut parts, cx).await.unwrap();
