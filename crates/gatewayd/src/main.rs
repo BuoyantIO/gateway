@@ -140,10 +140,10 @@ async fn main() -> anyhow::Result<()> {
     gateway_extension_impls::register_builtins(&mut classes);
     classes
         .register(
-            gateway_extension_impls::bllmp::BLLMP_SELECTOR,
-            std::sync::Arc::new(gateway_extension_impls::bllmp::BllmpSelectorClass),
+            gateway_extension_impls::kinference::KINFERENCE_SELECTOR,
+            std::sync::Arc::new(gateway_extension_impls::kinference::KinferenceSelectorClass),
         )
-        .expect("bllmp_selector is not a reserved name");
+        .expect("kinference_selector is not a reserved name");
     let gateway = gateway_runtime::Gateway::with_metrics(store, metrics).with_classes(classes);
     gateway.run(drain_watch).await?;
 

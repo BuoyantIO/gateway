@@ -1,12 +1,12 @@
 syntax = "proto3";
 
-package bllmp.v1;
+package kinference.v1;
 
 /*
-Buoyant LLM Picker (bllmp) — router for inference requests.
+Buoyant LLM Picker (kinference) — router for inference requests.
 
-Given an inference request, Bllmp picks a model and a destination to best serve
-it, which can be a local inference engine pod or an off-cluster provider.  Bllmp
+Given an inference request, Kinference picks a model and a destination to best serve
+it, which can be a local inference engine pod or an off-cluster provider.  Kinference
 rewrites the body to fit into the shape of the endpoint.
 
 Nothing here requires the caller to buffer the body: stream it in as it arrives,
@@ -44,7 +44,7 @@ failures as gRPC status directly:
   DEADLINE_EXCEEDED (4)   PushBody idle longer than the inter-chunk budget
   INVALID_ARGUMENT (3)    malformed request; Pick with body_stream_id = 0; a
                           PushBody whose byte count disagrees with its
-                          `bllmp-declared-length`
+                          `kinference-declared-length`
 
 Conformance:
 
@@ -77,8 +77,8 @@ message BodyChunk {
 /*
 Reply to a completed PushBody stream. Two gRPC metadata headers are set on the
 PushBody call:
-- bllmp-client-request-id: Matches PickRequest.client_request_id.
-- bllmp-declared-length: The client's Content-Length when known. Absent for a
+- kinference-client-request-id: Matches PickRequest.client_request_id.
+- kinference-declared-length: The client's Content-Length when known. Absent for a
   chunked upload.
 */
 
@@ -311,7 +311,7 @@ Clients MUST:
   Pick().
 - Treat a reset PushBody or PullBody stream as a failed request, and not reopen
   or resume it. There is no resumption protocol.
-- Send `bllmp-declared-length` on PushBody when the length is known.
+- Send `kinference-declared-length` on PushBody when the length is known.
 - Keep chunks at 1 MiB or less. Boundaries carry no meaning, and one oversized
   chunk fails the push with RESOURCE_EXHAUSTED even when the whole body is
   within budget.

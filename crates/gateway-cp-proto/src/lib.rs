@@ -51,13 +51,13 @@ mod tests {
         let extension_upsert = v1::ExtensionUpsert {
             namespace: "inference".into(),
             name: "picker".into(),
-            class: "bllmp_selector".into(),
+            class: "kinference_selector".into(),
             failure_mode: v1::FailureMode::Closed as i32,
             limits: Some(v1::ExtensionLimits {
                 request_body: v1::RequestBodyLimit::Stream as i32,
                 max_buffer_bytes: 1_048_576,
             }),
-            config_yaml: "service: bllmp.svc:50051".into(),
+            config_yaml: "service: kinference.svc:50051".into(),
         };
         let _ = v1::Upsert {
             body: Some(v1::upsert::Body::Extension(extension_upsert)),

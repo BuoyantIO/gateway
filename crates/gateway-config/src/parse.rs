@@ -288,18 +288,18 @@ gatewayConfig:
   binds: []
   extensions:
     - name: chat-picker
-      class: bllmp_selector
+      class: kinference_selector
       failureMode: Open
       limits: { requestBody: Buffer, maxBufferBytes: 1048576 }
       config:
-        service: bllmp.inference-d.svc:50051
+        service: kinference.inference-d.svc:50051
         pool: { namespace: inference, name: my-pool }
 ",
         )
         .unwrap();
         let ext = &cfg.extensions[0];
         assert_eq!(ext.name, "chat-picker");
-        assert_eq!(ext.class, "bllmp_selector");
+        assert_eq!(ext.class, "kinference_selector");
         assert_eq!(ext.failure_mode, crate::extension::FailureMode::Open);
         assert_eq!(
             ext.limits.request_body,
@@ -307,7 +307,7 @@ gatewayConfig:
         );
         assert_eq!(ext.limits.max_buffer_bytes, Some(1_048_576));
         // The opaque config keeps its nested shape verbatim.
-        assert_eq!(ext.config["service"], "bllmp.inference-d.svc:50051");
+        assert_eq!(ext.config["service"], "kinference.inference-d.svc:50051");
         assert_eq!(ext.config["pool"]["namespace"], "inference");
     }
 

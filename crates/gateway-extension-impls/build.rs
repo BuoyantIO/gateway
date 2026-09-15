@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto = "proto/bllmp.proto";
+    let proto = "proto/kinference.proto";
     tonic_prost_build::configure()
         // Server code is test-only (the fake picker the tests run
         // against); codegen cannot be gated per-cfg, so it is always

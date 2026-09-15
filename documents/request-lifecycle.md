@@ -216,7 +216,7 @@ for, as the route named it (group, kind, namespace, name). It is the
 identity the resolved key cannot always carry, because a ref of a kind
 the gateway has no schema for is substituted at the control plane by
 the refs of the `BackendBinding` claiming it; each substituted ref
-reports the claimed object as its origin. That is how the bllmp
+reports the claimed object as its origin. That is how the kinference
 selector names the `InferencePool` the rule was routed to.
 
 The host calls `select` exactly once, on the one declaring instance.
@@ -256,7 +256,7 @@ the selector's own declaration:
 Two examples:
 
 A rule with a header-based auth extension (`None` — it decides from
-headers in `on_request_start`) and a bllmp picker (`Stream`,
+headers in `on_request_start`) and a kinference picker (`Stream`,
 selects). Effective mode: `Stream`. The body is delivered to the
 picker's `on_request_body` chunk by chunk, and the picker forwards
 each chunk to its service; the gateway retains nothing. `select`
@@ -306,7 +306,7 @@ behind. A selector that cannot build the line it wanted errors rather
 than dispatching on the one it meant to replace. The host is not told
 any of this: like a header-modification filter, a selector that
 changes the request is a black box that changed the request. The
-bllmp selector's `dispatch_on` is the worked example, and an endpoint
+kinference selector's `dispatch_on` is the worked example, and an endpoint
 pick leaves the line alone there: that endpoint is a member of the
 service the client addressed.
 
