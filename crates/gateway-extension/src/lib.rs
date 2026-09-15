@@ -108,13 +108,26 @@ pub trait Extension: Send {
     /// when nothing was kept — a selector on a streaming rule
     /// consumed the body and must supply the one to forward.
     ///
+    /// `head` is the request as it will be dispatched, and the last
+    /// point anything may change it: a selector that routes somewhere
+    /// spelling the operation differently rewrites the request line
+    /// here itself, rather than handing the host a rewrite to apply.
+    /// Route matching and every request filter have already run
+    /// against this head, so what is changed here is the selector's
+    /// alone to justify.
+    ///
     /// # Errors
     /// An error fails the request. There is no fallback to the
     /// default load balancer: a selector that cannot decide is a
     /// failed request, not a differently routed one. Selection is
     /// always fail-closed — `failureMode: Open` has no continue path
     /// here and does not apply.
-    async fn select(&mut self, _held: Held<'_>, _cx: &mut Cx) -> Result<Selected, Error> {
+    async fn select(
+        &mut self,
+        _head: &mut http::request::Parts,
+        _held: Held<'_>,
+        _cx: &mut Cx,
+    ) -> Result<Selected, Error> {
         Err("extension declared selects_targets but does not implement select".into())
     }
 }

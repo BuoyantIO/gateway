@@ -1,6 +1,13 @@
 //! The bllmp selector: streams the request body to a Buoyant LLM
 //! Picker, dispatches to the endpoint or provider backend it picks
 //! with the body it returns, and reports how the request went.
+//!
+//! A provider pick may also name the request line to dispatch on,
+//! replacing the client's; the picker routes to a model the client
+//! did not ask for, and the destination that wins may spell the same
+//! operation somewhere else. The rewrite happens here, on the head
+//! `select` is handed: to the host this selector is a black box that
+//! changed the request, like any other extension that does.
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
@@ -20,7 +27,8 @@ use gateway_extension::{
     Held, LocalResponse, ResponseEnd, ResponseMode, Selected, Selection, Target, TargetBackend,
     async_trait,
 };
-use http::{HeaderMap, StatusCode};
+use http::uri::PathAndQuery;
+use http::{HeaderMap, StatusCode, Uri};
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -300,7 +308,12 @@ impl Extension for BllmpSelector {
         Ok(gateway_extension::Action::Continue)
     }
 
-    async fn select(&mut self, _held: Held<'_>, cx: &mut Cx) -> Result<Selected, Error> {
+    async fn select(
+        &mut self,
+        head: &mut http::request::Parts,
+        _held: Held<'_>,
+        cx: &mut Cx,
+    ) -> Result<Selected, Error> {
         use proto::pick_response::{Destination, Outcome};
 
         let push = self
@@ -363,6 +376,14 @@ impl Extension for BllmpSelector {
         // as a synthesized 5xx wherever it surfaces — here, in the
         // host's validation, or at the dial.
         self.provider = matches!(pick.destination, Some(Destination::Provider(_)));
+        // Only a provider pick names a request line; an endpoint pick
+        // is a member of the service the client addressed and keeps
+        // the client's own. A rewrite that fails leaves a head that
+        // is never dispatched, since the failed selection fails the
+        // request.
+        if let Some(Destination::Provider(provider)) = &pick.destination {
+            dispatch_on(head, &provider.path)?;
+        }
         let target = pick_target(pick.destination, cx)?;
 
         tracing::debug!(target: LOG,
@@ -583,6 +604,49 @@ fn pick_target(
     }
 }
 
+/// Dispatch on the request line a provider pick named, replacing the
+/// client's path *and* query wholesale. The wire spells "leave it
+/// alone" as the empty field, so that is a no-op here, as it is in
+/// the picker that sends it.
+///
+/// What is replaced stands in for what the client sent, so the
+/// backend's own path prefix is still joined ahead of it at dispatch,
+/// exactly as it would be for the path this displaces.
+///
+/// The value is parsed rather than spliced in as a string: the picker
+/// validates only that the path starts with '/' and has no URL to
+/// check it against, so a value that cannot be a request target
+/// reaches us intact. Failing here answers the client a 500 and arms
+/// the terminal abort with `BACKEND_UNRESOLVED`, which is the one
+/// signal that tells the picker its destination did not work;
+/// building an invalid uri at dispatch would fail the same request
+/// with nothing said back.
+fn dispatch_on(head: &mut http::request::Parts, path: &str) -> Result<(), Error> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    if !path.starts_with('/') {
+        return Err(format!("picker path `{path}` does not start with '/'").into());
+    }
+    let parsed = path
+        .parse::<PathAndQuery>()
+        .map_err(|e| format!("picker path `{path}` is not a valid request target: {e}"))?;
+
+    // Everything else about the uri survives, so dispatch still
+    // builds the same upstream target around the new line. A
+    // path-and-query is legal beside any scheme/authority combination
+    // an inbound request can carry, including none at all, so the
+    // rebuild is unreachable in practice; dispatching on the line
+    // this replaced would route the request somewhere it asked us not
+    // to, so the selection fails instead.
+    let mut uri = head.uri.clone().into_parts();
+    uri.path_and_query = Some(parsed);
+    head.uri = Uri::from_parts(uri)
+        .map_err(|e| format!("picker path `{path}` cannot be applied to the request uri: {e}"))?;
+    tracing::debug!(target: LOG, uri = %head.uri, "bllmp: dispatching on the picked request line");
+    Ok(())
+}
+
 fn clamp_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -750,10 +814,12 @@ qos: Batch
         let mut parts = request_parts();
         ext.on_request_start(&mut parts, &mut cx).await.unwrap();
 
-        let selected =
-            tokio::time::timeout(Duration::from_secs(5), ext.select(Held::Nothing, &mut cx))
-                .await
-                .expect("select must fail by deadline, not hang");
+        let selected = tokio::time::timeout(
+            Duration::from_secs(5),
+            ext.select(&mut parts, Held::Nothing, &mut cx),
+        )
+        .await
+        .expect("select must fail by deadline, not hang");
         let Err(err) = selected else {
             panic!("a silent picker cannot answer");
         };
@@ -792,11 +858,16 @@ qos: Batch
     // ---- pick_target: provider destinations ----
 
     fn provider_pick(ns: &str, name: &str) -> proto::pick_response::Destination {
+        provider_pick_on(ns, name, "")
+    }
+
+    fn provider_pick_on(ns: &str, name: &str, path: &str) -> proto::pick_response::Destination {
         proto::pick_response::Destination::Provider(proto::ProviderTarget {
             backend_ref: Some(proto::BackendRef {
                 namespace: ns.into(),
                 name: name.into(),
             }),
+            path: path.into(),
         })
     }
 
@@ -818,9 +889,68 @@ qos: Batch
     #[test]
     fn provider_pick_without_a_ref_fails() {
         let destination = Some(proto::pick_response::Destination::Provider(
-            proto::ProviderTarget { backend_ref: None },
+            proto::ProviderTarget {
+                backend_ref: None,
+                path: String::new(),
+            },
         ));
         assert!(pick_target(destination, &Cx::new()).is_err());
+    }
+
+    // ---- the dispatch path ----
+
+    fn dispatched_on(uri: &str, path: &str) -> Uri {
+        let mut parts = http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        dispatch_on(&mut parts, path).expect("a request target applies to any inbound uri");
+        parts.uri
+    }
+
+    /// The wire spells "leave the request line alone" as the empty
+    /// field; nothing else means it.
+    #[test]
+    fn an_empty_pick_path_is_no_rewrite() {
+        assert_eq!(dispatched_on("/chat?keep=me", ""), "/chat?keep=me");
+    }
+
+    /// The whole request line is replaced, query included: a pick
+    /// that carries no query leaves the client none. Everything else
+    /// about the uri survives, so dispatch still builds the same
+    /// upstream target around it.
+    #[test]
+    fn a_pick_path_replaces_the_whole_request_line() {
+        assert_eq!(
+            dispatched_on("/chat?keep=me", "/v1/messages"),
+            "/v1/messages"
+        );
+        assert_eq!(
+            dispatched_on(
+                "http://gateway.example.com/chat?keep=me",
+                "/v1/messages?beta=true"
+            ),
+            "http://gateway.example.com/v1/messages?beta=true"
+        );
+    }
+
+    /// The picker gates only on a leading '/' and has no url to check
+    /// the rest against, so both halves of that are ours to enforce.
+    /// A line we cannot dispatch on fails the selection rather than
+    /// leaving the client's in place, which would route the request
+    /// somewhere the picker asked us not to.
+    #[test]
+    fn a_pick_path_that_is_not_a_request_target_fails() {
+        let mut parts = request_parts();
+        let err = dispatch_on(&mut parts, "v1/messages")
+            .expect_err("a relative path is not a request line");
+        assert!(err.to_string().contains("does not start with '/'"), "{err}");
+        assert_eq!(parts.uri, "/v1/chat");
+
+        assert!(dispatch_on(&mut parts, "/v1/mes sages").is_err());
+        assert_eq!(parts.uri, "/v1/chat");
     }
 
     // ---- the terminal abort's reason ----
@@ -1081,15 +1211,18 @@ qos: Batch
     /// Drive one request through the hooks against `service` and
     /// return the selector (for the response phase) and what select
     /// decided.
-    async fn run_select(service: &str, cx: &mut Cx) -> (BllmpSelector, Result<Selected, Error>) {
+    async fn run_select(
+        service: &str,
+        cx: &mut Cx,
+    ) -> (BllmpSelector, http::request::Parts, Result<Selected, Error>) {
         let mut ext = selector_for(service, None);
         let mut parts = request_parts();
         ext.on_request_start(&mut parts, cx).await.unwrap();
         ext.on_request_body(Bytes::from_static(b"prompt"), true, cx)
             .await
             .unwrap();
-        let selected = ext.select(Held::Nothing, cx).await;
-        (ext, selected)
+        let selected = ext.select(&mut parts, Held::Nothing, cx).await;
+        (ext, parts, selected)
     }
 
     fn dispatched(selected: Result<Selected, Error>) -> Selection {
@@ -1102,13 +1235,20 @@ qos: Batch
 
     #[tokio::test]
     async fn select_dispatches_a_provider_pick() {
-        let pick = ok_pick(provider_pick("prod", "openai"), 9);
+        let pick = ok_pick(provider_pick_on("prod", "openai", "/v1/messages"), 9);
         let (service, _aborts, _picks) =
             spawn_picker(pick, vec![Bytes::from_static(b"rewritten")]).await;
 
         let mut cx = Cx::new();
-        let selection = dispatched(run_select(&service, &mut cx).await.1);
-        assert!(matches!(selection.target, Target::Backend { ref name } if name == "prod/openai"));
+        let (_ext, parts, selected) = run_select(&service, &mut cx).await;
+        let selection = dispatched(selected);
+        let Target::Backend { ref name } = selection.target else {
+            panic!("a provider pick is a dialable backend");
+        };
+        assert_eq!(name, "prod/openai");
+        // Over a real exchange, so the request line the picker chose
+        // survives the wire and not just the parse.
+        assert_eq!(parts.uri, "/v1/messages");
         let BodySource::Stream(body, len) = selection.body else {
             panic!("a pick's body streams back from the picker");
         };
@@ -1131,7 +1271,8 @@ qos: Batch
             8080,
             Some(pool_origin("inference", "chat-pool")),
         ));
-        let selection = dispatched(run_select(&service, &mut cx).await.1);
+        let (_ext, parts, selected) = run_select(&service, &mut cx).await;
+        let selection = dispatched(selected);
         let Target::Endpoint { backend, addr } = selection.target else {
             panic!("a local pick targets an endpoint");
         };
@@ -1143,6 +1284,10 @@ qos: Batch
         let pool = asked.inference_pool.expect("a pool was named");
         assert_eq!(pool.namespace, "inference");
         assert_eq!(pool.name, "chat-pool");
+
+        // An endpoint pick is a member of the service the client
+        // addressed, so it keeps the client's request line.
+        assert_eq!(parts.uri, "/v1/chat");
     }
 
     /// The pool is the rule's, not the object's: it is read off the
@@ -1193,7 +1338,7 @@ qos: Batch
         let (service, mut aborts, _picks) = spawn_picker(pick, vec![]).await;
 
         let mut cx = Cx::new();
-        let (mut ext, selected) = run_select(&service, &mut cx).await;
+        let (mut ext, _parts, selected) = run_select(&service, &mut cx).await;
         dispatched(selected);
         ext.on_response_end(&ended(StatusCode::BAD_GATEWAY, false), &mut cx);
 
@@ -1224,7 +1369,7 @@ qos: Batch
         let (service, mut aborts, _picks) = spawn_picker(pick, vec![]).await;
 
         let mut cx = Cx::new();
-        let (mut ext, selected) = run_select(&service, &mut cx).await;
+        let (mut ext, _parts, selected) = run_select(&service, &mut cx).await;
         let Ok(Selected::Respond(resp)) = selected else {
             panic!("NO_WORKERS answers locally");
         };

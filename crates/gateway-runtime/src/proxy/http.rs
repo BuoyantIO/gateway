@@ -622,7 +622,7 @@ async fn serve_selected(
         .iter_mut()
         .find(|m| m.decl.selects_targets)
         .expect("caller checked a selector exists");
-    let selection = match selector.ext.select(held, &mut cx).await {
+    let selection = match selector.ext.select(&mut parts, held, &mut cx).await {
         Ok(Selected::Target(selection)) => selection,
         // The selector answering directly (a shed, an overload) is
         // the route working as configured.

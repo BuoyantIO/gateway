@@ -153,6 +153,14 @@ message BackendRef {
 
 message ProviderTarget {
   BackendRef backend_ref = 1;
+
+  /*
+  Path to dispatch on, REPLACING the path the client sent; empty means leave it
+  alone. It is joined AFTER any path prefix the GatewayBackend's baseURL
+  carries. Always starts with '/', and may carry a query string, which likewise
+  replaces the client's.
+  */
+  string path = 2;
 }
 
 message ReportFirstTokenRequest {
