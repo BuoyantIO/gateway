@@ -136,12 +136,17 @@ jobs:
           docker load -i /tmp/gateway-images.tar
           docker push "$DOCKER_REGISTRY/gateway-cp:${{ needs.meta.outputs.version }}"
           docker push "$DOCKER_REGISTRY/gatewayd:${{ needs.meta.outputs.version }}"
-      - name: Publish chart
+      - name: Publish charts
+        # Both charts are versioned in lockstep: one release tag stamps
+        # gateway-crds and gateway alike.
         run: |
-          helm package deploy/chart/gateway \
-            --version ${{ needs.meta.outputs.version }} \
-            --app-version ${{ needs.meta.outputs.version }}
-          helm push "gateway-${{ needs.meta.outputs.version }}.tgz" "oci://$DOCKER_REGISTRY/charts"
+          version='${{ needs.meta.outputs.version }}'
+          for chart in gateway-crds gateway; do
+            helm package "deploy/chart/$chart" \
+              --version "$version" \
+              --app-version "$version"
+            helm push "$chart-$version.tgz" "oci://$DOCKER_REGISTRY/charts"
+          done
 
   create_release_tag:
     # The tag is only created once the release has been fully published;

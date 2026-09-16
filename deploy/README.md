@@ -1,6 +1,6 @@
 # Deploy
 
-Helm chart and sample manifests for running the gateway control
+Helm charts and sample manifests for running the gateway control
 plane and a sample data plane on a Kubernetes cluster (kind or any
 standard distribution).
 
@@ -10,6 +10,9 @@ standard distribution).
 deploy/
 ├── README.md
 ├── chart/
+│   ├── gateway-crds/                        # Helm chart: the gateway.linkerd.io
+│   │   ├── Chart.yaml                       # CRDs, installed before the gateway
+│   │   └── templates/                       # chart and upgraded like any release
 │   └── gateway/                             # Helm chart: CP Deployment, RBAC,
 │       ├── Chart.yaml                       # headless Service, GatewayClass
 │       ├── values.yaml                      # controlPlane.image / dataPlane.image
@@ -45,13 +48,15 @@ For kind:
 kind load docker-image gateway-data-plane:latest gateway-control-plane:latest
 ```
 
-Install the Gateway API CRDs, the chart (pointed at the local
-images), and the sample app:
+Install the Gateway API CRDs, the two charts (the workload chart
+pointed at the local images), and the sample app:
 
 ```sh
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+helm upgrade --install gateway-crds deploy/chart/gateway-crds \
+    --namespace gateway-system --create-namespace
 helm upgrade --install gateway deploy/chart/gateway \
-    --namespace gateway-system --create-namespace \
+    --namespace gateway-system \
     --set controlPlane.image.repository=gateway-control-plane \
     --set controlPlane.image.tag=latest \
     --set dataPlane.image.repository=gateway-data-plane \
@@ -62,6 +67,14 @@ kubectl apply -f deploy/manifests/examples/sample-app/
 Image values default to the published `ghcr.io/buoyantio` images at
 the chart's `appVersion`; the overrides above are only needed for
 locally built images.
+
+The `gateway-crds` chart must be installed first: the control plane
+watches those CRDs at startup. On a cluster that installed a
+pre-split `gateway` chart the CRDs already exist without Helm
+ownership metadata (Helm's `crds/` directory installs them
+untracked), so the first `helm install gateway-crds` there needs
+`--take-ownership` (or a one-time label/annotate of the three CRDs
+with the release metadata).
 
 ## Verify
 
