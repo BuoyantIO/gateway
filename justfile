@@ -29,7 +29,7 @@ clippy:
 
 [group('check')]
 lint-chart:
-    helm lint deploy/chart/gateway
+    helm lint deploy/chart/gateway-crds deploy/chart/gateway
 
 [group('check')]
 lint: check-fmt clippy
@@ -68,8 +68,10 @@ up: images
     # Gateway API CRD bundle at startup; whoever loses that race must
     # take ownership rather than fail.
     kubectl apply --server-side --force-conflicts -f {{GATEWAY_API_CRDS}}
+    helm upgrade --install gateway-crds deploy/chart/gateway-crds \
+        --namespace gateway-system --create-namespace
     helm upgrade --install gateway deploy/chart/gateway \
-        --namespace gateway-system --create-namespace \
+        --namespace gateway-system \
         --set controlPlane.image.repository={{CP_IMAGE_REPO}} \
         --set controlPlane.image.tag={{CP_IMAGE_TAG}} \
         --set dataPlane.image.repository={{DP_IMAGE_REPO}} \
