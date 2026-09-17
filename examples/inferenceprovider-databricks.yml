@@ -1,0 +1,14 @@
+apiVersion: kinference.buoyant.io/v1alpha1
+kind: InferenceProvider
+metadata:
+  name: databricks
+  namespace: default
+spec:
+  backendRef:
+    name: databricks
+  api: OpenAI
+  path: /serving-endpoints/vllm-endpoint/invocations
+  models:
+    - name: Qwen/Qwen2.5-32B-Instruct-Turbo
+      aliases: [qwen-2.5, qwen-simple]
+      contextWindow: 32768

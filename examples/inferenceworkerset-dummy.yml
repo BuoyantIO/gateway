@@ -1,0 +1,17 @@
+apiVersion: kinference.buoyant.io/v1alpha1
+kind: InferenceWorkerSet
+metadata:
+  name: dummy
+  namespace: default
+spec:
+  profile: default
+  kvBlockSize: 128
+
+  serviceRef:
+    name: dummy-vllm
+    port: http
+  kvEvents:
+    port: kv-pub
+
+  models:
+    - {name: HuggingFaceTB/SmolLM2-135M-Instruct, aliases: [dummy]}

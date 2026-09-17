@@ -1,0 +1,17 @@
+apiVersion: gateway.linkerd.io/v1alpha1
+kind: GatewayBackend
+metadata:
+  name: databricks
+  namespace: default
+spec:
+  baseURL: https://dbc-8f15bc20-a291.cloud.databricks.com
+  auth:
+    type: OAuth2
+    oauth2:
+      tokenURL: https://${DATABRICKS_SUBDOMAIN}.cloud.databricks.com/oidc/v1/token
+      clientID: ${DATABRICKS_CLIENT_ID}
+      clientSecretRef:
+        name: databricks-oauth
+        key: client-secret
+      scopes: [all-apis]
+      clientAuthMethod: ClientSecretBasic
