@@ -8,5 +8,5 @@ pub mod convert;
 pub mod error;
 
 pub use apply::{Affected, ApplyOutcome, apply_update};
-pub use client::run;
+pub use client::{endpoint, run};
 pub use error::Error;

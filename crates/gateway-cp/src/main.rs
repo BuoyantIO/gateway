@@ -67,6 +67,11 @@ fn default_pod_name() -> String {
 /// are all short, bounded operations.
 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Keepalive on the data-plane config streams; see the matching
+/// constants in `gateway_cp_client`.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A shutdown future for a task that only needs the signal: resolves
 /// when draining starts and releases its barrier hold immediately
 /// (the task's own `Watch` clone keeps the barrier up until it
@@ -270,6 +275,12 @@ async fn main() -> anyhow::Result<()> {
     let service = ConfigStreamServer::new(ConfigStreamService::new(state));
     tracing::info!(listen = %args.listen, controller = %args.controller_name, "control plane listening");
     Server::builder()
+        // The same reasoning as the data plane's keepalive, in the
+        // other direction: a config stream is idle for as long as the
+        // cluster is quiet, so without a ping a data plane that went
+        // away silently keeps a broadcast receiver alive forever.
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .add_service(service)
         .serve_with_shutdown(args.listen, stopped(drain_watch.clone()))
         .await?;

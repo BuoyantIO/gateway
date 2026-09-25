@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cp_handle = if let Some(cp_url) = args.control_plane {
         let client_id = args.client_id.expect("required by clap");
-        let endpoint = tonic::transport::Endpoint::try_from(cp_url)
+        let endpoint = gateway_cp_client::endpoint(cp_url)
             .map_err(|e| anyhow::anyhow!("invalid --control-plane URL: {e}"))?;
         let store_clone = store.clone();
         let w = drain_watch.clone();
