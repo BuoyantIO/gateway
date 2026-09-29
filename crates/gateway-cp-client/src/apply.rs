@@ -27,6 +27,14 @@ pub struct Affected {
 
 /// Apply one batched `ConfigUpdate`. Upserts first, then removes.
 ///
+/// Not atomic: an error leaves the items ahead of it applied and the
+/// rest of the batch untouched, so the store is left holding a
+/// fraction of a config the CP considers delivered. The caller has
+/// to treat that as fatal to the session and reconnect; a
+/// re-bootstrap is what makes the store whole again, and there is no
+/// other path back, since the CP diffs against its own previous
+/// world rather than against what a data plane holds.
+///
 /// # Errors
 /// First conversion or Store error; remaining items in the batch are
 /// skipped. The outcome reflects only what landed before the error.

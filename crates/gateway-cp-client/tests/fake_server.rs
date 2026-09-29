@@ -29,7 +29,7 @@ struct ServerState {
     connect_count: usize,
     /// Keep the stream open once the script is exhausted, the way a
     /// real CP does between publishes. Off by default: most tests
-    /// want the stream to close so the client reconnects to the next
+    /// want the stream to close so the client moves to the next
     /// script.
     hold_open: bool,
 }
@@ -648,6 +648,110 @@ async fn blackholed_stream_is_detected_and_reconnects() {
         endpoint_addrs()
     );
     assert!(state.lock().await.connect_count >= 2, "no reconnect");
+
+    let _ = client_stop.send(());
+    let _ = server_stop.send(());
+}
+
+/// A batch that fails to apply ends the session, and the re-bootstrap
+/// puts the store back in step.
+///
+/// Swallowing the error instead leaves the data plane short of a
+/// config the CP considers delivered, for good: publishes are diffed
+/// against the CP's own previous world, so the batch is never sent
+/// again and nothing else will bring it back.
+///
+/// The unconvertible item here is a bodyless `Upsert`; in a cluster
+/// it is usually a Secret carrying something that is not PEM, which
+/// the CP forwards because it only checks that `tls.crt` is
+/// non-empty. The item ahead of it matters as much as the one
+/// behind: `apply_update` is not atomic, so `stale` lands before the
+/// batch dies and only `retain` can get rid of it.
+#[tokio::test]
+async fn failed_apply_ends_the_session_and_re_bootstraps() {
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    {
+        let mut s = state.lock().await;
+        s.hold_open = true;
+        s.scripts.insert(
+            "demo/gw".to_string(),
+            vec![
+                vec![
+                    batch(
+                        vec![
+                            bind_upsert("demo/gw/http", 80),
+                            listener_upsert("demo/gw/http", "demo/gw/http"),
+                            route_upsert("demo/gw/http", "demo/gw/http", "demo/app/rule0", "be"),
+                            backend_upsert("be", "10.0.0.1", 8000),
+                        ],
+                        vec![],
+                        true,
+                    ),
+                    batch(
+                        vec![
+                            backend_upsert("stale", "10.0.9.9", 8000),
+                            pb::Upsert { body: None },
+                            backend_upsert("be", "10.0.1.24", 8000),
+                        ],
+                        vec![],
+                        false,
+                    ),
+                ],
+                vec![batch(
+                    vec![
+                        bind_upsert("demo/gw/http", 80),
+                        listener_upsert("demo/gw/http", "demo/gw/http"),
+                        route_upsert("demo/gw/http", "demo/gw/http", "demo/app/rule0", "be"),
+                        backend_upsert("be", "10.0.1.24", 8000),
+                    ],
+                    vec![],
+                    true,
+                )],
+            ],
+        );
+    }
+
+    let (endpoint, server_stop) = spawn_server(state.clone()).await;
+    let store = Store::new();
+    let key = BackendKey::new("be");
+    let addrs = {
+        let store = store.clone();
+        let key = key.clone();
+        move || -> Vec<String> {
+            store
+                .read()
+                .backend(&key)
+                .map(|b| {
+                    b.endpoints()
+                        .iter()
+                        .map(|e| e.address.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    };
+
+    let client_stop = run_until(
+        endpoint,
+        "demo/gw",
+        store.clone(),
+        {
+            let addrs = addrs.clone();
+            let state = state.clone();
+            move |_| {
+                state.try_lock().is_ok_and(|s| s.connect_count >= 2)
+                    && addrs() == vec!["10.0.1.24".to_string()]
+            }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert_eq!(addrs(), vec!["10.0.1.24".to_string()]);
+    assert!(
+        store.read().backend(&BackendKey::new("stale")).is_none(),
+        "half-applied item survived the re-bootstrap"
+    );
 
     let _ = client_stop.send(());
     let _ = server_stop.send(());
