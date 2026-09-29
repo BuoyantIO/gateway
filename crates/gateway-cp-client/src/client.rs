@@ -112,8 +112,8 @@ async fn run_session(
         let outcome = match apply_update(store, update) {
             Ok(o) => o,
             Err(e) => {
-                tracing::warn!(error = %e, "apply failed; CP push will retry");
-                continue;
+                tracing::warn!(error = %e, "apply failed; reconnecting to re-bootstrap");
+                return Err(e);
             }
         };
 
