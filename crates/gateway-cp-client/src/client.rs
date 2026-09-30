@@ -30,6 +30,38 @@ const BACKOFF_FACTOR: u32 = 2;
 const BACKOFF_JITTER: f64 = 0.2;
 const REQUEST_CHANNEL_CAPACITY: usize = 4;
 
+// Keepalive. The config stream is idle whenever the cluster is quiet,
+// and an idle connection that dies without a FIN or an RST (a dropped
+// conntrack entry, an LB idle timeout, a node that vanished under the
+// control plane) is invisible to the reader: the next `message()`
+// parks forever, the session never errors, and the data plane serves
+// its last config while believing it is connected. The ping is what
+// turns that into a transport error the reconnect loop can act on,
+// which is why it has to be sent while idle.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connect bound, so a dial into a black hole fails into the backoff
+/// loop instead of hanging the way an established stream would.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The control-plane channel, configured.
+///
+/// Callers build their endpoint through this rather than from the URL
+/// directly: the keepalive settings above are the only thing that
+/// makes a dead stream observable, and an endpoint assembled
+/// elsewhere loses them silently; the data plane keeps serving, so
+/// nothing reports the loss until someone notices stale config.
+///
+/// # Errors
+/// `url` is not a valid gRPC endpoint.
+pub fn endpoint(url: String) -> Result<Endpoint, Error> {
+    Ok(Endpoint::try_from(url)?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true))
+}
+
 /// Run until `shutdown` resolves. Transient gRPC failures drop the
 /// stream and reconnect; only a non-recoverable startup error escapes
 /// as `Err`.

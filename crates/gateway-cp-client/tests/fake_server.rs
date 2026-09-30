@@ -9,7 +9,7 @@ use std::time::Duration;
 use gateway_cp_proto::v1 as pb;
 use gateway_cp_proto::v1::config_stream_server::{ConfigStream, ConfigStreamServer};
 use gateway_state::{BackendKey, BindKey, ListenerKey, RouteKey, Store};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::ReceiverStream;
@@ -83,8 +83,8 @@ impl ConfigStream for FakeCp {
             }
             if hold_open {
                 // Park holding the sender: the stream stays open with
-                // nothing on it, which is where a data plane spends
-                // almost all of its life.
+                // nothing on it, which is the state a data plane spends
+                // almost all of its life in.
                 tx.closed().await;
             }
             // Dropping tx closes the stream and the client reconnects.
@@ -234,6 +234,55 @@ where
     .await;
     polled.expect("condition not met within deadline");
     shutdown_tx
+}
+
+// ---------------- blackhole proxy ----------------
+
+/// A TCP proxy that can stop forwarding without closing either
+/// socket: both ends stay ESTABLISHED and everything sent after the
+/// flip is dropped on the floor. That is what a dropped conntrack
+/// entry, an idle-timing LB or a vanished node looks like to the
+/// client, and it is the one failure an h2 reader cannot observe for
+/// itself: no FIN, no RST, just silence.
+///
+/// Only the flows that are live when the flip happens are
+/// blackholed; connections opened afterwards are proxied normally,
+/// so the client's reconnect gets through. That is what
+/// `mark_unchanged` buys: a cloned receiver inherits its parent's
+/// seen version, not the current one, so without it every later
+/// connection would see the same flip and the client could never
+/// recover.
+async fn spawn_blackhole_proxy(upstream: SocketAddr) -> (Endpoint, watch::Sender<bool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (flip_tx, flip_rx) = watch::channel(false);
+
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let Ok(mut server) = TcpStream::connect(upstream).await else {
+                return;
+            };
+            let mut flip = flip_rx.clone();
+            flip.mark_unchanged();
+            tokio::spawn(async move {
+                let (mut client_rx, mut client_tx) = client.split();
+                let (mut server_rx, mut server_tx) = server.split();
+                tokio::select! {
+                    _ = tokio::io::copy(&mut client_rx, &mut server_tx) => {}
+                    _ = tokio::io::copy(&mut server_rx, &mut client_tx) => {}
+                    _ = flip.changed() => {
+                        // Park, holding both sockets open: dropping
+                        // them here would close the connection and
+                        // hand the client the very signal under test.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            });
+        }
+    });
+
+    let endpoint = gateway_cp_client::endpoint(format!("http://{addr}")).unwrap();
+    (endpoint, flip_tx)
 }
 
 // ---------------- tests ----------------
@@ -498,6 +547,107 @@ async fn stale_entities_purged_after_reconnect() {
         "demo/app/rule0"
     )));
     assert!(read.bind(&BindKey::new("demo/gw/http")).is_some());
+
+    let _ = client_stop.send(());
+    let _ = server_stop.send(());
+}
+
+/// A blackholed stream is noticed, and the reconnect re-bootstraps.
+///
+/// Without keepalive on the channel the client parks on `message()`
+/// forever: no error, no reconnect, and the store goes on serving the
+/// config from before the break while the control plane moves on. The
+/// assertion is the reconnect and the endpoint that comes with it,
+/// since a reconnect is the only thing that puts a data plane back in
+/// step.
+///
+/// Builds its endpoint through `gateway_cp_client::endpoint`, so it
+/// exercises the production keepalive values; that is also why it
+/// takes upwards of 15 seconds to fail over.
+#[tokio::test]
+async fn blackholed_stream_is_detected_and_reconnects() {
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    {
+        let mut s = state.lock().await;
+        s.hold_open = true;
+        s.scripts.insert(
+            "demo/gw".to_string(),
+            vec![
+                // The world before the break.
+                vec![batch(
+                    vec![backend_upsert("be", "10.0.0.1", 8000)],
+                    vec![],
+                    true,
+                )],
+                // What the reconnect has to pick up.
+                vec![batch(
+                    vec![backend_upsert("be", "10.0.1.24", 8000)],
+                    vec![],
+                    true,
+                )],
+            ],
+        );
+    }
+
+    let (cp_endpoint, server_stop) = spawn_server(state.clone()).await;
+    let cp_addr: SocketAddr = cp_endpoint
+        .uri()
+        .authority()
+        .expect("fake CP endpoint has an authority")
+        .as_str()
+        .parse()
+        .expect("fake CP endpoint is host:port");
+    let (endpoint, blackhole) = spawn_blackhole_proxy(cp_addr).await;
+
+    let store = Store::new();
+    let key = BackendKey::new("be");
+    let endpoint_addrs = {
+        let store = store.clone();
+        let key = key.clone();
+        move || -> Vec<String> {
+            store
+                .read()
+                .backend(&key)
+                .map(|b| {
+                    b.endpoints()
+                        .iter()
+                        .map(|e| e.address.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    };
+
+    let client_stop = run_until(
+        endpoint,
+        "demo/gw",
+        store.clone(),
+        {
+            let key = key.clone();
+            move |s| s.read().backend(&key).is_some()
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(endpoint_addrs(), vec!["10.0.0.1".to_string()]);
+
+    blackhole.send_replace(true);
+
+    let converged = timeout(Duration::from_secs(45), async {
+        loop {
+            if endpoint_addrs() == vec!["10.0.1.24".to_string()] {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        converged.is_ok(),
+        "client never noticed the dead connection; endpoints still {:?}",
+        endpoint_addrs()
+    );
+    assert!(state.lock().await.connect_count >= 2, "no reconnect");
 
     let _ = client_stop.send(());
     let _ = server_stop.send(());
