@@ -22,20 +22,23 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
 use gateway_cp::crd::{
-    ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding, BackendBindingSpec,
+    ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding, BackendBindingSpec, BackendTls,
     BindingBackendRef, BindingObjectReference, Claim, Extension, ExtensionSpec, FailureMode,
-    GatewayBackend, GatewayBackendSpec, Limits, SecretKeyReference,
+    GatewayBackend, GatewayBackendSpec, Limits, LocalSecretReference, SecretKeyReference,
 };
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, Pod, PodSpec, PodTemplateSpec, Secret, Service, ServicePort,
+    Container, ContainerPort, EnvVar, Pod, PodSpec, PodTemplateSpec, Secret, Service, ServicePort,
     ServiceSpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, LogParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
+use serde::Deserialize;
+
+use crate::certs::PROVIDER_SNI;
 
 /// Build a `Gateway` attached to the in-tree `buoyant-gateway`
 /// `GatewayClass`, with one HTTP listener on `port`. The provisioned
@@ -728,18 +731,25 @@ pub async fn annotate_gateway(
 /// # Errors
 /// Returns an error if no DP pod exists or the proxied request fails.
 pub async fn dp_admin_get(client: &Client, ns: &str, gw_name: &str, path: &str) -> Result<String> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
     let selector = format!("gateway.networking.k8s.io/gateway-name={gw_name}");
-    let pod = pods
-        .list(&ListParams::default().labels(&selector))
-        .await?
-        .items
-        .into_iter()
-        .next()
-        .with_context(|| format!("no DP pod labeled {selector}"))?;
-    let pod_name = pod.metadata.name.context("pod has no name")?;
+    pod_proxy_get(client, ns, &selector, 15021, path).await
+}
 
-    let uri = format!("/api/v1/namespaces/{ns}/pods/{pod_name}:15021/proxy{path}");
+/// GET a path from the first pod matching `selector`, on `port`,
+/// through the apiserver's pod proxy subresource. The way a test
+/// reaches a port no Service publishes.
+///
+/// # Errors
+/// Returns an error if no pod matches or the proxied request fails.
+pub async fn pod_proxy_get(
+    client: &Client,
+    ns: &str,
+    selector: &str,
+    port: u16,
+    path: &str,
+) -> Result<String> {
+    let pod_name = first_pod_named(client, ns, selector).await?;
+    let uri = format!("/api/v1/namespaces/{ns}/pods/{pod_name}:{port}/proxy{path}");
     let req = http::Request::get(&uri)
         .body(Vec::new())
         .context("building pod proxy request")?;
@@ -747,6 +757,68 @@ pub async fn dp_admin_get(client: &Client, ns: &str, gw_name: &str, path: &str) 
         .request_text(req)
         .await
         .with_context(|| format!("GET {uri}"))
+}
+
+/// Name of the first pod matching `selector`.
+async fn first_pod_named(client: &Client, ns: &str, selector: &str) -> Result<String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let pod = pods
+        .list(&ListParams::default().labels(selector))
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .with_context(|| format!("no pod labeled {selector}"))?;
+    pod.metadata.name.context("pod has no name")
+}
+
+/// The provisioned data plane's container log, with the terminal
+/// escapes stripped.
+///
+/// The access log is the only place the response byte count and
+/// whether the stream ran to its end are written down — neither is a
+/// metric — so a test asserting on how a response *ended* reads it
+/// here. See `crates/gateway-runtime/src/proxy/access.rs`.
+///
+/// The stripping is not cosmetic: `tracing_subscriber::fmt` colours
+/// its output whether or not anything is attached to read it, so a
+/// field in the raw log reads `path\e[0m\e[2m=\e[0m/x` and no
+/// `key=value` match finds it.
+///
+/// # Errors
+/// Returns an error if no DP pod exists or the log read fails.
+pub async fn dp_logs(client: &Client, ns: &str, gw_name: &str) -> Result<String> {
+    let selector = format!("gateway.networking.k8s.io/gateway-name={gw_name}");
+    let pod_name = first_pod_named(client, ns, &selector).await?;
+    let raw = Api::<Pod>::namespaced(client.clone(), ns)
+        .logs(&pod_name, &LogParams::default())
+        .await
+        .with_context(|| format!("reading logs of {ns}/{pod_name}"))?;
+    Ok(strip_ansi(&raw))
+}
+
+/// Drop CSI escape sequences (`ESC [ ... final`), which is all the
+/// formatter emits.
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() != Some('[') {
+            continue;
+        }
+        // Parameter and intermediate bytes, then one final byte in
+        // `@`..=`~` that ends the sequence.
+        for c in chars.by_ref() {
+            if ('@'..='~').contains(&c) {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Scale an existing `Deployment` to `replicas`.
@@ -1069,4 +1141,230 @@ pub async fn delete_secret(client: &Client, ns: &str, name: &str) -> Result<()> 
         .await
         .with_context(|| format!("deleting Secret {ns}/{name}"))?;
     Ok(())
+}
+
+/// The port the mock inference provider serves its API on, over the
+/// TLS the gateway originates.
+pub const PROVIDER_PORT: u16 = 8443;
+/// Its plaintext side channel, published on the Service but only ever
+/// read through the pod proxy.
+const PROVIDER_STATS_PORT: u16 = 8080;
+
+/// Deploy the mock inference provider (same test image, third
+/// binary): a `Deployment` serving TLS on [`PROVIDER_PORT`] plus a
+/// `Service` fronting it, demanding `credential` in `header` on every
+/// request.
+///
+/// # Errors
+/// Returns an error if a create call fails.
+pub async fn deploy_provider_mock(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    header: &str,
+    credential: &str,
+) -> Result<()> {
+    let labels: BTreeMap<String, String> =
+        [("app".to_owned(), name.to_owned())].into_iter().collect();
+
+    let deployment = Deployment {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(1),
+            selector: LabelSelector {
+                match_labels: Some(labels.clone()),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "provider".into(),
+                        image: Some("gateway-test-echo:e2e".into()),
+                        image_pull_policy: Some("IfNotPresent".into()),
+                        command: Some(vec!["/usr/local/bin/openai_mock".to_string()]),
+                        env: Some(vec![
+                            EnvVar {
+                                name: "MOCK_CREDENTIAL_HEADER".into(),
+                                value: Some(header.into()),
+                                ..Default::default()
+                            },
+                            EnvVar {
+                                name: "MOCK_CREDENTIAL".into(),
+                                value: Some(credential.into()),
+                                ..Default::default()
+                            },
+                        ]),
+                        ports: Some(vec![
+                            ContainerPort {
+                                name: Some("https".into()),
+                                container_port: i32::from(PROVIDER_PORT),
+                                ..Default::default()
+                            },
+                            ContainerPort {
+                                name: Some("stats".into()),
+                                container_port: i32::from(PROVIDER_STATS_PORT),
+                                ..Default::default()
+                            },
+                        ]),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    Api::<Deployment>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), &deployment)
+        .await
+        .with_context(|| format!("creating provider deployment {name}"))?;
+
+    let svc = Service {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(labels),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("https".into()),
+                    port: i32::from(PROVIDER_PORT),
+                    target_port: Some(IntOrString::String("https".into())),
+                    protocol: Some("TCP".into()),
+                    ..Default::default()
+                },
+                ServicePort {
+                    name: Some("stats".into()),
+                    port: i32::from(PROVIDER_STATS_PORT),
+                    target_port: Some(IntOrString::String("stats".into())),
+                    protocol: Some("TCP".into()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        status: None,
+    };
+
+    Api::<Service>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), &svc)
+        .await
+        .with_context(|| format!("creating provider service {name}"))?;
+
+    Ok(())
+}
+
+/// The `baseURL` a `GatewayBackend` reaches the mock provider at:
+/// its cluster DNS name, and the `/v1` a provider serves its API
+/// under.
+#[must_use]
+pub fn provider_base_url(ns: &str, name: &str) -> String {
+    format!("https://{name}.{ns}.svc.cluster.local:{PROVIDER_PORT}/v1")
+}
+
+/// Create a `Secret` carrying only a CA chain under `tls.crt` — the
+/// shape a `GatewayBackend`'s `tls.ca` reference reads. No private
+/// key: a trust root has no use for one.
+///
+/// # Errors
+/// Returns an error if the create call fails.
+pub async fn deploy_ca_secret(client: &Client, ns: &str, name: &str, ca_pem: &str) -> Result<()> {
+    let mut data = BTreeMap::new();
+    data.insert("tls.crt".to_owned(), ByteString(ca_pem.as_bytes().to_vec()));
+
+    let secret = Secret {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        type_: Some("Opaque".into()),
+        data: Some(data),
+        ..Default::default()
+    };
+
+    Api::<Secret>::namespaced(client.clone(), ns)
+        .create(&PostParams::default(), &secret)
+        .await
+        .with_context(|| format!("creating CA secret {name}"))?;
+    Ok(())
+}
+
+/// A `GatewayBackend` reached over originated TLS, verified against
+/// the CA in `ca_secret` and authenticated with an API key.
+///
+/// `sni` is [`PROVIDER_SNI`] rather than the URL's host because the
+/// baked leaf cannot carry a name containing a per-test namespace;
+/// see `crate::certs`.
+#[must_use]
+pub fn gateway_backend_tls_api_key(
+    ns: &str,
+    name: &str,
+    base_url: &str,
+    ca_secret: &str,
+    secret: &str,
+    key: &str,
+    header: &str,
+) -> GatewayBackend {
+    let mut object = gateway_backend_with_api_key(ns, name, base_url, secret, key, header);
+    object.spec.tls = Some(BackendTls {
+        ca: Some(LocalSecretReference {
+            name: ca_secret.into(),
+        }),
+        sni: Some(PROVIDER_SNI.into()),
+        alpn: None,
+        insecure_skip_verify: false,
+    });
+    object
+}
+
+/// One request as the mock provider experienced it. Mirrors the
+/// record `e2e/src/bin/openai_mock.rs` serves.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderRequest {
+    pub id: u64,
+    pub method: String,
+    /// The path the provider received, which carries the `baseURL`
+    /// path the gateway joined ahead of the client's.
+    pub path: String,
+    pub http_version: String,
+    pub authorized: bool,
+    pub chunks_sent: u64,
+    pub bytes_sent: u64,
+    /// True only if the provider handed over the whole scripted
+    /// response; false means it was still streaming when the client
+    /// went away.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderStats {
+    pub requests: Vec<ProviderRequest>,
+}
+
+/// Read the mock provider's record of what it served, through the
+/// apiserver pod proxy — the stats port is deliberately not behind
+/// the gateway, so what it reports is independent of the path under
+/// test.
+///
+/// # Errors
+/// Returns an error if no provider pod exists, the proxied request
+/// fails, or the response is not the expected JSON.
+pub async fn provider_stats(client: &Client, ns: &str, name: &str) -> Result<ProviderStats> {
+    let selector = format!("app={name}");
+    let body = pod_proxy_get(client, ns, &selector, PROVIDER_STATS_PORT, "/__stats").await?;
+    serde_json::from_str(&body).with_context(|| format!("parsing provider stats: {body}"))
 }

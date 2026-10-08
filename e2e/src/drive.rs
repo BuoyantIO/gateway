@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use http::StatusCode;
 use reqwest::header::HeaderMap;
+use tokio_stream::StreamExt;
 
 /// Outer deadline for the wait loops. Generous because a fresh
 /// cluster's first test pays every cold start at once: data-plane
@@ -225,4 +226,102 @@ pub async fn wait_until_routed_tls(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(2));
     }
+}
+
+/// What a streamed response looked like as it arrived.
+///
+/// The timings are what make "the tokens streamed" an assertion
+/// rather than a hope: [`Sse::first_chunk`] is the moment the first
+/// body frame reached the client, and a response the gateway had
+/// buffered would show it indistinguishable from [`Sse::last_chunk`].
+pub struct Sse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    /// Body bytes received, concatenated.
+    pub body: String,
+    pub bytes: u64,
+    /// Frames the client was handed, which is not the number of SSE
+    /// events: nothing promises they line up one to one.
+    pub chunks: u64,
+    /// Time from sending the request to the first and last body
+    /// frames. `None` when no frame ever arrived.
+    pub first_chunk: Option<Duration>,
+    pub last_chunk: Option<Duration>,
+    /// Whether the body ran to its end, as opposed to the caller
+    /// walking away from it.
+    pub complete: bool,
+}
+
+/// A client for responses that outlive a normal request. The usual
+/// `timeout` bounds the whole exchange, body included, which a long
+/// completion is meant to exceed; `read_timeout` bounds the gap
+/// between frames instead, so a stalled stream still fails fast.
+fn stream_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(10))
+        .build()
+        .context("building streaming reqwest client")
+}
+
+/// POST `body` as JSON and consume the response body frame by frame,
+/// timing each one.
+///
+/// `take` bounds how many frames are read: `None` reads to the end of
+/// the stream, and `Some(n)` stops after `n` and drops the response,
+/// which is how a test disconnects mid-stream.
+///
+/// # Errors
+/// Returns an error on transport failure, or if a frame fails to
+/// arrive within the read timeout.
+pub async fn post_sse(
+    gateway_addr: &str,
+    host: &str,
+    path: &str,
+    body: serde_json::Value,
+    take: Option<u64>,
+) -> Result<Sse> {
+    let url = format!("http://{gateway_addr}{path}");
+    let started = std::time::Instant::now();
+    let resp = stream_client()?
+        .post(&url)
+        .header(reqwest::header::HOST, host)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url} (host {host})"))?;
+
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let mut sse = Sse {
+        status,
+        headers,
+        body: String::new(),
+        bytes: 0,
+        chunks: 0,
+        first_chunk: None,
+        last_chunk: None,
+        complete: false,
+    };
+
+    let mut stream = Box::pin(resp.bytes_stream());
+    loop {
+        if take.is_some_and(|n| sse.chunks >= n) {
+            // Drop the stream, and with it the connection: the
+            // gateway sees the client go away mid-response.
+            break;
+        }
+        let Some(frame) = stream.next().await else {
+            sse.complete = true;
+            break;
+        };
+        let frame = frame.with_context(|| format!("reading body of POST {url}"))?;
+        let elapsed = started.elapsed();
+        sse.first_chunk.get_or_insert(elapsed);
+        sse.last_chunk = Some(elapsed);
+        sse.chunks += 1;
+        sse.bytes += frame.len() as u64;
+        sse.body.push_str(&String::from_utf8_lossy(&frame));
+    }
+    Ok(sse)
 }

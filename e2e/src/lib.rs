@@ -5,6 +5,7 @@
 //! from `Gateway.status.addresses` — the same way an external
 //! client would.
 
+pub mod certs;
 pub mod cluster;
 pub mod drive;
 pub mod fixtures;
@@ -16,7 +17,9 @@ pub mod grpc {
 }
 
 pub use cluster::{Scope, kube_client};
-pub use drive::{Driver, wait_until_redirected, wait_until_routed, wait_until_routed_tls};
+pub use drive::{
+    Driver, Sse, post_sse, wait_until_redirected, wait_until_routed, wait_until_routed_tls,
+};
 pub use fixtures::{
     HttpRouteBuilder, annotate_gateway, delete_http_route, deploy_echo, deploy_grpc_echo,
     deploy_tls_secret, dp_admin_get, gateway, gateway_address, gateway_backend, gateway_https,
