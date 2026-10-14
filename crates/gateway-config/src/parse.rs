@@ -147,7 +147,7 @@ gatewayConfig:
             panic!("expected TLS listener");
         };
         assert_eq!(l.tls.mode, TlsMode::Passthrough);
-        assert!(l.tls.certificates.is_empty());
+        assert!(l.tls.certificates.is_empty(), "{:?}", l.tls.certificates);
     }
 
     #[test]

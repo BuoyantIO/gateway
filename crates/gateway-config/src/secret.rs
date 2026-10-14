@@ -617,7 +617,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
     fn secret_ref_namespace_defaults_to_empty() {
         let r: SecretRef =
             serde_yaml::from_str("name: provider-creds\nkey: apiKey\n").expect("parses");
-        assert!(r.namespace.is_empty());
+        assert!(r.namespace.is_empty(), "{:?}", r.namespace);
     }
 
     // Indent each line of a PEM block by 8 spaces for a YAML literal scalar.

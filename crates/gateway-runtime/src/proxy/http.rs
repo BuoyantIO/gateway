@@ -2378,7 +2378,11 @@ mod tests {
         assert_eq!(targets.backend("be-a").unwrap().endpoints().len(), 1);
         assert_eq!(targets.backend("be-a").unwrap().weight(), 1);
         // An unresolved ref is visible but offers nothing to pick.
-        assert!(targets.backend("ghost").unwrap().endpoints().is_empty());
+        assert!(
+            targets.backend("ghost").unwrap().endpoints().is_empty(),
+            "{:?}",
+            targets.backend("ghost").unwrap().endpoints()
+        );
         assert!(targets.backend("absent").is_none());
     }
 

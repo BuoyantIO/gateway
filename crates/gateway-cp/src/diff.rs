@@ -226,7 +226,7 @@ mod tests {
         next.binds.insert(BindKey::new("a"), upsert_bind("a", 80));
         let batch = diff(&prev, &next).expect("diff");
         assert_eq!(batch.upserts.len(), 1);
-        assert!(batch.removes.is_empty());
+        assert!(batch.removes.is_empty(), "{:?}", batch.removes);
         assert!(!batch.sync_complete);
     }
 
@@ -236,7 +236,7 @@ mod tests {
         prev.binds.insert(BindKey::new("a"), upsert_bind("a", 80));
         let next = Snapshot::default();
         let batch = diff(&prev, &next).expect("diff");
-        assert!(batch.upserts.is_empty());
+        assert!(batch.upserts.is_empty(), "{:?}", batch.upserts);
         assert_eq!(batch.removes.len(), 1);
     }
 
@@ -248,7 +248,7 @@ mod tests {
         next.binds.insert(BindKey::new("a"), upsert_bind("a", 81));
         let batch = diff(&prev, &next).expect("diff");
         assert_eq!(batch.upserts.len(), 1);
-        assert!(batch.removes.is_empty());
+        assert!(batch.removes.is_empty(), "{:?}", batch.removes);
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
         );
         let batch = diff(&prev, &next).expect("diff");
         assert_eq!(batch.upserts.len(), 1);
-        assert!(batch.removes.is_empty());
+        assert!(batch.removes.is_empty(), "{:?}", batch.removes);
         assert!(matches!(
             batch.upserts[0].body,
             Some(pb::upsert::Body::Secret(_))
@@ -330,7 +330,7 @@ mod tests {
         );
         let next = Snapshot::default();
         let batch = diff(&prev, &next).expect("diff");
-        assert!(batch.upserts.is_empty());
+        assert!(batch.upserts.is_empty(), "{:?}", batch.upserts);
         assert_eq!(batch.removes.len(), 1);
         match &batch.removes[0].key {
             Some(pb::remove::Key::Secret(k)) => {
@@ -355,6 +355,6 @@ mod tests {
         );
         let batch = diff(&prev, &next).expect("diff");
         assert_eq!(batch.upserts.len(), 1);
-        assert!(batch.removes.is_empty());
+        assert!(batch.removes.is_empty(), "{:?}", batch.removes);
     }
 }

@@ -1127,7 +1127,7 @@ gatewayConfig:
             oauth.client_auth_method,
             ClientAuthMethod::ClientSecretBasic
         );
-        assert!(oauth.scopes.is_empty());
+        assert!(oauth.scopes.is_empty(), "{:?}", oauth.scopes);
     }
 
     /// The gateway dials the token endpoint itself, so the URL has to

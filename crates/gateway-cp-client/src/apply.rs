@@ -624,7 +624,7 @@ huMI9EpCZAC8QV43yS5/4Ljj171TYarpLsLvYMlaNyyvyBrGOIxGJ7Qf\n\
 
         let bind = store.read().bind(&BindKey::new("b")).unwrap();
         let r = &bind.listeners[0].routes[0];
-        assert!(r.filters.is_empty());
+        assert!(r.filters.is_empty(), "{:?}", r.filters);
     }
 
     // ----- extensions -----
