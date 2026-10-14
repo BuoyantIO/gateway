@@ -64,9 +64,9 @@ helm upgrade --install gateway deploy/chart/gateway \
 kubectl apply -f deploy/manifests/examples/sample-app/
 ```
 
-Image values default to the published `ghcr.io/buoyantio` images at
-the chart's `appVersion`; the overrides above are only needed for
-locally built images.
+Image values default to the published `cr.kinference.ai/buoyantio` images at
+the chart's `appVersion`; the overrides above are only needed for locally built
+images.
 
 The `gateway-crds` chart must be installed first: the control plane
 watches those CRDs at startup. On a cluster that installed a
