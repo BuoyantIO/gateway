@@ -1,0 +1,51 @@
+# Log request and response heads and capped body prefixes on a route,
+# with credentials redacted. The smoke route (httproute-smoke.yml) with
+# the `debug_log` extension attached; apply it in place of that file,
+# and re-apply httproute-smoke.yml to detach it.
+#
+#   kubectl logs deploy/llm-gw-gatewayd -f | grep extension::debug_log
+#
+# Lines log at info, which the default data-plane filter already
+# shows. The body logged is the client's: a kinference pick forwards
+# the body its picker returns, which does not pass through here.
+apiVersion: gateway.linkerd.io/v1alpha1
+kind: Extension
+metadata:
+  name: debug-log
+  namespace: default
+spec:
+  class: debug_log
+  config:
+    # Bytes of each body to log; 0 logs heads only. At most 1048576.
+    maxBodyBytes: 4096
+    # Redacts the values of authorization, proxy-authorization, cookie,
+    # set-cookie, x-api-key, api-key, x-goog-api-key and
+    # x-amz-security-token, and of the key, api_key, api-key, apikey,
+    # access_token and token query parameters. false logs them in the
+    # clear: only for a cluster whose logs are yours alone.
+    redactCredentials: true
+    # Redacted on top of the list above, and even with
+    # redactCredentials: false.
+    redactHeaders: []
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: chat
+  namespace: default
+spec:
+  parentRefs:
+    - name: llm-gw
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.linkerd.io
+            kind: Extension
+            name: debug-log
+      backendRefs:
+        - group: kinference.buoyant.io
+          kind: InferencePool
+          name: smoke

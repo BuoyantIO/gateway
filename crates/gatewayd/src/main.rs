@@ -144,6 +144,12 @@ async fn main() -> anyhow::Result<()> {
             std::sync::Arc::new(gateway_extension_impls::kinference::KinferenceSelectorClass),
         )
         .expect("kinference_selector is not a reserved name");
+    classes
+        .register(
+            gateway_extension_impls::debug_log::DEBUG_LOG,
+            std::sync::Arc::new(gateway_extension_impls::debug_log::DebugLogClass),
+        )
+        .expect("debug_log is not a reserved name");
     let gateway = gateway_runtime::Gateway::with_metrics(store, metrics).with_classes(classes);
     gateway.run(drain_watch).await?;
 

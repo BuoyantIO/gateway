@@ -30,6 +30,7 @@ gateway-state = { path = "../gateway-state" }
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tracing-subscriber = "0.3"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
