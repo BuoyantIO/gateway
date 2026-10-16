@@ -57,6 +57,7 @@ pub(super) fn end_without_response(instances: &mut [Instance], cx: &mut Cx, stat
         status,
         body_bytes: 0,
         complete: false,
+        body_failed: false,
         upstream: false,
     };
     for instance in instances
@@ -66,6 +67,17 @@ pub(super) fn end_without_response(instances: &mut [Instance], cx: &mut Cx, stat
     {
         instance.ext.on_response_end(&end, cx);
     }
+}
+
+/// How a tapped response body finished.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// Ran to its end.
+    Finished,
+    /// The body returned an error mid-stream.
+    Failed,
+    /// Dropped while still streaming: the client went away.
+    Abandoned,
 }
 
 struct TappedBody {
@@ -85,7 +97,7 @@ struct TappedBody {
 impl TappedBody {
     /// Runs the terminal hook once. Every later call is a no-op, so
     /// the end-of-stream paths and `Drop` can all call it freely.
-    fn end(&mut self, complete: bool) {
+    fn end(&mut self, ending: Ending) {
         if !self.armed {
             return;
         }
@@ -93,7 +105,8 @@ impl TappedBody {
         let end = ResponseEnd {
             status: self.status,
             body_bytes: self.bytes,
-            complete,
+            complete: matches!(ending, Ending::Finished),
+            body_failed: matches!(ending, Ending::Failed),
             upstream: self.upstream,
         };
         for instance in self
@@ -142,7 +155,7 @@ impl Body for TappedBody {
                     let end_of_stream = this.inner.is_end_stream();
                     this.deliver(data, end_of_stream);
                     if end_of_stream {
-                        this.end(true);
+                        this.end(Ending::Finished);
                     }
                 }
             }
@@ -151,10 +164,10 @@ impl Body for TappedBody {
                 // empty, matching the request side's contract.
                 if this.armed {
                     this.deliver(&Bytes::new(), true);
-                    this.end(true);
+                    this.end(Ending::Finished);
                 }
             }
-            Poll::Ready(Some(Err(_))) => this.end(false),
+            Poll::Ready(Some(Err(_))) => this.end(Ending::Failed),
             Poll::Pending => {}
         }
         polled
@@ -173,7 +186,7 @@ impl Drop for TappedBody {
     fn drop(&mut self) {
         // Still armed means the response never completed — most often
         // the client disconnected while it was streaming.
-        self.end(false);
+        self.end(Ending::Abandoned);
     }
 }
 
@@ -310,6 +323,7 @@ mod tests {
                 status: StatusCode::OK,
                 body_bytes: 7,
                 complete: true,
+                body_failed: false,
                 upstream: true,
             }]
         );
@@ -335,6 +349,7 @@ mod tests {
                 status: StatusCode::CREATED,
                 body_bytes: 2,
                 complete: true,
+                body_failed: false,
                 upstream: true,
             }]
         );
@@ -362,6 +377,7 @@ mod tests {
                 status: StatusCode::BAD_GATEWAY,
                 body_bytes: 11,
                 complete: true,
+                body_failed: false,
                 upstream: false,
             }]
         );
@@ -391,6 +407,42 @@ mod tests {
                 status: StatusCode::OK,
                 body_bytes: 5,
                 complete: false,
+                body_failed: false,
+                upstream: true,
+            }]
+        );
+    }
+
+    /// A body that errors mid-stream is incomplete like a disconnect,
+    /// but says the failure was the body's, not the client's.
+    #[tokio::test]
+    async fn a_failed_body_fires_the_terminal_as_failed() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (m, seen) = instance("m", ResponseMode::Tap, &order);
+        let frames: Vec<Result<Frame<Bytes>, BoxError>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"first"))),
+            Err("upstream reset".into()),
+        ];
+        let body = tap(
+            StreamBody::new(stream::iter(frames)).boxed_unsync(),
+            vec![m],
+            Cx::new(),
+            StatusCode::OK,
+            true,
+        );
+        assert!(
+            body.collect().await.is_err(),
+            "the failure reaches the client"
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.ends,
+            vec![ResponseEnd {
+                status: StatusCode::OK,
+                body_bytes: 5,
+                complete: false,
+                body_failed: true,
                 upstream: true,
             }]
         );
@@ -485,6 +537,7 @@ mod tests {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
                 body_bytes: 0,
                 complete: false,
+                body_failed: false,
                 upstream: false,
             }]
         );

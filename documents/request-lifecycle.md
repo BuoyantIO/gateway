@@ -461,16 +461,18 @@ Every request ends exactly once, and instances that declared
 `ResponseMode::End` or `Tap` are told how: `on_response_end` receives
 `ResponseEnd` — the status the client got, the response body bytes
 delivered, `complete`, true only if the response body ran to its
-end, and `upstream`, true only if the status came from an upstream
-response rather than being synthesized here.
+end, `body_failed`, true only if the body itself errored mid-stream
+(which tells that ending apart from a client walking away), and
+`upstream`, true only if the status came from an upstream response
+rather than being synthesized here.
 
 The hook fires in one of two ways:
 
 - **The request produced a response.** The hook fires when the
   response body finishes: at end of stream (`complete: true`), on a
-  body error (`complete: false`), or from `Drop` when the client
-  disconnects mid-stream (`complete: false`). `Drop` is why the hook
-  is sync.
+  body error (`complete: false`, `body_failed: true`), or from `Drop`
+  when the client disconnects mid-stream (`complete: false`,
+  `body_failed: false`). `Drop` is why the hook is sync.
 - **The request was answered without an upstream response** — a
   filter responded, a body limit hit, selection failed. The hook
   fires at that point, with the synthesized status, zero body bytes,
@@ -497,7 +499,8 @@ The endings, grouped by phase:
 | instantiation failed | 500 | `internal` |
 
 **Answered without an upstream response** — `on_response_end` fires
-immediately: zero body bytes, `complete: false`, `upstream: false`.
+immediately: zero body bytes, `complete: false`, `body_failed: false`,
+`upstream: false`.
 
 | ending | status | reason |
 |---|---|---|
@@ -511,13 +514,13 @@ immediately: zero body bytes, `complete: false`, `upstream: false`.
 
 **Dispatched** — `on_response_end` fires when the response body finishes.
 
-| ending | status | reason | `complete` | `upstream` |
-|---|---|---|---|---|
-| dial failed | 502 | `dial_failure` | true — the 502 ran to its end | false — no upstream answered |
-| the backend's TLS block does not compile | 500 | `backend_unresolved` | true — the 500 ran to its end | false — nothing was dialed |
-| response delivered | upstream's status | `ok` | true | true |
-| client disconnected mid-response | as sent | `ok` | false | true |
-| upstream body failed mid-response | as sent | `ok` | false | true |
+| ending | status | reason | `complete` | `body_failed` | `upstream` |
+|---|---|---|---|---|---|
+| dial failed | 502 | `dial_failure` | true — the 502 ran to its end | false | false — no upstream answered |
+| the backend's TLS block does not compile | 500 | `backend_unresolved` | true — the 500 ran to its end | false | false — nothing was dialed |
+| response delivered | upstream's status | `ok` | true | false | true |
+| client disconnected mid-response | as sent | `ok` | false | false | true |
+| upstream body failed mid-response | as sent | `ok` | false | true | true |
 
 One metric reason per request, on every row.
 

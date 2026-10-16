@@ -21,9 +21,10 @@ Per-request flow:
                       quality.
 3. PullBody()         stream the body back out. It may have been modified, but
                       is always complete.
-4. ReportFirstToken() at the first response byte, with observed TTFT.
+4. ReportFirstToken() at the first token, with observed TTFT. (See
+                      ReportFirstTokenRequest below for details.)
 5. ReportFinalToken() after the response completes, with the served model, token
-                      counts, and inter-token latency.
+                      counts, inter-token latency, and status.
 6. Abort()            if the request dies after Pick() and will never dispatch.
 
 Body streaming has no sequence numbers, offsets, or resumption: ordering and
@@ -117,6 +118,13 @@ message PickRequest {
   QosClass qos_class = 4;
 
   string tenant = 5;
+
+  enum Mode {
+    OPENAI_CHAT_COMPLETIONS = 0; // /v1/chat/completions
+    ANTHROPIC_MESSAGES = 1;      // /v1/messages
+    ANTHROPIC_COUNT_TOKENS = 2;  // /v1/messages/count_tokens
+  }
+  Mode mode = 6;
 }
 
 message PickResponse {
@@ -163,6 +171,13 @@ message ProviderTarget {
   string path = 2;
 }
 
+/*
+TTFT is time to the first token specifically, not response headers or first
+byte, which an engine may send before prefill finishes. In a stream, the first
+token is the first chunk whose delta carries non-empty content, reasoning or a
+tool call (OPENAI_CHAT_COMPLETIONS), or the first `content_block_delta` event
+(ANTHROPIC_MESSAGES).
+*/
 message ReportFirstTokenRequest {
   uint64 response_id = 1;
   uint32 observed_ttft_ms = 2;
@@ -173,6 +188,21 @@ message ReportFirstTokenResponse {
   bool acknowledged = 1;
 }
 
+/*
+Report token counts. For mode = ANTHROPIC_MESSAGES calls, take the last `usage`
+seen (`message_delta`, falling back to `message_start`) and map it as:
+
+- prompt_tokens = input_tokens + cache_read_input_tokens +
+  cache_creation_input_tokens
+- completion_tokens = output_tokens
+- cached_tokens = cache_read_input_tokens
+
+Anthropic's `input_tokens` EXCLUDES cache hits, so reporting it alone as
+prompt_tokens undercounts every prompt by cache-hit volume.
+
+For inter-token gaps, measure between `content_block_delta` events; the other
+event types carry no tokens.
+*/
 message ReportFinalTokenRequest {
   uint64 response_id = 1;
   string model = 2;
@@ -201,6 +231,17 @@ message ReportFinalTokenRequest {
 
   repeated uint32 itl_bucket_counts = 6;
   uint32 itl_bucket_layout = 7;
+
+  // How the response ended. Token counts may be partial for anything but
+  // COMPLETED.
+  enum Completion {
+    COMPLETION_UNSPECIFIED = 0; // a caller that predates the field
+    COMPLETED = 1;              // the upstream finished the response
+    CLIENT_CANCELLED = 2;       // the client went away first
+    UPSTREAM_ERROR = 3;         // the upstream failed mid-response, including an
+                                // Anthropic `error` event in a 200 stream
+  }
+  Completion completion = 8;
 }
 
 message ReportFinalTokenResponse {

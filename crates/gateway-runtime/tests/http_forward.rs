@@ -2194,6 +2194,7 @@ async fn a_response_tap_sees_the_body_and_the_client_still_gets_it() {
             status: StatusCode::OK,
             body_bytes: body.len() as u64,
             complete: true,
+            body_failed: false,
             upstream: true,
         }]
     );
@@ -2245,6 +2246,7 @@ async fn the_terminal_fires_when_the_request_never_reaches_an_upstream() {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 body_bytes: 0,
                 complete: false,
+                body_failed: false,
                 upstream: false,
             }],
             "an instance that reserved on the request must still settle"

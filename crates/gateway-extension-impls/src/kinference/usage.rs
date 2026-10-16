@@ -2,6 +2,11 @@
 //! model from the head, usage from the tail, chunk-arrival gaps
 //! bucketed. Raw scans over capped bytes work for SSE and plain
 //! JSON alike; the body is never retained beyond the caps.
+//!
+//! The scans search for quoted field names, so a needle only matches
+//! a whole key: `"input_tokens"` cannot match inside
+//! `"cache_read_input_tokens"`, whose `input_tokens` follows a `_`
+//! rather than a quote.
 
 use std::time::Instant;
 
@@ -47,6 +52,69 @@ impl Capture {
     /// by providers that serve a prefix from cache; absent otherwise.
     pub(crate) fn cached_tokens(&self) -> Option<u64> {
         extract_usage_uint(&self.tail, "cached_tokens")
+    }
+
+    /// The top-level `usage` of a non-streamed Anthropic Messages
+    /// response, which rides at the end of the document.
+    pub(crate) fn anthropic_usage(&self) -> AnthropicUsage {
+        let mut usage = AnthropicUsage::default();
+        usage.overlay(&self.tail);
+        usage
+    }
+}
+
+/// Token usage as an Anthropic Messages response reports it, each
+/// field `None` until a `usage` object names it.
+///
+/// Anthropic's `input_tokens` excludes the prompt tokens served from
+/// or written to the cache, so the prompt is the sum of all three.
+/// The cache fields are not always present — vLLM emits them only
+/// with `--enable-prompt-tokens-details` — and absent means unknown,
+/// not zero, which is why `cached_tokens` stays `None` without them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnthropicUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_creation: Option<u64>,
+}
+
+impl AnthropicUsage {
+    /// Fold in the last `usage` object in `bytes`. Each field it
+    /// names replaces the one seen before and each it omits keeps it,
+    /// so a stream's `message_delta` overrides its `message_start`
+    /// field by field and falls back to it for anything it leaves
+    /// out.
+    pub(crate) fn overlay(&mut self, bytes: &[u8]) {
+        for (field, slot) in [
+            ("input_tokens", &mut self.input),
+            ("output_tokens", &mut self.output),
+            ("cache_read_input_tokens", &mut self.cache_read),
+            ("cache_creation_input_tokens", &mut self.cache_creation),
+        ] {
+            if let Some(n) = extract_usage_uint(bytes, field) {
+                *slot = Some(n);
+            }
+        }
+    }
+
+    /// Every prompt token, cache hits and cache writes included;
+    /// `None` when no prompt count was seen at all.
+    pub(crate) fn prompt_tokens(&self) -> Option<u64> {
+        let terms = [self.input, self.cache_read, self.cache_creation];
+        if terms.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(terms.into_iter().flatten().fold(0, u64::saturating_add))
+    }
+
+    pub(crate) fn completion_tokens(&self) -> Option<u64> {
+        self.output
+    }
+
+    /// Prompt tokens served from the cache.
+    pub(crate) fn cached_tokens(&self) -> Option<u64> {
+        self.cache_read
     }
 }
 
@@ -121,10 +189,12 @@ const EDGES_MS: [u128; 14] = [5, 10, 15, 20, 30, 40, 50, 75, 100, 150, 200, 300,
 pub(crate) const ITL_LAYOUT: u32 = 1;
 
 /// Response-chunk arrival gaps, bucketed per layout 1 — the
-/// measurable stand-in for inter-token latency. A chunk carries one
-/// token when the upstream flushes per token; under batching it
-/// carries several whose gaps go unseen, so the histogram reports
-/// fewer, larger gaps than the tokens truly had.
+/// measurable stand-in for inter-token latency. Which chunks count is
+/// the caller's: every chunk of a chat-completions response, only the chunks
+/// carrying a `content_block_delta` in an Anthropic stream. A chunk
+/// carries one token when the upstream flushes per token; under
+/// batching it carries several whose gaps go unseen, so the histogram
+/// reports fewer, larger gaps than the tokens truly had.
 #[derive(Default)]
 pub(crate) struct Itl {
     last: Option<Instant>,
@@ -205,6 +275,68 @@ mod tests {
         assert_eq!(c.prompt_tokens(), None);
         assert_eq!(c.completion_tokens(), None);
         assert_eq!(c.cached_tokens(), None);
+    }
+
+    #[test]
+    fn anthropic_usage_maps_cache_hits_into_the_prompt() {
+        let mut c = Capture::default();
+        c.feed(
+            b"{\"type\": \"message\", \"model\": \"claude\", \"content\": [], \"usage\": {\"input_tokens\": 10, \"cache_creation_input_tokens\": 5, \"cache_read_input_tokens\": 30, \"output_tokens\": 42}}",
+        );
+        let usage = c.anthropic_usage();
+        assert_eq!(usage.prompt_tokens(), Some(45));
+        assert_eq!(usage.completion_tokens(), Some(42));
+        assert_eq!(usage.cached_tokens(), Some(30));
+    }
+
+    #[test]
+    fn anthropic_usage_without_cache_fields_leaves_cached_unknown() {
+        let mut c = Capture::default();
+        c.feed(b"{\"usage\": {\"input_tokens\": 10, \"output_tokens\": 42}}");
+        let usage = c.anthropic_usage();
+        assert_eq!(usage.prompt_tokens(), Some(10));
+        assert_eq!(usage.completion_tokens(), Some(42));
+        assert_eq!(usage.cached_tokens(), None, "absent is unknown, not 0");
+    }
+
+    /// `input_tokens` is a suffix of both cache field names; in either
+    /// order, the cache fields must not be read as the input count.
+    #[test]
+    fn anthropic_input_tokens_is_not_shadowed_by_cache_fields() {
+        for doc in [
+            &b"{\"usage\": {\"cache_read_input_tokens\": 30, \"cache_creation_input_tokens\": 5, \"input_tokens\": 10}}"[..],
+            &b"{\"usage\": {\"input_tokens\": 10, \"cache_read_input_tokens\": 30, \"cache_creation_input_tokens\": 5}}"[..],
+        ] {
+            let mut usage = AnthropicUsage::default();
+            usage.overlay(doc);
+            assert_eq!(usage.input, Some(10));
+            assert_eq!(usage.cache_read, Some(30));
+            assert_eq!(usage.cache_creation, Some(5));
+        }
+
+        // With no `input_tokens` at all, neither cache field stands in
+        // for it.
+        let mut usage = AnthropicUsage::default();
+        usage.overlay(b"{\"usage\": {\"cache_read_input_tokens\": 30}}");
+        assert_eq!(usage.input, None);
+    }
+
+    #[test]
+    fn anthropic_overlay_keeps_what_a_later_usage_omits() {
+        let mut usage = AnthropicUsage::default();
+        usage.overlay(b"{\"usage\": {\"input_tokens\": 10, \"cache_read_input_tokens\": 30, \"output_tokens\": 1}}");
+        usage.overlay(b"{\"usage\": {\"output_tokens\": 42, \"cache_read_input_tokens\": null}}");
+        assert_eq!(usage.prompt_tokens(), Some(40));
+        assert_eq!(usage.completion_tokens(), Some(42));
+        assert_eq!(usage.cached_tokens(), Some(30));
+    }
+
+    #[test]
+    fn anthropic_usage_absent_is_none() {
+        let usage = AnthropicUsage::default();
+        assert_eq!(usage.prompt_tokens(), None);
+        assert_eq!(usage.completion_tokens(), None);
+        assert_eq!(usage.cached_tokens(), None);
     }
 
     #[test]

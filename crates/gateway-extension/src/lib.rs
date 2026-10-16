@@ -306,6 +306,11 @@ pub struct ResponseEnd {
     /// that disconnected mid-stream, a failed body, and a request
     /// answered before any upstream response existed.
     pub complete: bool,
+    /// Whether the response body itself failed mid-stream, as opposed
+    /// to the client going away. Only ever set beside
+    /// `complete: false`; with it clear, an incomplete response that
+    /// came from an upstream is one the client walked away from.
+    pub body_failed: bool,
     /// Whether the status came from an upstream response. `false`
     /// covers a filter answering, a body limit, a failed selection,
     /// and a failed dial — endings where no upstream response

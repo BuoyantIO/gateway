@@ -8,12 +8,22 @@
 //! operation somewhere else. The rewrite happens here, on the head
 //! `select` is handed: to the host this selector is a black box that
 //! changed the request, like any other extension that does.
+//!
+//! The request path decides the request's mode — chat completions,
+//! Anthropic Messages, or Anthropic's token count — and this is the
+//! one place it is decided: the picker never sees the path and does
+//! not guess from the body. The mode travels with the Pick and stays
+//! with the request, deciding how the response is read for the token
+//! reports (see `response`). A token count runs no inference, so it
+//! is never reported on.
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
     tonic::include_proto!("kinference.v1");
 }
 
+mod response;
+mod sse;
 mod usage;
 
 use std::net::SocketAddr;
@@ -37,7 +47,9 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
+use proto::pick_request::Mode;
 use proto::picker_client::PickerClient;
+use proto::report_final_token_request::Completion;
 use proto::{
     AbortRequest, BodyChunk, InferencePoolRef, PickRequest, PullBodyRequest, PushBodyResponse,
     ReportFinalTokenRequest, ReportFirstTokenRequest,
@@ -195,13 +207,12 @@ impl ExtensionBuilder for KinferenceSelectorBuilder {
             push: None,
             tenant: String::new(),
             client_request_id: String::new(),
+            mode: Mode::OpenaiChatCompletions,
             response_id: 0,
             dispatched_at: None,
             upstream_status: 0,
-            ttft_reported: false,
             provider: false,
-            itl: usage::Itl::default(),
-            capture: usage::Capture::default(),
+            response: response::Observer::new(Mode::OpenaiChatCompletions),
         })
     }
 }
@@ -219,18 +230,19 @@ struct KinferenceSelector {
     push: Option<Push>,
     tenant: String,
     client_request_id: String,
+    /// Decided from the request path at request start.
+    mode: Mode,
     /// 0 until a Pick succeeds — the picker never assigns 0.
     response_id: u64,
     dispatched_at: Option<Instant>,
     upstream_status: i32,
-    ttft_reported: bool,
     /// Whether the pick chose a provider backend. A provider is the
     /// picker's blind spot — it cannot see one fail — so a
     /// synthesized 5xx ending aborts as `BACKEND_UNRESOLVED` rather
     /// than `NOT_DISPATCHED`.
     provider: bool,
-    itl: usage::Itl,
-    capture: usage::Capture,
+    /// Built for `mode` at request start.
+    response: response::Observer,
 }
 
 #[async_trait]
@@ -253,6 +265,10 @@ impl Extension for KinferenceSelector {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .clone_into(&mut self.client_request_id);
+        // The path the route matched, before `select` can rewrite the
+        // request line for a provider.
+        self.mode = mode_for(head.uri.path());
+        self.response = response::Observer::new(self.mode);
 
         let (tx, rx) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
         let mut request = tonic::Request::new(ReceiverStream::new(rx));
@@ -274,6 +290,7 @@ impl Extension for KinferenceSelector {
         tracing::debug!(target: LOG,
             request_id = %self.client_request_id,
             tenant = %self.tenant,
+            mode = ?self.mode,
             "kinference: opening PushBody"
         );
         let mut client = self.client.clone();
@@ -349,6 +366,7 @@ impl Extension for KinferenceSelector {
             inference_pool: pool_from_targets(cx),
             qos_class: self.prepared.qos,
             tenant: self.tenant.clone(),
+            mode: self.mode as i32,
         });
         let pick = tokio::time::timeout(self.prepared.rpc_timeout, pick)
             .await
@@ -421,15 +439,15 @@ impl Extension for KinferenceSelector {
 
     fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
         self.upstream_status = i32::from(head.status.as_u16());
+        self.response.start(&head.headers);
     }
 
     fn on_response_body(&mut self, chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {
-        if self.response_id == 0 || chunk.is_empty() {
+        if self.response_id == 0 || chunk.is_empty() || self.mode == Mode::AnthropicCountTokens {
             return;
         }
         let now = Instant::now();
-        if !self.ttft_reported {
-            self.ttft_reported = true;
+        if self.response.feed(&chunk, now) {
             let ttft_ms = self
                 .dispatched_at
                 .map(|t| u32::try_from(now.duration_since(t).as_millis()).unwrap_or(u32::MAX))
@@ -438,7 +456,7 @@ impl Extension for KinferenceSelector {
                 response_id = self.response_id,
                 ttft_ms,
                 status = self.upstream_status,
-                "kinference: first response chunk"
+                "kinference: first token"
             );
             self.reporter.send(Report::First(ReportFirstTokenRequest {
                 response_id: self.response_id,
@@ -446,8 +464,6 @@ impl Extension for KinferenceSelector {
                 upstream_status: self.upstream_status,
             }));
         }
-        self.itl.record(now);
-        self.capture.feed(&chunk);
     }
 
     fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
@@ -456,40 +472,41 @@ impl Extension for KinferenceSelector {
         }
         let response_id = std::mem::take(&mut self.response_id);
         if end.upstream {
-            let prompt = self.capture.prompt_tokens();
-            let completion = self.capture.completion_tokens();
-            let counts = self.itl.counts();
-            // Nothing measured, nothing to report.
-            if prompt.is_none() && completion.is_none() && counts.is_empty() {
+            if self.mode == Mode::AnthropicCountTokens {
                 tracing::debug!(target: LOG,
                     response_id,
-                    "kinference: no usage and no arrival gaps; skipping ReportFinalToken"
+                    "kinference: count_tokens ran no inference; no token reports"
                 );
                 return;
             }
-            let cached = self.capture.cached_tokens();
-            let model = self.capture.model();
+            // Sent with whatever was measured, even nothing: how the
+            // response ended is news on its own.
+            let completion = completion(end, self.response.saw_error_event());
+            let seen = self.response.usage();
+            let counts = self.response.itl_counts();
             tracing::debug!(target: LOG,
                 response_id,
-                %model,
-                prompt_tokens = prompt.unwrap_or(0),
-                completion_tokens = completion.unwrap_or(0),
-                cached_tokens = cached.unwrap_or(0),
+                model = %seen.model,
+                ?completion,
+                prompt_tokens = seen.prompt.unwrap_or(0),
+                completion_tokens = seen.completion.unwrap_or(0),
+                cached_tokens = seen.cached.unwrap_or(0),
                 itl_samples = counts.iter().sum::<u32>(),
                 "kinference: reporting final token"
             );
             self.reporter.send(Report::Final(ReportFinalTokenRequest {
                 response_id,
-                model,
-                prompt_tokens: clamp_u32(prompt.unwrap_or(0)),
-                completion_tokens: clamp_u32(completion.unwrap_or(0)),
-                cached_tokens: cached.map(clamp_u32),
+                model: seen.model,
+                prompt_tokens: clamp_u32(seen.prompt.unwrap_or(0)),
+                completion_tokens: clamp_u32(seen.completion.unwrap_or(0)),
+                cached_tokens: seen.cached.map(clamp_u32),
                 itl_bucket_layout: if counts.is_empty() {
                     0
                 } else {
                     usage::ITL_LAYOUT
                 },
                 itl_bucket_counts: counts,
+                completion: completion as i32,
             }));
         } else {
             use proto::abort_request::Reason;
@@ -527,6 +544,33 @@ impl Drop for KinferenceSelector {
         if let Some(push) = self.push.take() {
             push.task.abort();
         }
+    }
+}
+
+/// The request's mode, from its path alone. Anything that is not an
+/// Anthropic Messages path is what every path was before modes
+/// existed.
+fn mode_for(path: &str) -> Mode {
+    match path {
+        "/v1/messages" => Mode::AnthropicMessages,
+        "/v1/messages/count_tokens" => Mode::AnthropicCountTokens,
+        _ => Mode::OpenaiChatCompletions,
+    }
+}
+
+/// How a response that reached an upstream ended. An upstream that
+/// answered non-2xx, or reported an error inside a 200 stream, failed
+/// however far its body got; otherwise the body's own ending decides
+/// between a finished response, a failed one, and a client that left.
+fn completion(end: &ResponseEnd, error_event: bool) -> Completion {
+    if !end.status.is_success() || error_event {
+        Completion::UpstreamError
+    } else if end.complete {
+        Completion::Completed
+    } else if end.body_failed {
+        Completion::UpstreamError
+    } else {
+        Completion::ClientCancelled
     }
 }
 
@@ -793,13 +837,12 @@ qos: Batch
             push,
             tenant: String::new(),
             client_request_id: String::new(),
+            mode: Mode::OpenaiChatCompletions,
             response_id: 0,
             dispatched_at: None,
             upstream_status: 0,
-            ttft_reported: false,
             provider: false,
-            itl: usage::Itl::default(),
-            capture: usage::Capture::default(),
+            response: response::Observer::new(Mode::OpenaiChatCompletions),
         }
     }
 
@@ -972,6 +1015,7 @@ qos: Batch
             status,
             body_bytes: 0,
             complete: false,
+            body_failed: false,
             upstream,
         }
     }
@@ -1225,8 +1269,20 @@ qos: Batch
         http::request::Parts,
         Result<Selected, Error>,
     ) {
+        run_select_on(service, request_parts(), cx).await
+    }
+
+    /// [`run_select`] for a request the test built.
+    async fn run_select_on(
+        service: &str,
+        mut parts: http::request::Parts,
+        cx: &mut Cx,
+    ) -> (
+        KinferenceSelector,
+        http::request::Parts,
+        Result<Selected, Error>,
+    ) {
         let mut ext = selector_for(service, None);
-        let mut parts = request_parts();
         ext.on_request_start(&mut parts, cx).await.unwrap();
         ext.on_request_body(Bytes::from_static(b"prompt"), true, cx)
             .await
@@ -1291,6 +1347,7 @@ qos: Batch
 
         // The pool the route named travelled with the Pick.
         let asked = picks.try_recv().expect("the picker was asked to pick");
+        assert_eq!(asked.mode, Mode::OpenaiChatCompletions as i32);
         let pool = asked.inference_pool.expect("a pool was named");
         assert_eq!(pool.namespace, "inference");
         assert_eq!(pool.name, "chat-pool");
@@ -1389,5 +1446,265 @@ qos: Batch
         // No dispatch was counted, so the terminal settles nothing.
         ext.on_response_end(&ended(StatusCode::SERVICE_UNAVAILABLE, false), &mut cx);
         assert!(aborts.try_recv().is_err(), "nothing to abort");
+    }
+
+    // ---- the mode, and what it changes about the reports ----
+
+    #[test]
+    fn the_path_decides_the_mode() {
+        for (path, mode) in [
+            ("/v1/chat/completions", Mode::OpenaiChatCompletions),
+            ("/v1/messages", Mode::AnthropicMessages),
+            ("/v1/messages/count_tokens", Mode::AnthropicCountTokens),
+            // Whatever was routed here before modes existed keeps
+            // being treated as it was.
+            ("/v1/completions", Mode::OpenaiChatCompletions),
+            ("/v1/messages/batches", Mode::OpenaiChatCompletions),
+        ] {
+            assert_eq!(mode_for(path), mode, "{path}");
+        }
+    }
+
+    /// The mode crosses the wire on the Pick, and an endpoint pick
+    /// leaves the client's request line and headers alone: the query
+    /// and the `anthropic-*` headers reach the upstream as sent.
+    #[tokio::test]
+    async fn an_anthropic_request_picks_in_its_mode_and_keeps_its_query() {
+        let destination = proto::pick_response::Destination::Local(proto::LocalTarget {
+            endpoint: "10.0.0.9:8080".into(),
+        });
+        let (service, _aborts, mut picks) = spawn_picker(ok_pick(destination, 0), vec![]).await;
+
+        let mut cx = Cx::new();
+        cx.set_targets(endpoint_targets(
+            "workers",
+            "10.0.0.9".parse().unwrap(),
+            8080,
+            None,
+        ));
+        let parts = http::Request::builder()
+            .uri("/v1/messages?beta=true")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (ext, parts, selected) = run_select_on(&service, parts, &mut cx).await;
+        dispatched(selected);
+
+        let asked = picks.try_recv().expect("the picker was asked to pick");
+        assert_eq!(asked.mode, Mode::AnthropicMessages as i32);
+        assert_eq!(ext.mode, Mode::AnthropicMessages);
+        assert_eq!(parts.uri, "/v1/messages?beta=true");
+        assert_eq!(parts.headers["anthropic-version"], "2023-06-01");
+        assert_eq!(parts.headers["anthropic-beta"], "prompt-caching-2024-07-31");
+    }
+
+    /// A selector past a successful pick, in `mode`, reporting into
+    /// the queue the test holds.
+    fn dispatched_in(mode: Mode) -> (KinferenceSelector, mpsc::Receiver<Report>) {
+        let (reporter, rx) = capturing_reporter();
+        let mut ext = selector_for("127.0.0.1:1", None);
+        ext.reporter = reporter;
+        ext.mode = mode;
+        ext.response = response::Observer::new(mode);
+        ext.response_id = 7;
+        ext.dispatched_at = Some(Instant::now());
+        (ext, rx)
+    }
+
+    /// Play a response head with `content_type`.
+    fn respond(ext: &mut KinferenceSelector, status: StatusCode, content_type: &str) {
+        let mut head = http::Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        ext.on_response_start(&mut head, &mut Cx::new());
+    }
+
+    fn chunk(ext: &mut KinferenceSelector, bytes: &'static [u8]) {
+        ext.on_response_body(Bytes::from_static(bytes), false, &mut Cx::new());
+    }
+
+    fn upstream_end(status: StatusCode, complete: bool, body_failed: bool) -> ResponseEnd {
+        ResponseEnd {
+            status,
+            body_bytes: 0,
+            complete,
+            body_failed,
+            upstream: true,
+        }
+    }
+
+    fn final_report(rx: &mut mpsc::Receiver<Report>) -> ReportFinalTokenRequest {
+        match rx.try_recv() {
+            Ok(Report::Final(report)) => report,
+            Ok(Report::First(_)) => panic!("expected a final report, got a first-token report"),
+            Ok(Report::Abort(_)) => panic!("expected a final report, got an abort"),
+            Err(e) => panic!("expected a final report: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn count_tokens_sends_no_token_reports() {
+        let (mut ext, mut rx) = dispatched_in(Mode::AnthropicCountTokens);
+        respond(&mut ext, StatusCode::OK, "application/json");
+        chunk(&mut ext, b"{\"input_tokens\": 12}");
+        ext.on_response_end(&upstream_end(StatusCode::OK, true, false), &mut Cx::new());
+        assert!(rx.try_recv().is_err(), "a token count is never reported on");
+    }
+
+    /// TTFT is the first token's, not the first byte's: the role-only
+    /// opener an engine flushes before prefill finishes is not it.
+    #[tokio::test]
+    async fn an_openai_stream_reports_its_first_token_not_its_first_byte() {
+        let (mut ext, mut rx) = dispatched_in(Mode::OpenaiChatCompletions);
+        respond(&mut ext, StatusCode::OK, "text/event-stream");
+        chunk(
+            &mut ext,
+            b"data: {\"model\":\"llama\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        );
+        assert!(rx.try_recv().is_err(), "no token yet");
+        chunk(
+            &mut ext,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        );
+        let Ok(Report::First(first)) = rx.try_recv() else {
+            panic!("the content chunk is the first token");
+        };
+        assert_eq!(first.response_id, 7);
+        assert_eq!(first.upstream_status, 200);
+        chunk(
+            &mut ext,
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
+        );
+        assert!(rx.try_recv().is_err(), "one first-token report per request");
+
+        ext.on_response_end(&upstream_end(StatusCode::OK, true, false), &mut Cx::new());
+        let report = final_report(&mut rx);
+        assert_eq!(report.model, "llama");
+        assert_eq!(report.prompt_tokens, 7);
+        assert_eq!(report.completion_tokens, 2);
+        assert_eq!(report.cached_tokens, None);
+        // Three chunks, two gaps: OpenAI still counts every chunk.
+        assert_eq!(report.itl_bucket_counts.iter().sum::<u32>(), 2);
+        assert_eq!(report.itl_bucket_layout, usage::ITL_LAYOUT);
+        assert_eq!(report.completion, Completion::Completed as i32);
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_stream_reports_at_its_first_delta_with_mapped_usage() {
+        let (mut ext, mut rx) = dispatched_in(Mode::AnthropicMessages);
+        respond(&mut ext, StatusCode::OK, "text/event-stream");
+        chunk(
+            &mut ext,
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":30,\"output_tokens\":1}}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\n",
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "message_start and ping carry no token"
+        );
+        chunk(
+            &mut ext,
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+        );
+        assert!(matches!(rx.try_recv(), Ok(Report::First(_))));
+        chunk(
+            &mut ext,
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        ext.on_response_end(&upstream_end(StatusCode::OK, true, false), &mut Cx::new());
+        let report = final_report(&mut rx);
+        assert_eq!(report.model, "claude");
+        assert_eq!(report.prompt_tokens, 45);
+        assert_eq!(report.completion_tokens, 42);
+        assert_eq!(report.cached_tokens, Some(30));
+        assert!(report.itl_bucket_counts.is_empty(), "one delta, no gap");
+        assert_eq!(report.itl_bucket_layout, 0);
+        assert_eq!(report.completion, Completion::Completed as i32);
+    }
+
+    /// An Anthropic `error` event arrives inside a 200 stream; the
+    /// response still ends cleanly, and still failed.
+    #[tokio::test]
+    async fn an_error_event_in_a_200_stream_is_an_upstream_error() {
+        let (mut ext, mut rx) = dispatched_in(Mode::AnthropicMessages);
+        respond(&mut ext, StatusCode::OK, "text/event-stream");
+        chunk(
+            &mut ext,
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        ext.on_response_end(&upstream_end(StatusCode::OK, true, false), &mut Cx::new());
+        let report = final_report(&mut rx);
+        assert_eq!(report.completion, Completion::UpstreamError as i32);
+    }
+
+    /// The final report goes even with nothing measured, carrying how
+    /// the response ended: here, a client that left before a byte.
+    #[tokio::test]
+    async fn a_final_report_goes_even_when_nothing_was_measured() {
+        let (mut ext, mut rx) = dispatched_in(Mode::OpenaiChatCompletions);
+        respond(&mut ext, StatusCode::OK, "text/event-stream");
+        ext.on_response_end(&upstream_end(StatusCode::OK, false, false), &mut Cx::new());
+        let report = final_report(&mut rx);
+        assert_eq!(report.response_id, 7);
+        assert_eq!(report.prompt_tokens, 0);
+        assert_eq!(report.completion_tokens, 0);
+        assert_eq!(report.cached_tokens, None);
+        assert!(report.itl_bucket_counts.is_empty());
+        assert_eq!(report.itl_bucket_layout, 0);
+        assert_eq!(report.completion, Completion::ClientCancelled as i32);
+    }
+
+    #[test]
+    fn completion_follows_how_the_response_ended() {
+        let ok = StatusCode::OK;
+        for (end, error_event, want) in [
+            (upstream_end(ok, true, false), false, Completion::Completed),
+            (
+                upstream_end(ok, false, false),
+                false,
+                Completion::ClientCancelled,
+            ),
+            (
+                upstream_end(ok, false, true),
+                false,
+                Completion::UpstreamError,
+            ),
+            (
+                upstream_end(ok, true, false),
+                true,
+                Completion::UpstreamError,
+            ),
+            // An error event before the client left is still the
+            // upstream's failure.
+            (
+                upstream_end(ok, false, false),
+                true,
+                Completion::UpstreamError,
+            ),
+            // A non-2xx answer failed however far its body got.
+            (
+                upstream_end(StatusCode::SERVICE_UNAVAILABLE, true, false),
+                false,
+                Completion::UpstreamError,
+            ),
+            (
+                upstream_end(StatusCode::BAD_REQUEST, false, false),
+                false,
+                Completion::UpstreamError,
+            ),
+        ] {
+            assert_eq!(
+                completion(&end, error_event),
+                want,
+                "{end:?}, {error_event}"
+            );
+        }
     }
 }
