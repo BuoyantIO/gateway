@@ -3,6 +3,7 @@
 //! construction, so the hooks are infallible.
 
 pub mod debug_log;
+pub mod jwt_auth;
 pub mod kinference;
 
 use std::sync::Arc;

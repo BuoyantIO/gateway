@@ -16,6 +16,16 @@
 //! with the request, deciding how the response is read for the token
 //! reports (see `response`). A token count runs no inference, so it
 //! is never reported on.
+//!
+//! The selector arrives on a rule ahead of the rule's own filters (a
+//! `BackendBinding` prepends it), so its request-start hook runs
+//! before theirs. Nothing reaches the picker until the body does: the
+//! `PushBody` call opens with the first body chunk, after every
+//! request-start hook has run, so a request an authenticating filter
+//! rejects never touches the picker. The tenant is read in `select`
+//! for the same reason: an [`Identity`] an authenticating filter
+//! established wins, and the configured tenant header is the fallback
+//! for routes with none.
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
@@ -34,8 +44,8 @@ use bytes::Bytes;
 use gateway_config::extension::{ConfigValue, from_value};
 use gateway_extension::{
     BodyMode, BodySource, Cx, Declarations, Error, Extension, ExtensionBuilder, ExtensionClass,
-    Held, LocalResponse, ResponseEnd, ResponseMode, Selected, Selection, Target, TargetBackend,
-    async_trait,
+    Held, Identity, LocalResponse, ResponseEnd, ResponseMode, Selected, Selection, Target,
+    TargetBackend, async_trait,
 };
 use http::uri::PathAndQuery;
 use http::{HeaderMap, StatusCode, Uri};
@@ -205,8 +215,8 @@ impl ExtensionBuilder for KinferenceSelectorBuilder {
             reporter: self.reporter.clone(),
             prepared: Arc::clone(&self.prepared),
             push: None,
-            tenant: String::new(),
             client_request_id: String::new(),
+            declared_length: None,
             mode: Mode::OpenaiChatCompletions,
             response_id: 0,
             dispatched_at: None,
@@ -227,9 +237,11 @@ struct KinferenceSelector {
     client: PickerClient<Channel>,
     reporter: Reporter,
     prepared: Arc<Prepared>,
+    /// Opened by the first body chunk.
     push: Option<Push>,
-    tenant: String,
     client_request_id: String,
+    /// The client's `Content-Length`, for the `PushBody` metadata.
+    declared_length: Option<String>,
     /// Decided from the request path at request start.
     mode: Mode,
     /// 0 until a Pick succeeds — the picker never assigns 0.
@@ -252,55 +264,20 @@ impl Extension for KinferenceSelector {
         head: &mut http::request::Parts,
         _cx: &mut Cx,
     ) -> Result<gateway_extension::Action, Error> {
-        self.prepared
-            .tenant_header
-            .clone()
-            .as_ref()
-            .and_then(|h| head.headers.get(h))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .clone_into(&mut self.tenant);
         head.headers
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .clone_into(&mut self.client_request_id);
+        self.declared_length = head
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         // The path the route matched, before `select` can rewrite the
         // request line for a provider.
         self.mode = mode_for(head.uri.path());
         self.response = response::Observer::new(self.mode);
-
-        let (tx, rx) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
-        let mut request = tonic::Request::new(ReceiverStream::new(rx));
-        if let Ok(id) = tonic::metadata::MetadataValue::try_from(&self.client_request_id) {
-            request
-                .metadata_mut()
-                .insert("kinference-client-request-id", id);
-        }
-        if let Some(len) = head
-            .headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| tonic::metadata::MetadataValue::try_from(v).ok())
-        {
-            request
-                .metadata_mut()
-                .insert("kinference-declared-length", len);
-        }
-        tracing::debug!(target: LOG,
-            request_id = %self.client_request_id,
-            tenant = %self.tenant,
-            mode = ?self.mode,
-            "kinference: opening PushBody"
-        );
-        let mut client = self.client.clone();
-        let task = tokio::spawn(async move {
-            client
-                .push_body(request)
-                .await
-                .map(tonic::Response::into_inner)
-        });
-        self.push = Some(Push { tx, task });
         Ok(gateway_extension::Action::Continue)
     }
 
@@ -310,9 +287,14 @@ impl Extension for KinferenceSelector {
         _end_of_stream: bool,
         _cx: &mut Cx,
     ) -> Result<gateway_extension::Action, Error> {
-        let Some(push) = self.push.as_ref() else {
-            return Err("request body before request start".into());
-        };
+        let push = self.push.get_or_insert_with(|| {
+            open_push(
+                &self.client,
+                &self.client_request_id,
+                self.declared_length.as_deref(),
+                self.mode,
+            )
+        });
         let mut rest = chunk;
         while !rest.is_empty() {
             let piece = rest.split_to(rest.len().min(MAX_CHUNK_BYTES));
@@ -359,13 +341,20 @@ impl Extension for KinferenceSelector {
             "kinference: body pushed"
         );
 
+        let tenant = tenant_for(head, self.prepared.tenant_header.as_ref());
+        tracing::debug!(target: LOG,
+            request_id = %self.client_request_id,
+            %tenant,
+            mode = ?self.mode,
+            "kinference: picking"
+        );
         let mut client = self.client.clone();
         let pick = client.pick(PickRequest {
             body_stream_id: pushed.stream_id,
             client_request_id: self.client_request_id.clone(),
             inference_pool: pool_from_targets(cx),
             qos_class: self.prepared.qos,
-            tenant: self.tenant.clone(),
+            tenant,
             mode: self.mode as i32,
         });
         let pick = tokio::time::timeout(self.prepared.rpc_timeout, pick)
@@ -545,6 +534,57 @@ impl Drop for KinferenceSelector {
             push.task.abort();
         }
     }
+}
+
+/// Open the `PushBody` call the body streams into. The call runs on
+/// its own task; the half-close in `select` is what completes it.
+fn open_push(
+    client: &PickerClient<Channel>,
+    client_request_id: &str,
+    declared_length: Option<&str>,
+    mode: Mode,
+) -> Push {
+    let (tx, rx) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
+    let mut request = tonic::Request::new(ReceiverStream::new(rx));
+    if let Ok(id) = tonic::metadata::MetadataValue::try_from(client_request_id) {
+        request
+            .metadata_mut()
+            .insert("kinference-client-request-id", id);
+    }
+    if let Some(len) =
+        declared_length.and_then(|v| tonic::metadata::MetadataValue::try_from(v).ok())
+    {
+        request
+            .metadata_mut()
+            .insert("kinference-declared-length", len);
+    }
+    tracing::debug!(target: LOG,
+        request_id = %client_request_id,
+        ?mode,
+        "kinference: opening PushBody"
+    );
+    let mut client = client.clone();
+    let task = tokio::spawn(async move {
+        client
+            .push_body(request)
+            .await
+            .map(tonic::Response::into_inner)
+    });
+    Push { tx, task }
+}
+
+/// The tenant to pick for: the identity an authenticating extension
+/// established, else the configured tenant header, else `""`, which the
+/// picker reads as "no tenant could be determined".
+fn tenant_for(head: &http::request::Parts, tenant_header: Option<&http::HeaderName>) -> String {
+    if let Some(identity) = head.extensions.get::<Identity>() {
+        return identity.tenant.clone();
+    }
+    tenant_header
+        .and_then(|h| head.headers.get(h))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The request's mode, from its path alone. Anything that is not an
@@ -835,8 +875,8 @@ qos: Batch
                 body_send_timeout: TEST_TIMEOUT,
             }),
             push,
-            tenant: String::new(),
             client_request_id: String::new(),
+            declared_length: None,
             mode: Mode::OpenaiChatCompletions,
             response_id: 0,
             dispatched_at: None,
@@ -862,6 +902,9 @@ qos: Batch
         let mut cx = Cx::new();
         let mut parts = request_parts();
         ext.on_request_start(&mut parts, &mut cx).await.unwrap();
+        ext.on_request_body(Bytes::new(), true, &mut cx)
+            .await
+            .unwrap();
 
         let selected = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1706,5 +1749,77 @@ qos: Batch
                 "{end:?}, {error_event}"
             );
         }
+    }
+
+    // ---- authentication: nothing before the body, identity at the pick ----
+
+    /// A request a later request hook rejects never reaches the
+    /// picker: request start alone opens nothing.
+    #[tokio::test]
+    async fn request_start_opens_no_push_body() {
+        let mut ext = selector_for("127.0.0.1:1", None);
+        let mut parts = request_parts();
+        ext.on_request_start(&mut parts, &mut Cx::new())
+            .await
+            .unwrap();
+        assert!(ext.push.is_none(), "PushBody must wait for the body");
+    }
+
+    #[test]
+    fn the_tenant_prefers_an_established_identity() {
+        let header = http::HeaderName::from_static("x-tenant");
+        let mut parts = http::Request::builder()
+            .uri("/v1/messages")
+            .header("x-tenant", "from-header")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(tenant_for(&parts, Some(&header)), "from-header");
+        assert_eq!(tenant_for(&parts, None), "", "no header configured");
+
+        parts.extensions.insert(Identity {
+            tenant: "alice@example.com".into(),
+            subject: "CiQ".into(),
+        });
+        assert_eq!(
+            tenant_for(&parts, Some(&header)),
+            "alice@example.com",
+            "a verified identity wins over a client-supplied header"
+        );
+    }
+
+    /// The identity an authenticating filter put on the head, after
+    /// the selector's own request-start hook ran, is what the Pick
+    /// carries.
+    #[tokio::test]
+    async fn the_pick_carries_the_identity_as_tenant() {
+        let destination = proto::pick_response::Destination::Local(proto::LocalTarget {
+            endpoint: "10.0.0.9:8080".into(),
+        });
+        let (service, _aborts, mut picks) = spawn_picker(ok_pick(destination, 0), vec![]).await;
+
+        let mut cx = Cx::new();
+        cx.set_targets(endpoint_targets(
+            "workers",
+            "10.0.0.9".parse().unwrap(),
+            8080,
+            None,
+        ));
+        let mut ext = selector_for(&service, None);
+        let mut parts = request_parts();
+        ext.on_request_start(&mut parts, &mut cx).await.unwrap();
+        // The filter behind the selector authenticates the caller.
+        parts.extensions.insert(Identity {
+            tenant: "alice@example.com".into(),
+            subject: "CiQ".into(),
+        });
+        ext.on_request_body(Bytes::from_static(b"prompt"), true, &mut cx)
+            .await
+            .unwrap();
+        dispatched(ext.select(&mut parts, Held::Nothing, &mut cx).await);
+
+        let asked = picks.try_recv().expect("the picker was asked to pick");
+        assert_eq!(asked.tenant, "alice@example.com");
     }
 }

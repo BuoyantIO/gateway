@@ -1,0 +1,60 @@
+# Bearer-token authentication on the inference paths. Callers send a
+# JWT from the issuer (Dex here) as `Authorization: Bearer <jwt>`, or as
+# `X-Api-Key` (what Anthropic's SDKs send). A token that verifies goes
+# on with its header removed, and the kinference selector picks for the
+# token's `email` as the tenant. Anything else is a 401, or a 503 while
+# the issuer's keys have never been fetched.
+#
+# Rejections log on the `extension::jwt_auth` target at info:
+#
+#   kubectl logs deploy/kinference-gw-gatewayd -f | grep extension::jwt_auth
+apiVersion: gateway.linkerd.io/v1alpha1
+kind: Extension
+metadata:
+  name: jwt-auth
+  namespace: default
+spec:
+  class: jwt_auth
+  config:
+    # Must equal the token's `iss` exactly: Dex's public issuer URL,
+    # not the in-cluster address the keys are fetched from.
+    issuer: https://perpetual.buoyant.io/dex
+    # Must be the token's `aud`, or one of them: the Dex client ID
+    # callers get their tokens for.
+    audience: inference-gateway
+    # Where Dex publishes its signing keys. http or https.
+    jwksUrl: http://dex.dex.svc:5556/dex/keys
+    # The claim the tenant is read from; email by default.
+    tenantClaim: email
+    # Refuse tokens whose email_verified is not true.
+    requireEmailVerified: true
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: inference
+  namespace: default
+spec:
+  parentRefs:
+    - name: kinference-gw
+      sectionName: https
+  rules:
+    - matches:
+        - method: POST
+          path: { type: Exact, value: /v1/chat/completions }
+        - method: POST
+          path: { type: Exact, value: /v1/messages }
+        - method: POST
+          path: { type: Exact, value: /v1/messages/count_tokens }
+      filters:
+        # Before any debug_log filter, so the token header is already
+        # gone when that logs the request.
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.linkerd.io
+            kind: Extension
+            name: jwt-auth
+      backendRefs:
+        - group: kinference.buoyant.io
+          kind: InferencePool
+          name: inference-pool

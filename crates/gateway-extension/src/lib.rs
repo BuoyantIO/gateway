@@ -214,6 +214,21 @@ pub enum Action {
     Respond(LocalResponse),
 }
 
+/// The caller's identity, as an authenticating extension established
+/// it. It travels in the request head's `extensions`: the
+/// authenticating hook inserts it, replacing any already there, and
+/// later hooks and the selector read it from the head they are handed.
+/// It is never sent upstream. Absent means no extension on the
+/// request authenticated the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// Who the caller is for policy purposes: the tenant a picker
+    /// schedules and limits by.
+    pub tenant: String,
+    /// The issuer's stable identifier for the caller, for logs.
+    pub subject: String,
+}
+
 /// A response produced by an extension instead of an upstream.
 #[derive(Debug)]
 pub struct LocalResponse {
