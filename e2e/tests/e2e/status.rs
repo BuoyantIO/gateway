@@ -1,6 +1,6 @@
-//! Gateway status writeback, end to end: the exact reads the
-//! benchmark harnesses perform. No traffic is driven — the routing
-//! suite covers data paths; this covers what `kubectl get gtw`
+//! Gateway and `HTTPRoute` status writeback, end to end: the exact
+//! reads the benchmark harnesses perform. No traffic is driven — the
+//! routing suite covers data paths; this covers what `kubectl get`
 //! reports.
 
 use std::time::Duration;
@@ -8,18 +8,25 @@ use std::time::Duration;
 use anyhow::Result;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api::apis::standard::httproutes::{
+    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+};
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
-use gateway_e2e::{Scope, gateway, http_route};
+use gateway_e2e::{Scope, deploy_echo, gateway, http_route};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::ResourceExt;
-use kube::api::{Api, DeleteParams};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 
 const POLL: Duration = Duration::from_millis(250);
 const DEADLINE: Duration = Duration::from_mins(1);
+const CONTROLLER: &str = "gateway.buoyant.io/controller";
+const FOREIGN_CONTROLLER: &str = "example.io/other-controller";
 
-/// Poll until the Gateway's status satisfies `pred`.
-async fn wait_for_status<F>(api: &Api<Gateway>, name: &str, what: &str, pred: F) -> Result<Gateway>
+/// Poll until the object's status satisfies `pred`.
+async fn wait_for_status<K, F>(api: &Api<K>, name: &str, what: &str, pred: F) -> Result<K>
 where
-    F: Fn(&Gateway) -> bool,
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+    F: Fn(&K) -> bool,
 {
     let deadline = std::time::Instant::now() + DEADLINE;
     loop {
@@ -52,6 +59,65 @@ fn condition_true(gw: &Gateway, type_: &str) -> bool {
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .is_some_and(|c| c.iter().any(|c| c.type_ == type_ && c.status == "True"))
+}
+
+/// Our parent entry's condition of `type_`, if written.
+fn route_condition<'a>(hr: &'a HTTPRoute, type_: &str) -> Option<&'a Condition> {
+    hr.status
+        .as_ref()?
+        .parents
+        .iter()
+        .find(|p| p.controller_name == CONTROLLER)?
+        .conditions
+        .iter()
+        .find(|c| c.type_ == type_)
+}
+
+fn route_reason(hr: &HTTPRoute, type_: &str) -> Option<String> {
+    route_condition(hr, type_).map(|c| format!("{}/{}", c.status, c.reason))
+}
+
+/// Set the route's hostnames and wait for our entry to report the
+/// new generation.
+async fn patch_and_wait_for_status(
+    api: &Api<HTTPRoute>,
+    name: &str,
+    hostnames: &[&str],
+) -> Result<HTTPRoute> {
+    let patch = serde_json::json!({ "spec": { "hostnames": hostnames } });
+    let generation = api
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?
+        .metadata
+        .generation;
+    wait_for_status(api, name, &format!("{name} at the new generation"), |hr| {
+        route_condition(hr, "Accepted").is_some_and(|c| c.observed_generation == generation)
+    })
+    .await
+}
+
+/// Add a `status.parents` entry owned by another controller.
+async fn seed_foreign_entry(api: &Api<HTTPRoute>, name: &str) -> Result<()> {
+    let mut route = api.get(name).await?;
+    let condition = Condition {
+        message: "seeded by the test".into(),
+        ..route_condition(&route, "Accepted").unwrap().clone()
+    };
+    route
+        .status
+        .get_or_insert_with(HttpRouteStatus::default)
+        .parents
+        .push(HttpRouteStatusParents {
+            conditions: vec![condition],
+            controller_name: FOREIGN_CONTROLLER.into(),
+            parent_ref: HttpRouteStatusParentsParentRef {
+                name: "their-gw".into(),
+                ..Default::default()
+            },
+        });
+    api.replace_status(name, &PostParams::default(), &route)
+        .await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -130,6 +196,86 @@ async fn gateway_status_reflects_the_world() -> Result<()> {
         after.resource_version(),
         "status writer must not touch an unchanged gateway"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test`"]
+async fn http_route_status_reflects_attachment_and_backends() -> Result<()> {
+    let scope = Scope::new("route-status").await?;
+    let ns = scope.name();
+    let client = scope.client();
+    let route_api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
+
+    apply_gateway(client, &gateway(ns, "gw", 80, Some("a.example"))).await?;
+    deploy_echo(client, ns, "echo", None).await?;
+
+    for route in [
+        http_route(ns, "gw", "served")
+            .path_prefix("/")
+            .backend("echo", 8080)
+            .build(),
+        http_route(ns, "gw", "elsewhere")
+            .hostnames(["b.example"])
+            .path_prefix("/")
+            .backend("echo", 8080)
+            .build(),
+        http_route(ns, "gw", "missing-backend")
+            .path_prefix("/")
+            .backend("gone", 8080)
+            .build(),
+    ] {
+        apply_http_route(client, &route).await?;
+    }
+
+    for (name, accepted, resolved_refs) in [
+        ("served", "True/Accepted", "True/ResolvedRefs"),
+        (
+            "elsewhere",
+            "False/NoMatchingListenerHostname",
+            "True/ResolvedRefs",
+        ),
+        ("missing-backend", "True/Accepted", "False/BackendNotFound"),
+    ] {
+        wait_for_status(&route_api, name, &format!("{name} route status"), |hr| {
+            route_reason(hr, "Accepted").as_deref() == Some(accepted)
+                && route_reason(hr, "ResolvedRefs").as_deref() == Some(resolved_refs)
+        })
+        .await?;
+    }
+
+    // A pass that changes one route does not rewrite the others.
+    let rv = route_api.get("missing-backend").await?.resource_version();
+    patch_and_wait_for_status(&route_api, "elsewhere", &["c.example"]).await?;
+    assert_eq!(
+        rv,
+        route_api.get("missing-backend").await?.resource_version(),
+        "status writer must not touch an unchanged route"
+    );
+
+    // Another controller's entry survives our next write: seed one,
+    // then bump the spec so our entry is rewritten for the new
+    // generation.
+    seed_foreign_entry(&route_api, "served").await?;
+    let served = patch_and_wait_for_status(&route_api, "served", &["a.example"]).await?;
+    let parents = served.status.unwrap().parents;
+    assert!(
+        parents
+            .iter()
+            .any(|p| p.controller_name == FOREIGN_CONTROLLER),
+        "another controller's entry must survive our write: {parents:#?}"
+    );
+
+    // Detaching from our Gateway removes our entry.
+    let patch = serde_json::json!({ "spec": { "parentRefs": [{ "name": "not-ours" }] } });
+    route_api
+        .patch("served", &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    wait_for_status(&route_api, "served", "our entry removed", |hr| {
+        route_condition(hr, "Accepted").is_none()
+    })
+    .await?;
 
     Ok(())
 }
