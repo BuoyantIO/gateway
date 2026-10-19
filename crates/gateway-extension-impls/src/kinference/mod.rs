@@ -26,6 +26,14 @@
 //! for the same reason: an [`Identity`] an authenticating filter
 //! established wins, and the configured tenant header is the fallback
 //! for routes with none.
+//!
+//! The `qos` class is read in `select` too, from the client's own
+//! header (`user-agent` unless `qosHeader` names another): the first
+//! `qosRules` prefix that starts it decides the class, and `qos` is
+//! the class when none does. The header is the client's claim, not a
+//! credential — any caller can say it is `claude-cli` — so a rule is
+//! a scheduling hint, never a privilege; fairness between callers is
+//! the tenant's, which an authenticating filter makes verified.
 
 pub mod proto {
     #![allow(clippy::pedantic, clippy::nursery, clippy::all, missing_docs)]
@@ -122,11 +130,28 @@ struct Config {
     /// Request header carrying the tenant; `""` sent when absent.
     #[serde(default)]
     tenant_header: Option<String>,
+    /// The class a request no rule matches is picked with.
     #[serde(default)]
+    qos: Qos,
+    /// The request header `qos_rules` match; `user-agent` when absent.
+    #[serde(default)]
+    qos_header: Option<String>,
+    /// Tried in order against the client's header; the first match
+    /// decides the class.
+    #[serde(default)]
+    qos_rules: Vec<QosRule>,
+}
+
+/// One `qosRules` entry: a client header starting with `prefix`,
+/// compared case-insensitively, is picked with `qos`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QosRule {
+    prefix: String,
     qos: Qos,
 }
 
-#[derive(Deserialize, Clone, Copy, Default)]
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Qos {
     #[default]
     Interactive,
@@ -144,10 +169,65 @@ impl Qos {
     }
 }
 
+/// How a request's class is decided: the first rule whose prefix
+/// starts the client's header, else the default.
+struct QosPolicy {
+    default: Qos,
+    header: http::HeaderName,
+    /// Prefixes lowercased once here, so a request lowercases nothing.
+    rules: Vec<(Vec<u8>, Qos)>,
+}
+
+impl QosPolicy {
+    fn from_config(cfg: &Config) -> Result<Self, Error> {
+        let header = match cfg.qos_header.as_deref() {
+            None => http::header::USER_AGENT,
+            Some(name) => http::HeaderName::try_from(name)
+                .map_err(|e| format!("`qosHeader` is not a valid header name: {e}"))?,
+        };
+        let rules = cfg
+            .qos_rules
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| {
+                // An empty prefix matches everything, silently
+                // shadowing every rule after it.
+                if rule.prefix.is_empty() {
+                    return Err(format!(
+                        "`qosRules[{i}].prefix` must not be empty; `qos` is the default"
+                    ));
+                }
+                Ok((rule.prefix.to_ascii_lowercase().into_bytes(), rule.qos))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            default: cfg.qos,
+            header,
+            rules,
+        })
+    }
+
+    /// The class to pick `headers`' request with. Bytes, not `str`: a
+    /// header that is not UTF-8 can still match an ASCII prefix.
+    fn for_request(&self, headers: &HeaderMap) -> Qos {
+        let Some(value) = headers.get(&self.header).map(http::HeaderValue::as_bytes) else {
+            return self.default;
+        };
+        self.rules
+            .iter()
+            .find(|(prefix, _)| {
+                value
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            })
+            .map_or(self.default, |&(_, qos)| qos)
+    }
+}
+
 /// Everything `configure` prepared, shared by every instance.
 struct Prepared {
     tenant_header: Option<http::HeaderName>,
-    qos: i32,
+    qos: QosPolicy,
     /// [`RPC_TIMEOUT`] and [`BODY_SEND_TIMEOUT`] in production;
     /// carried as data so tests can shrink them to milliseconds.
     rpc_timeout: Duration,
@@ -169,6 +249,7 @@ impl ExtensionClass for KinferenceSelectorClass {
             .map(http::HeaderName::try_from)
             .transpose()
             .map_err(|e| format!("`tenantHeader` is not a valid header name: {e}"))?;
+        let qos = QosPolicy::from_config(&cfg)?;
         let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", cfg.service))
             .map_err(|e| format!("`service` is not a valid gRPC target: {e}"))?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -179,13 +260,17 @@ impl ExtensionClass for KinferenceSelectorClass {
         // request must reach the same picker instance.
         let client = PickerClient::new(endpoint.connect_lazy());
         let reporter = Reporter::spawn(client.clone());
-        tracing::info!(target: LOG, service = %cfg.service, "kinference selector configured");
+        tracing::info!(target: LOG,
+            service = %cfg.service,
+            qos_rules = qos.rules.len(),
+            "kinference selector configured"
+        );
         Ok(Arc::new(KinferenceSelectorBuilder {
             client,
             reporter,
             prepared: Arc::new(Prepared {
                 tenant_header,
-                qos: cfg.qos.wire(),
+                qos,
                 rpc_timeout: RPC_TIMEOUT,
                 body_send_timeout: BODY_SEND_TIMEOUT,
             }),
@@ -341,9 +426,11 @@ impl Extension for KinferenceSelector {
         );
 
         let tenant = tenant_for(head, self.prepared.tenant_header.as_ref());
+        let qos = self.prepared.qos.for_request(&head.headers);
         tracing::debug!(target: LOG,
             request_id = %self.client_request_id,
             %tenant,
+            ?qos,
             mode = ?self.mode,
             "kinference: picking"
         );
@@ -352,7 +439,7 @@ impl Extension for KinferenceSelector {
             body_stream_id: pushed.stream_id,
             client_request_id: self.client_request_id.clone(),
             inference_pool: pool_from_targets(cx),
-            qos_class: self.prepared.qos,
+            qos_class: qos.wire(),
             tenant,
             mode: self.mode as i32,
         });
@@ -802,11 +889,38 @@ mod tests {
         serde_yaml::from_str(yaml)
     }
 
+    fn qos_policy(yaml: &str) -> QosPolicy {
+        match QosPolicy::from_config(&parse(yaml).expect("config parses")) {
+            Ok(policy) => policy,
+            Err(e) => panic!("policy rejected: {e}"),
+        }
+    }
+
+    fn qos_policy_err(yaml: &str) -> String {
+        match QosPolicy::from_config(&parse(yaml).expect("config parses")) {
+            Ok(_) => panic!("policy accepted"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn headers(pairs: &[(&str, &[u8])]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for &(name, value) in pairs {
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        map
+    }
+
     #[test]
     fn config_defaults() {
         let cfg = parse("service: kinference.default.svc:50051").expect("minimal config");
         assert!(cfg.tenant_header.is_none());
         assert!(matches!(cfg.qos, Qos::Interactive));
+        assert!(cfg.qos_header.is_none());
+        assert!(cfg.qos_rules.is_empty());
     }
 
     #[test]
@@ -816,11 +930,25 @@ mod tests {
 service: kinference.default.svc:50051
 tenantHeader: x-tenant
 qos: Batch
+qosHeader: x-app
+qosRules:
+  - { prefix: cli, qos: Interactive }
+  - { prefix: batch-runner, qos: Deferrable }
 ",
         )
         .expect("full config");
         assert_eq!(cfg.tenant_header.as_deref(), Some("x-tenant"));
         assert!(matches!(cfg.qos, Qos::Batch));
+        assert_eq!(cfg.qos_header.as_deref(), Some("x-app"));
+        let rules: Vec<_> = cfg
+            .qos_rules
+            .iter()
+            .map(|r| (r.prefix.as_str(), r.qos))
+            .collect();
+        assert_eq!(
+            rules,
+            [("cli", Qos::Interactive), ("batch-runner", Qos::Deferrable)]
+        );
     }
 
     #[test]
@@ -828,6 +956,76 @@ qos: Batch
         assert!(parse("service: s\nserivce: typo").is_err());
         // The pool is the route's to name, not the object's.
         assert!(parse("service: s\npool: { namespace: n, name: p }").is_err());
+        assert!(parse("service: s\nqosRules: [{ prefix: a, qos: Batch, header: b }]").is_err());
+        assert!(parse("service: s\nqosRules: [{ prefix: a, qos: Urgent }]").is_err());
+        assert!(parse("service: s\nqosRules: [{ prefix: a }]").is_err());
+    }
+
+    #[test]
+    fn a_qos_policy_rejects_what_could_never_match_as_meant() {
+        let empty = qos_policy_err(
+            "service: s\nqosRules: [{ prefix: a, qos: Batch }, { prefix: '', qos: Batch }]",
+        );
+        assert!(
+            empty.contains("`qosRules[1].prefix` must not be empty"),
+            "{empty}"
+        );
+        let header = qos_policy_err("service: s\nqosHeader: 'user agent'");
+        assert!(
+            header.contains("`qosHeader` is not a valid header name"),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn the_first_matching_prefix_decides_the_class() {
+        // A default no rule names, so a fallthrough can't pass for a
+        // match.
+        let policy = qos_policy(
+            "
+service: s
+qos: Deferrable
+qosRules:
+  - { prefix: claude-cli/, qos: Interactive }
+  - { prefix: curl/, qos: Batch }
+  - { prefix: claude, qos: Batch }
+",
+        );
+        let ua = |value: &[u8]| policy.for_request(&headers(&[("user-agent", value)]));
+        assert_eq!(ua(b"claude-cli/2.0.14 (external, cli)"), Qos::Interactive);
+        assert_eq!(ua(b"curl/8.7.1"), Qos::Batch);
+        assert_eq!(ua(b"CURL/8.7.1"), Qos::Batch, "prefixes ignore ASCII case");
+        assert_eq!(
+            ua(b"Claude-CLI/2.0.14"),
+            Qos::Interactive,
+            "first match wins"
+        );
+        assert_eq!(ua(b"claude-desktop/1.0"), Qos::Batch);
+        assert_eq!(ua(b"python-requests/2.32"), Qos::Deferrable);
+        assert_eq!(ua(b"curl"), Qos::Deferrable, "shorter than the prefix");
+        assert_eq!(ua(b"curl/\xff"), Qos::Batch, "not UTF-8 past the prefix");
+        assert_eq!(policy.for_request(&HeaderMap::new()), Qos::Deferrable);
+    }
+
+    #[test]
+    fn a_qos_header_names_the_header_rules_read() {
+        let policy = qos_policy(
+            "
+service: s
+qos: Batch
+qosHeader: x-app
+qosRules: [{ prefix: cli, qos: Interactive }]
+",
+        );
+        assert_eq!(
+            policy.for_request(&headers(&[("x-app", b"cli"), ("user-agent", b"curl/8")])),
+            Qos::Interactive
+        );
+        assert_eq!(
+            policy.for_request(&headers(&[("user-agent", b"cli")])),
+            Qos::Batch,
+            "user-agent is not read once another header is named"
+        );
     }
 
     #[test]
@@ -869,7 +1067,7 @@ qos: Batch
             reporter: Reporter::spawn(client),
             prepared: Arc::new(Prepared {
                 tenant_header: None,
-                qos: 0,
+                qos: qos_policy(&format!("service: {service}")),
                 rpc_timeout: TEST_TIMEOUT,
                 body_send_timeout: TEST_TIMEOUT,
             }),
@@ -1820,5 +2018,43 @@ qos: Batch
 
         let asked = picks.try_recv().expect("the picker was asked to pick");
         assert_eq!(asked.tenant, "alice@example.com");
+    }
+
+    /// The class the client's header decides is what the Pick carries.
+    #[tokio::test]
+    async fn the_pick_carries_the_clients_qos() {
+        let destination = proto::pick_response::Destination::Local(proto::LocalTarget {
+            endpoint: "10.0.0.9:8080".into(),
+        });
+        let (service, _aborts, mut picks) = spawn_picker(ok_pick(destination, 0), vec![]).await;
+
+        let mut cx = Cx::new();
+        cx.set_targets(endpoint_targets(
+            "workers",
+            "10.0.0.9".parse().unwrap(),
+            8080,
+            None,
+        ));
+        let mut ext = selector_for(&service, None);
+        Arc::get_mut(&mut ext.prepared).unwrap().qos = qos_policy(
+            "
+service: s
+qosRules:
+  - { prefix: claude-cli/, qos: Interactive }
+  - { prefix: curl/, qos: Batch }
+",
+        );
+        let mut parts = request_parts();
+        parts
+            .headers
+            .insert(http::header::USER_AGENT, "curl/8.7.1".parse().unwrap());
+        ext.on_request_start(&mut parts, &mut cx).await.unwrap();
+        ext.on_request_body(Bytes::from_static(b"prompt"), true, &mut cx)
+            .await
+            .unwrap();
+        dispatched(ext.select(&mut parts, Held::Nothing, &mut cx).await);
+
+        let asked = picks.try_recv().expect("the picker was asked to pick");
+        assert_eq!(asked.qos_class, proto::pick_request::QosClass::Batch as i32);
     }
 }

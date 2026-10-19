@@ -192,6 +192,28 @@ curl -sN "http://$GW/v1/chat/completions" \
   -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "max_tokens": 64, "messages": [{"role": "user", "content": "say hi"}]}'
 ```
 
+### QoS by client
+
+Every request is picked with the selector's `qos` (Interactive unless
+set) until `qosRules` says otherwise. Rules match a case-insensitive
+prefix of the client's `User-Agent` (`qosHeader` names another
+header), first match wins:
+
+```bash
+kubectl --context kind-gateway-e2e patch extension chat-picker --type merge -p '
+spec:
+  config:
+    qosRules:
+      - { prefix: claude-cli/, qos: Interactive }
+      - { prefix: curl/, qos: Batch }'
+```
+
+The kinference chart owns `chat-picker`, so its next `helm upgrade`
+puts the chart's config back. With the debug logs above on, the
+`kinference: picking` line shows the class: `qos=Batch` for any of
+the `curl` requests, `qos=Interactive` for the same request sent with
+`-A 'claude-cli/2.0.0 (external, cli)'`.
+
 ## 5. Teardown
 
 ```bash
