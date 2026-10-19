@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn itl_is_empty_under_two_chunks() {
         let mut itl = Itl::default();
-        assert!(itl.counts().is_empty());
+        assert!(itl.counts().is_empty(), "{:?}", itl.counts());
         itl.record(Instant::now());
         assert!(itl.counts().is_empty(), "one arrival leaves no gap");
     }

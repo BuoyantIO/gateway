@@ -2040,7 +2040,11 @@ mod tests {
         // The route ref resolves — the backend is registered — but
         // nothing treats it as an endpoint set.
         let route = &read.bind(&bkey("b")).expect("bind active").listeners[0].routes[0];
-        assert!(resolved_backend(&route.backends[0]).endpoints().is_empty());
+        assert!(
+            resolved_backend(&route.backends[0]).endpoints().is_empty(),
+            "{:?}",
+            resolved_backend(&route.backends[0]).endpoints()
+        );
     }
 
     #[test]
@@ -3412,7 +3416,7 @@ abIF6YlJNVR6UhS8sg==\n\
         };
         let report = store.apply(&cfg);
         assert_eq!(report.applied, 1);
-        assert!(report.skipped.is_empty());
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert!(store.read().secret(&secretkey("app-tls")).is_some());
     }
 

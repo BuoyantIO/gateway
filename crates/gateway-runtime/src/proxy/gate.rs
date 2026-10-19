@@ -507,7 +507,11 @@ mod tests {
         )
         .await;
         assert!(matches!(out, GateOutcome::Halt(Halt::TooLarge)));
-        assert!(rec.lock().unwrap().calls.is_empty());
+        assert!(
+            rec.lock().unwrap().calls.is_empty(),
+            "{:?}",
+            rec.lock().unwrap().calls
+        );
 
         // Undeclared: rejected from the running total mid-body.
         let (m, _rec) = instance(BodyMode::Buffer, None);
@@ -580,7 +584,11 @@ mod tests {
         assert!(matches!(out, GateOutcome::Forward(_)));
         assert_eq!(rec_b.lock().unwrap().calls.len(), 2);
         assert_eq!(rec_s.lock().unwrap().calls.len(), 2);
-        assert!(rec_n.lock().unwrap().calls.is_empty());
+        assert!(
+            rec_n.lock().unwrap().calls.is_empty(),
+            "{:?}",
+            rec_n.lock().unwrap().calls
+        );
     }
 
     #[tokio::test]

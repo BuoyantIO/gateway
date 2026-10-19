@@ -1871,7 +1871,11 @@ mod tests {
         let out = translate(&state, OURS);
         let s = out.get(&("demo".into(), "api".into())).unwrap();
         let backend = s.backends.get(&BackendKey::new("demo/svc:8080")).unwrap();
-        assert!(endpoint_set(backend).endpoints.is_empty());
+        assert!(
+            endpoint_set(backend).endpoints.is_empty(),
+            "{:?}",
+            endpoint_set(backend).endpoints
+        );
     }
 
     #[test]
@@ -2205,7 +2209,7 @@ mod tests {
     fn effective_hostnames_catch_all() {
         // listener: none, route: none -> empty Vec (catch-all)
         let got = effective_hostnames(None, &[]).unwrap();
-        assert!(got.is_empty());
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]

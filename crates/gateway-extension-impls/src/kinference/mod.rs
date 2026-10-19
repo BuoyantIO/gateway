@@ -1012,7 +1012,7 @@ qos: Batch
             abort.reason,
             proto::abort_request::Reason::NotDispatched as i32
         );
-        assert!(abort.detail.is_empty());
+        assert!(abort.detail.is_empty(), "{:?}", abort.detail);
     }
 
     #[tokio::test]
@@ -1336,7 +1336,11 @@ qos: Batch
         let pool = pool_from_targets(&cx).expect("the claimed pool");
         assert_eq!(pool.namespace, "demo");
         assert_eq!(pool.name, "chat-pool");
-        assert!(pool.resource_version.is_empty());
+        assert!(
+            pool.resource_version.is_empty(),
+            "{:?}",
+            pool.resource_version
+        );
     }
 
     /// The loop the hand-held-channel tests cannot close: a provider

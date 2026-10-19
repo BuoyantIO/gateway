@@ -390,8 +390,8 @@ mod tests {
     fn bootstrap_for_unknown_gateway_is_empty_sync_complete() {
         let state = ServerState::new();
         let update = state.bootstrap(&("ns".into(), "missing".into()));
-        assert!(update.upserts.is_empty());
-        assert!(update.removes.is_empty());
+        assert!(update.upserts.is_empty(), "{:?}", update.upserts);
+        assert!(update.removes.is_empty(), "{:?}", update.removes);
         assert!(update.sync_complete);
     }
 
@@ -410,7 +410,7 @@ mod tests {
         state.publish(&next);
 
         let update = state.bootstrap(&("demo".into(), "api".into()));
-        assert!(update.removes.is_empty());
+        assert!(update.removes.is_empty(), "{:?}", update.removes);
         assert!(update.sync_complete);
 
         let has = |pred: fn(&pb::upsert::Body) -> bool| {
@@ -482,7 +482,7 @@ mod tests {
         state.publish(&HashMap::new());
 
         let delta = rx.recv().await.expect("delta received");
-        assert!(delta.upserts.is_empty());
+        assert!(delta.upserts.is_empty(), "{:?}", delta.upserts);
         assert_eq!(delta.removes.len(), 1);
     }
 
@@ -503,7 +503,7 @@ mod tests {
 
         let delta = rx.recv().await.expect("delta received");
         assert_eq!(delta.upserts.len(), 1);
-        assert!(delta.removes.is_empty());
+        assert!(delta.removes.is_empty(), "{:?}", delta.removes);
     }
 
     #[tokio::test]
