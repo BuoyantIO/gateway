@@ -3,12 +3,12 @@ controlPlane:
   # every replica serves data planes.
   replicas: 2
   image:
-    repository: ghcr.io/buoyantio/gateway-cp
+    repository: cr.kinference.ai/buoyantio/gateway-cp
     # Defaults to the chart appVersion.
     tag: ""
 
 dataPlane:
   image:
-    repository: ghcr.io/buoyantio/gatewayd
+    repository: cr.kinference.ai/buoyantio/gatewayd
     # Defaults to the chart appVersion.
     tag: ""
