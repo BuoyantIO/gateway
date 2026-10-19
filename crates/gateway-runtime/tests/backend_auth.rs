@@ -335,7 +335,11 @@ async fn a_configured_header_and_empty_prefix_reach_the_provider() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     assert_eq!(received.values("x-api-key"), vec!["sk-test"]);
-    assert!(received.values("authorization").is_empty());
+    assert!(
+        received.values("authorization").is_empty(),
+        "{:?}",
+        received.values("authorization")
+    );
 
     drop(shutdown_tx);
     tokio::time::timeout(Duration::from_secs(2), gw_handle)

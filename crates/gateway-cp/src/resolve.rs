@@ -2487,7 +2487,7 @@ mod tests {
         });
         let outcome = resolve_one(&object, &[]);
         let tls = resolved(&outcome).tls.as_ref().expect("tls originated");
-        assert!(tls.alpn.is_empty());
+        assert!(tls.alpn.is_empty(), "{:?}", tls.alpn);
     }
 
     #[test]
@@ -2893,7 +2893,7 @@ mod tests {
                 vec![ready("10.1.0.1", "pod-a")],
             )],
         );
-        assert!(endpoints.is_empty());
+        assert!(endpoints.is_empty(), "{endpoints:?}");
     }
 
     #[test]
@@ -2908,7 +2908,7 @@ mod tests {
         slice.address_type = "IPv6".into();
         let endpoints =
             resolve_endpoints(service_with_port("demo", "svc", 8080, None), vec![slice]);
-        assert!(endpoints.is_empty());
+        assert!(endpoints.is_empty(), "{endpoints:?}");
     }
 
     #[test]
@@ -2931,7 +2931,7 @@ mod tests {
                 )],
             )],
         );
-        assert!(endpoints.is_empty());
+        assert!(endpoints.is_empty(), "{endpoints:?}");
     }
 
     #[test]
@@ -3130,7 +3130,11 @@ mod tests {
                 },
             ]
         );
-        assert!(r.gateways[1].addresses.is_empty());
+        assert!(
+            r.gateways[1].addresses.is_empty(),
+            "{:?}",
+            r.gateways[1].addresses
+        );
         assert_eq!(
             r.gateways[2].addresses,
             vec![GatewayAddress {
@@ -3138,7 +3142,11 @@ mod tests {
                 kind: AddressKind::Ip
             }]
         );
-        assert!(r.gateways[3].addresses.is_empty());
+        assert!(
+            r.gateways[3].addresses.is_empty(),
+            "{:?}",
+            r.gateways[3].addresses
+        );
     }
 
     #[test]
@@ -3188,7 +3196,11 @@ mod tests {
                 kind: AddressKind::Ip
             }]
         );
-        assert!(r.gateways[1].addresses.is_empty());
+        assert!(
+            r.gateways[1].addresses.is_empty(),
+            "{:?}",
+            r.gateways[1].addresses
+        );
     }
 
     // ----- BackendBinding -----

@@ -410,7 +410,7 @@ mod tests {
         drain(body).await;
 
         let seen = seen.lock().unwrap();
-        assert!(seen.chunks.is_empty());
+        assert!(seen.chunks.is_empty(), "{:?}", seen.chunks);
         // The terminal is not gated on body access: a limiter that
         // never reads a byte still has to settle.
         assert_eq!(seen.ends.len(), 1);

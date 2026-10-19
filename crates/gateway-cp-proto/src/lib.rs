@@ -197,7 +197,7 @@ mod tests {
             sync_complete: true,
         };
         assert!(update.sync_complete);
-        assert!(update.upserts.is_empty());
-        assert!(update.removes.is_empty());
+        assert!(update.upserts.is_empty(), "{:?}", update.upserts);
+        assert!(update.removes.is_empty(), "{:?}", update.removes);
     }
 }
