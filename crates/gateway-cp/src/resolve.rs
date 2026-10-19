@@ -57,6 +57,8 @@ pub(crate) const GATEWAY_GROUP: &str = "gateway.linkerd.io";
 /// (route x parentRef) with its attachment outcome, emission edges,
 /// and backend resolutions.
 pub struct Resolution<'a> {
+    /// The `controllerName` this resolution was made for.
+    pub controller_name: &'a str,
     /// `GatewayClass`es whose `controllerName` is ours.
     pub gateway_classes: Vec<&'a GatewayClass>,
     pub gateways: Vec<GatewayResolution<'a>>,
@@ -75,6 +77,9 @@ pub struct Resolution<'a> {
     /// not resolve among themselves.
     pub bindings_by_claim: HashMap<(&'a str, &'a str, &'a str, &'a str), Vec<usize>>,
     pub routes: Vec<RouteResolution<'a>>,
+    /// Every `HTTPRoute`, attached or not, so status can clear our
+    /// entries from routes that no longer name an owned Gateway.
+    pub http_routes: Vec<&'a HTTPRoute>,
 }
 
 pub struct GatewayResolution<'a> {
@@ -454,7 +459,7 @@ pub(crate) fn collect_owned_classes<'a>(
 }
 
 /// Resolve `state` into the attachment graph for `controller_name`.
-pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a> {
+pub fn resolve<'a>(state: &'a K8sState, controller_name: &'a str) -> Resolution<'a> {
     let gateway_classes: Vec<&GatewayClass> = state
         .gateway_classes
         .iter()
@@ -547,12 +552,14 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
     }
 
     Resolution {
+        controller_name,
         gateway_classes,
         gateways,
         gateway_backends,
         backend_bindings,
         bindings_by_claim,
         routes,
+        http_routes: state.http_routes.iter().collect(),
     }
 }
 
