@@ -474,16 +474,12 @@ fn listener_status(
 }
 
 /// For each desired condition, keep the observed transition time
-/// when the condition is semantically unchanged (same type, status,
-/// reason, message, observedGeneration); changed conditions keep the
-/// fresh stamp.
+/// while its status is unchanged: `lastTransitionTime` marks a status
+/// flip, not a new reason, message or generation.
 fn carry_timestamps(desired: &mut [Condition], observed: &[Condition]) {
     for d in desired {
         if let Some(o) = observed.iter().find(|o| o.type_ == d.type_)
             && o.status == d.status
-            && o.reason == d.reason
-            && o.message == d.message
-            && o.observed_generation == d.observed_generation
         {
             d.last_transition_time = o.last_transition_time.clone();
         }
@@ -746,6 +742,35 @@ mod tests {
             find(written.conditions.as_deref().unwrap(), "Programmed").last_transition_time,
             t(100)
         );
+    }
+
+    #[test]
+    fn transition_time_moves_only_when_status_flips() {
+        let observed = [
+            condition(
+                "Programmed",
+                true,
+                "Programmed",
+                "1 programmed",
+                Some(1),
+                &t(100),
+            ),
+            condition("Accepted", true, "Accepted", "ok", Some(1), &t(100)),
+        ];
+        let mut desired = [
+            condition(
+                "Programmed",
+                true,
+                "Programmed",
+                "2 programmed",
+                Some(2),
+                &t(200),
+            ),
+            condition("Accepted", false, "Invalid", "ok", Some(2), &t(200)),
+        ];
+        carry_timestamps(&mut desired, &observed);
+        assert_eq!(desired[0].last_transition_time, t(100));
+        assert_eq!(desired[1].last_transition_time, t(200));
     }
 
     // ---------- GatewayBackend ----------
