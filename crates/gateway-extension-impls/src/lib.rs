@@ -5,6 +5,7 @@
 pub mod debug_log;
 pub mod jwt_auth;
 pub mod kinference;
+mod sse;
 
 use std::sync::Arc;
 

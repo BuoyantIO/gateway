@@ -32,8 +32,8 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use super::proto::pick_request::Mode;
-use super::sse::Splitter;
 use super::usage::{AnthropicUsage, Capture, Itl};
+use crate::sse::Splitter;
 
 /// Per-request response state for the token reports.
 pub(crate) struct Observer {

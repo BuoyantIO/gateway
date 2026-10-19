@@ -27,6 +27,11 @@ spec:
     # Redacted on top of the list above, and even with
     # redactCredentials: false.
     redactHeaders: []
+    # Log an Anthropic Messages or chat-completions event stream as the
+    # one JSON document the same call would have answered without
+    # streaming, its text capped at maxBodyBytes. false logs the raw
+    # prefix of the stream instead.
+    destream: true
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

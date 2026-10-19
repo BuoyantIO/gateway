@@ -14,6 +14,14 @@
 //! as its first `maxBodyBytes` bytes, lossily decoded and escaped
 //! onto one line.
 //!
+//! A response event stream in a format `destream` understands
+//! (Anthropic Messages or chat completions) is logged instead as the
+//! document the same call would have answered without streaming,
+//! reassembled from its events and written as one line of JSON, with
+//! its text capped at `maxBodyBytes`. `destream: false` logs the raw
+//! prefix of every stream instead. A stream in any other format logs
+//! its raw prefix either way.
+//!
 //! What it sees is what the filter chain hands it at its position:
 //! the head after the filters ahead of it, and the request body as
 //! the client sent it. A selector on the same rule may rewrite the
@@ -34,7 +42,9 @@
 //! so attaching the extension is the opt-in;
 //! `extension::debug_log=off` silences it without detaching it.
 //!
-//! Each request holds at most `maxBodyBytes` of each body.
+//! Each request holds at most `maxBodyBytes` of each body; a
+//! reassembled stream also holds its document's structure, up to a
+//! fixed allowance, and the stream's current event.
 //! `maxBodyBytes: 0` logs heads only and declares no body access, so
 //! attaching it does not change how a rule's bodies are handled.
 
@@ -51,6 +61,10 @@ use gateway_extension::{
 };
 use http::{HeaderMap, HeaderName, Uri};
 use serde::Deserialize;
+
+use destream::{Destream, Ordered};
+
+mod destream;
 
 /// The class name `Extension` objects name.
 pub const DEBUG_LOG: &str = "debug_log";
@@ -110,6 +124,9 @@ struct Config {
     /// regardless of `redact_credentials`.
     #[serde(default)]
     redact_headers: Vec<String>,
+    /// Whether a response event stream is logged reassembled.
+    #[serde(default = "default_destream")]
+    destream: bool,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -117,6 +134,10 @@ fn default_max_body_bytes() -> usize {
 }
 
 fn default_redact_credentials() -> bool {
+    true
+}
+
+fn default_destream() -> bool {
     true
 }
 
@@ -131,6 +152,7 @@ impl ExtensionClass for DebugLogClass {
                 max_body_bytes: DEFAULT_MAX_BODY_BYTES,
                 redact_credentials: true,
                 redact_headers: Vec::new(),
+                destream: true,
             }
         } else {
             from_value(config)?
@@ -151,6 +173,7 @@ struct Prepared {
     redact: Vec<HeaderName>,
     /// Whether [`CREDENTIAL_PARAMS`] are redacted from the URI.
     redact_params: bool,
+    destream: bool,
 }
 
 impl DebugLogBuilder {
@@ -187,6 +210,7 @@ impl DebugLogBuilder {
             max_body_bytes = cfg.max_body_bytes,
             redact_credentials = cfg.redact_credentials,
             redacted_headers = redact.len(),
+            destream = cfg.destream,
             "debug_log configured"
         );
         Ok(Self {
@@ -194,6 +218,7 @@ impl DebugLogBuilder {
                 max_body_bytes: cfg.max_body_bytes,
                 redact,
                 redact_params: cfg.redact_credentials,
+                destream: cfg.destream,
             }),
         })
     }
@@ -223,6 +248,7 @@ impl ExtensionBuilder for DebugLogBuilder {
             seq: SEQ.fetch_add(1, Ordering::Relaxed),
             request: Prefix::default(),
             response: Prefix::default(),
+            destream: None,
             request_logged: false,
         })
     }
@@ -233,6 +259,9 @@ struct DebugLog {
     seq: u64,
     request: Prefix,
     response: Prefix,
+    /// Set at response start for an event stream, when reassembly is
+    /// on and bodies are logged.
+    destream: Option<Destream>,
     /// The `request body` line went out.
     request_logged: bool,
 }
@@ -277,6 +306,12 @@ impl Extension for DebugLog {
     }
 
     fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
+        if self.prepared.destream
+            && self.prepared.max_body_bytes > 0
+            && is_event_stream(&head.headers)
+        {
+            self.destream = Some(Destream::new(self.prepared.max_body_bytes));
+        }
         tracing::info!(target: LOG,
             seq = self.seq,
             status = head.status.as_u16(),
@@ -290,6 +325,14 @@ impl Extension for DebugLog {
     }
 
     fn on_response_body(&mut self, chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {
+        if let Some(destream) = &mut self.destream {
+            destream.feed(&chunk);
+            // The raw prefix is only the fallback for a stream that
+            // turns out not to be one it reassembles.
+            if destream.understood() {
+                return;
+            }
+        }
         self.response.feed(&chunk, self.prepared.max_body_bytes);
     }
 
@@ -308,6 +351,22 @@ impl Extension for DebugLog {
         }
         if !self.request_logged {
             self.log_request_body(false);
+        }
+        if let Some(r) = self.destream.take().and_then(Destream::finish) {
+            tracing::info!(target: LOG,
+                seq = self.seq,
+                status = end.status.as_u16(),
+                upstream = end.upstream,
+                complete = end.complete,
+                body_failed = end.body_failed,
+                body_bytes = end.body_bytes,
+                destreamed = r.format,
+                events = r.events,
+                truncated = r.truncated,
+                body = %Ordered(&r.document),
+                "response end"
+            );
+            return;
         }
         tracing::info!(target: LOG,
             seq = self.seq,
@@ -362,6 +421,15 @@ impl Prefix {
     fn text(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.kept)
     }
+}
+
+/// Whether a response's `content-type` is an event stream.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|ct| ct.split(';').next())
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 /// A header map formatted as `name: value` pairs, with the values of
@@ -722,6 +790,70 @@ mod tests {
             .expect("the body is logged at the end");
         assert!(line.contains("complete=false"), "{line}");
         assert!(line.contains(r#"body="partial""#), "{line}");
+    }
+
+    /// An Anthropic stream, split mid-event by the second chunk.
+    const STREAM: [&[u8]; 2] = [
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":\
+          {\"id\":\"msg_1\",\"type\":\"message\",\"content\":[]}}\n\n\
+          event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,",
+        b"\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+          event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\
+          \"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\\nworld\"}}\n\n",
+    ];
+
+    /// The `response end` line for [`STREAM`] served as `content_type`.
+    fn stream_end_line(config: &str, content_type: &str) -> String {
+        let (log, _guard) = capture();
+        let mut ext = parse(config).unwrap().build();
+        let mut cx = Cx::new();
+        let (mut resp, ()) = http::Response::builder()
+            .header("content-type", content_type)
+            .body(())
+            .unwrap()
+            .into_parts();
+        ext.on_response_start(&mut resp, &mut cx);
+        ext.on_response_body(Bytes::from_static(STREAM[0]), false, &mut cx);
+        ext.on_response_body(Bytes::from_static(STREAM[1]), true, &mut cx);
+        ext.on_response_end(&served(true, 0), &mut cx);
+        log.contents()
+            .lines()
+            .find(|l| l.contains("response end"))
+            .expect("a response end line")
+            .to_owned()
+    }
+
+    /// By default an event stream logs as the message it built, as
+    /// JSON on one line.
+    #[test]
+    fn an_event_stream_logs_reassembled() {
+        let line = stream_end_line("{}", "text/event-stream; charset=utf-8");
+        assert!(line.contains(r#"destreamed="anthropic""#), "{line}");
+        assert!(line.contains("events=3"), "{line}");
+        assert!(line.contains("truncated=false"), "{line}");
+        assert!(
+            line.contains(
+                r#"body={"type":"message","id":"msg_1","content":[{"type":"text","text":"Hello\nworld"}]}"#
+            ),
+            "{line}"
+        );
+    }
+
+    /// `destream: false` logs the raw prefix, and so does a body that
+    /// is not an event stream, whatever it holds.
+    #[test]
+    fn a_raw_stream_and_a_non_stream_log_their_prefix() {
+        for (config, content_type) in [
+            ("destream: false", "text/event-stream"),
+            ("{}", "application/json"),
+        ] {
+            let line = stream_end_line(config, content_type);
+            assert!(!line.contains("destreamed"), "{line}");
+            assert!(
+                line.contains(r#"body="event: message_start\ndata: "#),
+                "{line}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -33,7 +33,6 @@ pub mod proto {
 }
 
 mod response;
-mod sse;
 mod usage;
 
 use std::net::SocketAddr;
