@@ -482,24 +482,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         &slices_by_service,
         &dialables_by_id,
     );
-    // Keys borrow from the watched objects, not from the resolution
-    // entries, so the index and the entries move into `Resolution`
-    // together.
-    let mut bindings_by_claim: HashMap<(&str, &str, &str, &str), Vec<usize>> = HashMap::new();
-    for (idx, b) in backend_bindings.iter().enumerate() {
-        if !matches!(b.outcome, BackendBindingOutcome::Accepted { .. }) {
-            continue;
-        }
-        let object: &'a crd::BackendBinding = b.object;
-        let claim = &object.spec.claim;
-        let Some(ns) = object.metadata.namespace.as_deref() else {
-            continue;
-        };
-        bindings_by_claim
-            .entry((ns, &claim.group, &claim.kind, &claim.name))
-            .or_default()
-            .push(idx);
-    }
+    let bindings_by_claim = index_claims(&backend_bindings);
     demote_conflicting_claims(&mut backend_bindings, &bindings_by_claim);
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
@@ -571,6 +554,30 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         bindings_by_claim,
         routes,
     }
+}
+
+/// Accepted bindings by the claim they answer for. Keys borrow from
+/// the watched objects, not from the resolution entries, so the
+/// index and the entries move into `Resolution` together.
+fn index_claims<'a>(
+    backend_bindings: &[BackendBindingResolution<'a>],
+) -> HashMap<(&'a str, &'a str, &'a str, &'a str), Vec<usize>> {
+    let mut bindings_by_claim: HashMap<(&str, &str, &str, &str), Vec<usize>> = HashMap::new();
+    for (idx, b) in backend_bindings.iter().enumerate() {
+        if !matches!(b.outcome, BackendBindingOutcome::Accepted { .. }) {
+            continue;
+        }
+        let object: &'a crd::BackendBinding = b.object;
+        let claim = &object.spec.claim;
+        let Some(ns) = object.metadata.namespace.as_deref() else {
+            continue;
+        };
+        bindings_by_claim
+            .entry((ns, &claim.group, &claim.kind, &claim.name))
+            .or_default()
+            .push(idx);
+    }
+    bindings_by_claim
 }
 
 /// Classify a Gateway's listeners in spec order: group by port,
