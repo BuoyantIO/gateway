@@ -13,6 +13,9 @@ GATEWAY_API_CRDS := "https://github.com/kubernetes-sigs/gateway-api/releases/dow
 # cluster (host-routable on Linux). Runs as a container beside the
 # cluster; no toolchain requirement.
 CPK_IMAGE := "registry.k8s.io/cloud-provider-kind/cloud-controller-manager:v0.9.0"
+# cloud-provider-kind saves each load balancer's Envoy log here when
+# it deletes the container; the container's own log goes with it.
+CPK_LOG_DIR := "/tmp/cloud-provider-kind-logs"
 
 default: list
 
@@ -62,8 +65,11 @@ up: images
     kind create cluster --name {{CLUSTER}} --config e2e/kind.yaml
     kind load docker-image {{DP_IMAGE}} {{CP_IMAGE}} {{ECHO_IMAGE}} --name {{CLUSTER}}
     docker rm -f cloud-provider-kind 2>/dev/null || true
+    mkdir -p {{CPK_LOG_DIR}}
     docker run -d --name cloud-provider-kind --network kind \
-        -v /var/run/docker.sock:/var/run/docker.sock {{CPK_IMAGE}}
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v {{CPK_LOG_DIR}}:/logs \
+        {{CPK_IMAGE}} --enable-log-dumping --logs-dir /logs
     # --force-conflicts: cloud-provider-kind server-side-applies its own
     # Gateway API CRD bundle at startup; whoever loses that race must
     # take ownership rather than fail.

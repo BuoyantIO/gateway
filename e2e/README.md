@@ -59,6 +59,23 @@ cargo test -p gateway-e2e --test routing -- --ignored exact_beats_prefix
 All tests are `#[ignore]`d so they're not run by
 `cargo test --workspace`. The justfile passes `--ignored` for you.
 
+## Debugging failures
+
+A test's namespace, and with it its gatewayd and backend logs, is
+deleted when the test ends. Set `E2E_LOG_DIR` to keep them: each test
+then saves its pods' logs and its namespace's events to
+`$E2E_LOG_DIR/<namespace>/` before deleting it.
+
+Traffic reaches a Gateway through a cloud-provider-kind Envoy
+container (`kindccm-*`) that lives outside the cluster. `just up`
+starts cloud-provider-kind with log dumping on, so the Envoy log of
+every deleted `LoadBalancer` Service lands in
+`/tmp/cloud-provider-kind-logs/<namespace>_<service>.log`; live ones
+are in `docker logs`.
+
+CI does all of this and, when the suite fails, uploads it with the
+`kind export logs` output as the `kind-logs` artifact.
+
 ## How tests are structured
 
 Each test follows the same shape:
