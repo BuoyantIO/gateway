@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api::apis::standard::httproutes::HTTPRoute;
 use kube::api::{Api, PostParams};
 use kube::{Client, Resource, ResourceExt};
 use serde::Serialize;
@@ -31,7 +32,7 @@ use tokio::time::sleep;
 
 use super::build::{
     StatusWork, reconcile_backend_binding_status, reconcile_gateway_backend_status,
-    reconcile_gateway_class_status, reconcile_gateway_status,
+    reconcile_gateway_class_status, reconcile_gateway_status, reconcile_http_route_status,
 };
 use crate::crd::{BackendBinding, GatewayBackend};
 
@@ -162,6 +163,26 @@ async fn write_all(client: &Client, work: &StatusWork) -> Result<(), kube::Error
         }
     }
 
+    for (observed, desired) in &work.http_routes {
+        let namespace = observed.namespace().unwrap_or_default();
+        let api: Api<HTTPRoute> = Api::namespaced(client.clone(), &namespace);
+        let result = write_object(
+            &api,
+            observed,
+            desired.clone(),
+            |hr| &mut hr.status,
+            |desired, observed| {
+                reconcile_http_route_status(desired, observed, &work.controller_name)
+            },
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, kind = "HTTPRoute", namespace, name = observed.name_any(),
+                "status write failed; continuing with the rest");
+            first_err.get_or_insert(e);
+        }
+    }
+
     first_err.map_or(Ok(()), Err)
 }
 
@@ -271,6 +292,15 @@ mod tests {
     }
 
     fn mock_client(requests: Arc<Mutex<Vec<String>>>, script: Vec<Scripted>) -> Client {
+        mock_client_recording(requests, Arc::default(), script)
+    }
+
+    /// [`mock_client`] that also records the body of every echoed write.
+    fn mock_client_recording(
+        requests: Arc<Mutex<Vec<String>>>,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        script: Vec<Scripted>,
+    ) -> Client {
         let script = Arc::new(Mutex::new(VecDeque::from(script)));
         let (service, mut handle) =
             tower_test::mock::pair::<http::Request<Body>, http::Response<Body>>();
@@ -284,6 +314,7 @@ mod tests {
                 let response = match action {
                     Scripted::Echo => {
                         let body = req.into_body().collect().await.unwrap().to_bytes();
+                        bodies.lock().unwrap().push(body.to_vec());
                         http::Response::builder()
                             .status(200)
                             .header("content-type", "application/json")
@@ -354,8 +385,7 @@ mod tests {
                 // No status yet: written once.
                 (changed, gw_status("True", &t(200))),
             ],
-            gateway_backends: vec![],
-            backend_bindings: vec![],
+            ..Default::default()
         };
         write_all(&client, &work).await.unwrap();
 
@@ -387,8 +417,7 @@ mod tests {
         let work = StatusWork {
             gateway_classes: vec![],
             gateways: vec![(gw(None), gw_status("True", &t(200)))],
-            gateway_backends: vec![],
-            backend_bindings: vec![],
+            ..Default::default()
         };
         write_all(&client, &work).await.unwrap();
         let seen = requests.lock().unwrap().clone();
@@ -432,8 +461,7 @@ mod tests {
                 (gw(None), gw_status("True", &t(200))),
                 (other, gw_status("True", &t(200))),
             ],
-            gateway_backends: vec![],
-            backend_bindings: vec![],
+            ..Default::default()
         };
         let result = write_all(&client, &work).await;
         assert!(result.is_err(), "the failed write must surface for retry");
@@ -441,5 +469,61 @@ mod tests {
         let seen = requests.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[1].contains("/gateways/gw2/status"));
+    }
+
+    #[tokio::test]
+    async fn route_write_keeps_other_controllers_entries() {
+        use gateway_api::apis::standard::httproutes::{
+            HttpRouteSpec, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+        };
+
+        let entry = |controller: &str, gateway: &str| HttpRouteStatusParents {
+            conditions: vec![cond("True", &t(100))],
+            controller_name: controller.into(),
+            parent_ref: HttpRouteStatusParentsParentRef {
+                name: gateway.into(),
+                ..Default::default()
+            },
+        };
+        let route = HTTPRoute {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some("r".into()),
+                resource_version: Some("1".into()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec::default(),
+            status: Some(HttpRouteStatus {
+                parents: vec![entry("other.io/controller", "theirs")],
+            }),
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let client = mock_client_recording(requests.clone(), bodies.clone(), vec![]);
+
+        let work = StatusWork {
+            http_routes: vec![(
+                route,
+                HttpRouteStatus {
+                    parents: vec![entry("ours.io/controller", "gw")],
+                },
+            )],
+            controller_name: "ours.io/controller".into(),
+            ..Default::default()
+        };
+        write_all(&client, &work).await.unwrap();
+
+        assert_eq!(
+            requests.lock().unwrap().clone(),
+            vec!["PUT /apis/gateway.networking.k8s.io/v1/namespaces/demo/httproutes/r/status"]
+        );
+        let written: HTTPRoute = serde_json::from_slice(&bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(
+            written.status.unwrap().parents,
+            vec![
+                entry("other.io/controller", "theirs"),
+                entry("ours.io/controller", "gw")
+            ]
+        );
     }
 }

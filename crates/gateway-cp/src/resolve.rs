@@ -57,6 +57,8 @@ pub(crate) const GATEWAY_GROUP: &str = "gateway.linkerd.io";
 /// (route x parentRef) with its attachment outcome, emission edges,
 /// and backend resolutions.
 pub struct Resolution<'a> {
+    /// The `controllerName` this resolution was made for.
+    pub controller_name: &'a str,
     /// `GatewayClass`es whose `controllerName` is ours.
     pub gateway_classes: Vec<&'a GatewayClass>,
     pub gateways: Vec<GatewayResolution<'a>>,
@@ -75,6 +77,9 @@ pub struct Resolution<'a> {
     /// not resolve among themselves.
     pub bindings_by_claim: HashMap<(&'a str, &'a str, &'a str, &'a str), Vec<usize>>,
     pub routes: Vec<RouteResolution<'a>>,
+    /// Every `HTTPRoute`, attached or not, so status can clear our
+    /// entries from routes that no longer name an owned Gateway.
+    pub http_routes: Vec<&'a HTTPRoute>,
 }
 
 pub struct GatewayResolution<'a> {
@@ -454,7 +459,7 @@ pub(crate) fn collect_owned_classes<'a>(
 }
 
 /// Resolve `state` into the attachment graph for `controller_name`.
-pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a> {
+pub fn resolve<'a>(state: &'a K8sState, controller_name: &'a str) -> Resolution<'a> {
     let gateway_classes: Vec<&GatewayClass> = state
         .gateway_classes
         .iter()
@@ -482,24 +487,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
         &slices_by_service,
         &dialables_by_id,
     );
-    // Keys borrow from the watched objects, not from the resolution
-    // entries, so the index and the entries move into `Resolution`
-    // together.
-    let mut bindings_by_claim: HashMap<(&str, &str, &str, &str), Vec<usize>> = HashMap::new();
-    for (idx, b) in backend_bindings.iter().enumerate() {
-        if !matches!(b.outcome, BackendBindingOutcome::Accepted { .. }) {
-            continue;
-        }
-        let object: &'a crd::BackendBinding = b.object;
-        let claim = &object.spec.claim;
-        let Some(ns) = object.metadata.namespace.as_deref() else {
-            continue;
-        };
-        bindings_by_claim
-            .entry((ns, &claim.group, &claim.kind, &claim.name))
-            .or_default()
-            .push(idx);
-    }
+    let bindings_by_claim = index_claims(&backend_bindings);
     demote_conflicting_claims(&mut backend_bindings, &bindings_by_claim);
 
     let mut gateways: Vec<GatewayResolution<'a>> = Vec::new();
@@ -564,13 +552,39 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &str) -> Resolution<'a>
     }
 
     Resolution {
+        controller_name,
         gateway_classes,
         gateways,
         gateway_backends,
         backend_bindings,
         bindings_by_claim,
         routes,
+        http_routes: state.http_routes.iter().collect(),
     }
+}
+
+/// Accepted bindings by the claim they answer for. Keys borrow from
+/// the watched objects, not from the resolution entries, so the
+/// index and the entries move into `Resolution` together.
+fn index_claims<'a>(
+    backend_bindings: &[BackendBindingResolution<'a>],
+) -> HashMap<(&'a str, &'a str, &'a str, &'a str), Vec<usize>> {
+    let mut bindings_by_claim: HashMap<(&str, &str, &str, &str), Vec<usize>> = HashMap::new();
+    for (idx, b) in backend_bindings.iter().enumerate() {
+        if !matches!(b.outcome, BackendBindingOutcome::Accepted { .. }) {
+            continue;
+        }
+        let object: &'a crd::BackendBinding = b.object;
+        let claim = &object.spec.claim;
+        let Some(ns) = object.metadata.namespace.as_deref() else {
+            continue;
+        };
+        bindings_by_claim
+            .entry((ns, &claim.group, &claim.kind, &claim.name))
+            .or_default()
+            .push(idx);
+    }
+    bindings_by_claim
 }
 
 /// Classify a Gateway's listeners in spec order: group by port,

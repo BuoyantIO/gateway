@@ -9,7 +9,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Status writeback on owned objects.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "httproutes/status"]
     verbs: ["get", "patch", "update"]
   # "delete" covers the one removal the provisioner performs itself:
   # a provisioned Service superseded by an operator-owned one.

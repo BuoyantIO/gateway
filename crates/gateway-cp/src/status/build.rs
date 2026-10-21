@@ -6,21 +6,36 @@
 //! semantically unchanged conditions so identical passes compare
 //! equal. No API calls here; the writer task owns those. `now` is a
 //! parameter so tests run on a fixed clock.
+//!
+//! An `HTTPRoute`'s `status.parents` is shared with other
+//! controllers: we only ever add, replace or remove entries carrying
+//! our `controllerName`.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use gateway_api::apis::standard::gatewayclasses::{GatewayClass, GatewayClassStatus};
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
     GatewayStatusListenersSupportedKinds,
 };
+use gateway_api::apis::standard::httproutes::{
+    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 use crate::crd::{BackendBinding, BackendBindingStatus, GatewayBackend, GatewayBackendStatus};
 use crate::resolve::{
-    AddressKind, BackendBindingOutcome, BackendBindingResolution, CredentialOutcome,
-    GatewayBackendOutcome, GatewayBackendResolution, GatewayResolution, ListenerOutcome,
-    ListenerResolution, Resolution, ResolvedBackendAuth, ResolvedDialable,
+    AddressKind, BackendBindingOutcome, BackendBindingResolution, BackendOutcome,
+    BackendResolution, CredentialOutcome, GatewayBackendOutcome, GatewayBackendResolution,
+    GatewayResolution, ListenerOutcome, ListenerResolution, Resolution, ResolvedBackendAuth,
+    ResolvedDialable, RouteParentOutcome, RouteResolution,
 };
 use crate::snapshot::GatewayId;
+
+/// Failing backendRefs named in a route's `ResolvedRefs` message
+/// before the rest are only counted.
+const MAX_LISTED_REFS: usize = 8;
 
 /// Desired statuses for one pass, keyed by object identity.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +47,8 @@ pub struct StatusSet {
     pub gateway_backends: Vec<(GatewayId, GatewayBackendStatus)>,
     /// `BackendBinding` `(namespace, name)` -> desired status.
     pub backend_bindings: Vec<(GatewayId, BackendBindingStatus)>,
+    /// `HTTPRoute` `(namespace, name)` -> our parent entries only.
+    pub http_routes: Vec<(GatewayId, HttpRouteStatus)>,
 }
 
 /// One translate pass's status work for the writer: each desired
@@ -44,6 +61,11 @@ pub struct StatusWork {
     pub gateways: Vec<(Gateway, GatewayStatus)>,
     pub gateway_backends: Vec<(GatewayBackend, GatewayBackendStatus)>,
     pub backend_bindings: Vec<(BackendBinding, BackendBindingStatus)>,
+    /// Desired statuses hold only our parent entries; routes with
+    /// none desired and none observed are left out.
+    pub http_routes: Vec<(HTTPRoute, HttpRouteStatus)>,
+    /// Identifies our entries in `status.parents`.
+    pub controller_name: String,
 }
 
 /// [`build`], with each desired status paired to a clone of the
@@ -70,6 +92,14 @@ pub fn build_work(resolution: &Resolution<'_>, now: &Time) -> StatusWork {
             .iter()
             .map(|b| (b.object.clone(), backend_binding_status(b, now)))
             .collect(),
+        http_routes: http_route_statuses(resolution, now)
+            .into_iter()
+            .filter(|(hr, desired)| {
+                !desired.parents.is_empty() || has_parent_entry(hr, resolution.controller_name)
+            })
+            .map(|(hr, desired)| (hr.clone(), desired))
+            .collect(),
+        controller_name: resolution.controller_name.to_string(),
     }
 }
 
@@ -110,6 +140,10 @@ pub fn build(resolution: &Resolution<'_>, now: &Time) -> StatusSet {
                     backend_binding_status(b, now),
                 )
             })
+            .collect(),
+        http_routes: http_route_statuses(resolution, now)
+            .into_iter()
+            .filter_map(|(hr, desired)| Some((route_id(hr)?, desired)))
             .collect(),
     }
 }
@@ -187,6 +221,41 @@ pub fn reconcile_gateway_status(
         }
     }
     Some(desired)
+}
+
+/// Merge our desired parent entries into the observed route status:
+/// entries of other controllers are kept as they are, ours are
+/// replaced, and ours for parents no longer desired are dropped.
+/// `None` when our entries are semantically unchanged, whatever
+/// their order.
+pub fn reconcile_http_route_status(
+    desired: HttpRouteStatus,
+    observed: Option<&HttpRouteStatus>,
+    controller_name: &str,
+) -> Option<HttpRouteStatus> {
+    let observed = observed.map_or(&[][..], |o| o.parents.as_slice());
+    let observed_ours: Vec<&HttpRouteStatusParents> = observed
+        .iter()
+        .filter(|o| o.controller_name == controller_name)
+        .collect();
+
+    let mut ours = desired.parents;
+    for d in &mut ours {
+        if let Some(o) = observed_ours.iter().find(|o| o.parent_ref == d.parent_ref) {
+            carry_timestamps(&mut d.conditions, &o.conditions);
+        }
+    }
+    if ours.len() == observed_ours.len() && ours.iter().all(|d| observed_ours.contains(&d)) {
+        return None;
+    }
+
+    let mut parents: Vec<HttpRouteStatusParents> = observed
+        .iter()
+        .filter(|o| o.controller_name != controller_name)
+        .cloned()
+        .collect();
+    parents.extend(ours);
+    Some(HttpRouteStatus { parents })
 }
 
 fn gateway_class_status(gc: &GatewayClass, now: &Time) -> GatewayClassStatus {
@@ -367,6 +436,185 @@ fn resolved_refs_condition(resolved: &ResolvedDialable<'_>) -> (bool, &'static s
     }
 }
 
+/// Every route paired with our desired parent entries, one per
+/// parentRef naming an owned Gateway, in spec order.
+fn http_route_statuses<'a>(
+    resolution: &Resolution<'a>,
+    now: &Time,
+) -> Vec<(&'a HTTPRoute, HttpRouteStatus)> {
+    let mut by_route: HashMap<(&str, &str), Vec<HttpRouteStatusParents>> = HashMap::new();
+    for rr in resolution
+        .routes
+        .iter()
+        .filter(|rr| rr.gateway_id.is_some())
+    {
+        by_route
+            .entry((rr.route_ns, rr.route_name))
+            .or_default()
+            .push(route_parent_status(rr, resolution.controller_name, now));
+    }
+    resolution
+        .http_routes
+        .iter()
+        .map(|hr| {
+            let key = (
+                hr.metadata.namespace.as_deref().unwrap_or_default(),
+                hr.metadata.name.as_deref().unwrap_or_default(),
+            );
+            let parents = by_route.remove(&key).unwrap_or_default();
+            (*hr, HttpRouteStatus { parents })
+        })
+        .collect()
+}
+
+fn route_id(hr: &HTTPRoute) -> Option<GatewayId> {
+    Some((hr.metadata.namespace.clone()?, hr.metadata.name.clone()?))
+}
+
+fn has_parent_entry(hr: &HTTPRoute, controller_name: &str) -> bool {
+    hr.status.as_ref().is_some_and(|s| {
+        s.parents
+            .iter()
+            .any(|p| p.controller_name == controller_name)
+    })
+}
+
+fn route_parent_status(
+    rr: &RouteResolution<'_>,
+    controller_name: &str,
+    now: &Time,
+) -> HttpRouteStatusParents {
+    let generation = rr.route.metadata.generation;
+    let gateway = rr
+        .gateway_id
+        .as_ref()
+        .map_or_else(String::new, |(ns, name)| format!("{ns}/{name}"));
+    let accepted = match rr.outcome {
+        RouteParentOutcome::Accepted => (true, "Accepted", "route is accepted".to_string()),
+        RouteParentOutcome::NoMatchingParent => (
+            false,
+            "NoMatchingParent",
+            match rr.parent_ref.section_name.as_deref() {
+                Some(section) => {
+                    format!("gateway {gateway} has no accepted listener named {section:?}")
+                }
+                None => format!("gateway {gateway} has no accepted listener"),
+            },
+        ),
+        RouteParentOutcome::NoMatchingListenerHostname => (
+            false,
+            "NoMatchingListenerHostname",
+            format!(
+                "route hostnames [{}] match no listener hostname on gateway {gateway}",
+                rr.route.spec.hostnames.as_deref().unwrap_or(&[]).join(", ")
+            ),
+        ),
+    };
+    let resolved_refs = route_resolved_refs(rr);
+
+    let p = rr.parent_ref;
+    HttpRouteStatusParents {
+        conditions: vec![
+            condition(
+                "Accepted",
+                accepted.0,
+                accepted.1,
+                &accepted.2,
+                generation,
+                now,
+            ),
+            condition(
+                "ResolvedRefs",
+                resolved_refs.0,
+                resolved_refs.1,
+                &resolved_refs.2,
+                generation,
+                now,
+            ),
+        ],
+        controller_name: controller_name.to_string(),
+        parent_ref: HttpRouteStatusParentsParentRef {
+            group: p.group.clone(),
+            kind: p.kind.clone(),
+            name: p.name.clone(),
+            namespace: p.namespace.clone(),
+            port: p.port,
+            section_name: p.section_name.clone(),
+        },
+    }
+}
+
+/// `ResolvedRefs` over every rule's backendRefs: the first failure's
+/// reason, and a message listing each distinct failure.
+fn route_resolved_refs(rr: &RouteResolution<'_>) -> (bool, &'static str, String) {
+    let mut reason = None;
+    let mut failures: Vec<String> = Vec::new();
+    for (i, backends) in rr.rule_backends.iter().enumerate() {
+        for b in backends {
+            let Some((r, what)) = backend_failure(b, rr.route_ns) else {
+                continue;
+            };
+            let line = format!("rules[{i}]: {what}");
+            if !failures.contains(&line) {
+                reason.get_or_insert(r);
+                failures.push(line);
+            }
+        }
+    }
+    let Some(reason) = reason else {
+        return (true, "ResolvedRefs", "all references resolved".to_string());
+    };
+    let more = failures.len().saturating_sub(MAX_LISTED_REFS);
+    failures.truncate(MAX_LISTED_REFS);
+    let mut message = failures.join("; ");
+    if more > 0 {
+        let _ = write!(message, "; and {more} more");
+    }
+    (false, reason, message)
+}
+
+/// The `ResolvedRefs` reason and message for one backendRef that the
+/// data plane cannot reach as written. `UnsupportedValue` covers the
+/// port rules, for which the API defines no reason.
+fn backend_failure(b: &BackendResolution<'_>, route_ns: &str) -> Option<(&'static str, String)> {
+    let r = b.backend_ref;
+    let spec_ref = format!("{}/{}", r.namespace.as_deref().unwrap_or(route_ns), r.name);
+    Some(match &b.outcome {
+        BackendOutcome::Resolved { .. } | BackendOutcome::Dialable { .. } => return None,
+        BackendOutcome::MissingService { key } => {
+            ("BackendNotFound", format!("Service {key} not found"))
+        }
+        BackendOutcome::Headless { key } => (
+            "BackendNotFound",
+            format!("Service {key} has no cluster IP"),
+        ),
+        BackendOutcome::MissingDialable { key } => {
+            ("BackendNotFound", format!("GatewayBackend {key} not found"))
+        }
+        BackendOutcome::CrossNamespace => (
+            "RefNotPermitted",
+            format!("cross-namespace backendRef {spec_ref} is not permitted"),
+        ),
+        BackendOutcome::NoPort => (
+            "UnsupportedValue",
+            format!("Service backendRef {spec_ref} has no port"),
+        ),
+        BackendOutcome::PortNotAllowed => (
+            "UnsupportedValue",
+            format!("GatewayBackend backendRef {spec_ref} must not set a port"),
+        ),
+        // Also reached when the only claimants conflict: none is accepted.
+        BackendOutcome::UnsupportedKind { .. } => (
+            "InvalidKind",
+            format!(
+                "{}/{} backendRef {spec_ref} is not claimed by any accepted BackendBinding",
+                r.group.as_deref().unwrap_or(""),
+                r.kind.as_deref().unwrap_or("Service")
+            ),
+        ),
+    })
+}
+
 fn listener_status(
     lr: &ListenerResolution<'_>,
     generation: Option<i64>,
@@ -474,16 +722,12 @@ fn listener_status(
 }
 
 /// For each desired condition, keep the observed transition time
-/// when the condition is semantically unchanged (same type, status,
-/// reason, message, observedGeneration); changed conditions keep the
-/// fresh stamp.
+/// while its status is unchanged: `lastTransitionTime` marks a status
+/// flip, not a new reason, message or generation.
 fn carry_timestamps(desired: &mut [Condition], observed: &[Condition]) {
     for d in desired {
         if let Some(o) = observed.iter().find(|o| o.type_ == d.type_)
             && o.status == d.status
-            && o.reason == d.reason
-            && o.message == d.message
-            && o.observed_generation == d.observed_generation
         {
             d.last_transition_time = o.last_transition_time.clone();
         }
@@ -514,7 +758,9 @@ mod tests {
 
     use gateway_api::apis::standard::gatewayclasses::GatewayClassSpec;
     use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewaySpec};
-    use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteParentRefs, HttpRouteSpec};
+    use gateway_api::apis::standard::httproutes::{
+        HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteSpec,
+    };
     use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::{Secret, Service, ServiceSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -746,6 +992,35 @@ mod tests {
             find(written.conditions.as_deref().unwrap(), "Programmed").last_transition_time,
             t(100)
         );
+    }
+
+    #[test]
+    fn transition_time_moves_only_when_status_flips() {
+        let observed = [
+            condition(
+                "Programmed",
+                true,
+                "Programmed",
+                "1 programmed",
+                Some(1),
+                &t(100),
+            ),
+            condition("Accepted", true, "Accepted", "ok", Some(1), &t(100)),
+        ];
+        let mut desired = [
+            condition(
+                "Programmed",
+                true,
+                "Programmed",
+                "2 programmed",
+                Some(2),
+                &t(200),
+            ),
+            condition("Accepted", false, "Invalid", "ok", Some(2), &t(200)),
+        ];
+        carry_timestamps(&mut desired, &observed);
+        assert_eq!(desired[0].last_transition_time, t(100));
+        assert_eq!(desired[1].last_transition_time, t(200));
     }
 
     // ---------- GatewayBackend ----------
@@ -984,5 +1259,266 @@ mod tests {
             "the message names the other claimant: {}",
             accepted.message
         );
+    }
+
+    // ---------- HTTPRoute ----------
+
+    fn backend_ref(name: &str, port: Option<i32>) -> HttpRouteRulesBackendRefs {
+        HttpRouteRulesBackendRefs {
+            name: name.into(),
+            port,
+            ..Default::default()
+        }
+    }
+
+    fn echo_service() -> Service {
+        Service {
+            metadata: ObjectMeta {
+                namespace: Some("demo".into()),
+                name: Some("echo".into()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                cluster_ip: Some("10.96.0.20".into()),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    /// The fixture with route `r` sending its one rule to `refs`.
+    fn route_state(refs: Vec<HttpRouteRulesBackendRefs>) -> K8sState {
+        let mut state = fixture_state();
+        state.services.push(echo_service());
+        state.http_routes[0].metadata.generation = Some(2);
+        state.http_routes[0].spec.rules = Some(vec![HttpRouteRules {
+            backend_refs: Some(refs),
+            ..Default::default()
+        }]);
+        state
+    }
+
+    fn route_status(state: &K8sState) -> HttpRouteStatus {
+        let resolution = resolve(state, OURS);
+        build(&resolution, &t(100)).http_routes.remove(0).1
+    }
+
+    fn foreign_entry() -> HttpRouteStatusParents {
+        HttpRouteStatusParents {
+            conditions: vec![condition(
+                "Accepted",
+                true,
+                "Accepted",
+                "theirs",
+                Some(1),
+                &t(1),
+            )],
+            controller_name: "other.io/controller".into(),
+            parent_ref: HttpRouteStatusParentsParentRef {
+                name: "their-gw".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn an_attached_route_is_accepted_with_resolved_refs() {
+        let state = route_state(vec![backend_ref("echo", Some(8080))]);
+        let status = route_status(&state);
+
+        assert_eq!(status.parents.len(), 1);
+        let entry = &status.parents[0];
+        assert_eq!(entry.controller_name, OURS);
+        assert_eq!(entry.parent_ref.name, "gw");
+        let accepted = find(&entry.conditions, "Accepted");
+        assert_eq!(accepted.status, "True");
+        assert_eq!(accepted.observed_generation, Some(2));
+        assert_eq!(find(&entry.conditions, "ResolvedRefs").status, "True");
+    }
+
+    #[test]
+    fn a_parent_ref_to_a_gateway_we_do_not_own_gets_no_entry() {
+        let mut state = route_state(vec![backend_ref("echo", Some(8080))]);
+        state.http_routes[0].spec.parent_refs.as_mut().unwrap()[0].name = "elsewhere".into();
+        let parents = route_status(&state).parents;
+        assert!(parents.is_empty(), "{parents:?}");
+    }
+
+    #[test]
+    fn an_unmatched_section_name_is_no_matching_parent() {
+        let mut state = route_state(vec![backend_ref("echo", Some(8080))]);
+        state.http_routes[0].spec.parent_refs.as_mut().unwrap()[0].section_name =
+            Some("https".into());
+
+        let status = route_status(&state);
+        let entry = &status.parents[0];
+        assert_eq!(entry.parent_ref.section_name.as_deref(), Some("https"));
+        let accepted = find(&entry.conditions, "Accepted");
+        assert_eq!(accepted.status, "False");
+        assert_eq!(accepted.reason, "NoMatchingParent");
+        assert!(
+            accepted.message.contains("\"https\""),
+            "{}",
+            accepted.message
+        );
+    }
+
+    #[test]
+    fn disjoint_hostnames_are_no_matching_listener_hostname() {
+        let mut state = route_state(vec![backend_ref("echo", Some(8080))]);
+        state.gateways[0].spec.listeners[0].hostname = Some("a.example".into());
+        state.http_routes[0].spec.hostnames = Some(vec!["b.example".into()]);
+
+        let status = route_status(&state);
+        let accepted = find(&status.parents[0].conditions, "Accepted");
+        assert_eq!(accepted.status, "False");
+        assert_eq!(accepted.reason, "NoMatchingListenerHostname");
+        assert!(
+            accepted.message.contains("b.example"),
+            "{}",
+            accepted.message
+        );
+    }
+
+    #[test]
+    fn each_unresolved_backend_ref_has_its_reason() {
+        let mut headless = echo_service();
+        headless.metadata.name = Some("headless".into());
+        headless.spec.as_mut().unwrap().cluster_ip = Some("None".into());
+        let gateway_backend = |port| HttpRouteRulesBackendRefs {
+            group: Some("gateway.linkerd.io".into()),
+            kind: Some("GatewayBackend".into()),
+            ..backend_ref("missing", port)
+        };
+
+        for (backend, reason, mentions) in [
+            (
+                backend_ref("gone", Some(8080)),
+                "BackendNotFound",
+                "demo/gone:8080",
+            ),
+            (
+                backend_ref("headless", Some(8080)),
+                "BackendNotFound",
+                "cluster IP",
+            ),
+            (
+                gateway_backend(None),
+                "BackendNotFound",
+                "GatewayBackend demo/missing",
+            ),
+            (
+                HttpRouteRulesBackendRefs {
+                    namespace: Some("other".into()),
+                    ..backend_ref("echo", Some(8080))
+                },
+                "RefNotPermitted",
+                "other/echo",
+            ),
+            (backend_ref("echo", None), "UnsupportedValue", "no port"),
+            (
+                gateway_backend(Some(443)),
+                "UnsupportedValue",
+                "must not set a port",
+            ),
+            (
+                HttpRouteRulesBackendRefs {
+                    group: Some("example.io".into()),
+                    kind: Some("Pool".into()),
+                    ..backend_ref("pool", None)
+                },
+                "InvalidKind",
+                "example.io/Pool backendRef demo/pool is not claimed",
+            ),
+        ] {
+            let mut state = route_state(vec![backend]);
+            state.services.push(headless.clone());
+            let status = route_status(&state);
+            let entry = &status.parents[0];
+            assert_eq!(find(&entry.conditions, "Accepted").status, "True");
+            let refs = find(&entry.conditions, "ResolvedRefs");
+            assert_eq!(refs.status, "False");
+            assert_eq!(refs.reason, reason, "{}", refs.message);
+            assert!(refs.message.contains(mentions), "{}", refs.message);
+        }
+    }
+
+    #[test]
+    fn resolved_refs_lists_every_failure_under_the_first_reason() {
+        let state = route_state(vec![
+            backend_ref("echo", Some(8080)),
+            backend_ref("gone", Some(8080)),
+            backend_ref("echo", None),
+        ]);
+        let status = route_status(&state);
+        let refs = find(&status.parents[0].conditions, "ResolvedRefs");
+        assert_eq!(refs.reason, "BackendNotFound");
+        assert_eq!(
+            refs.message,
+            "rules[0]: Service demo/gone:8080 not found; \
+             rules[0]: Service backendRef demo/echo has no port"
+        );
+    }
+
+    #[test]
+    fn route_reconcile_keeps_foreign_entries_and_replaces_ours() {
+        let state = route_state(vec![backend_ref("echo", Some(8080))]);
+        let desired = route_status(&state);
+        let mut old_entry = desired.parents[0].clone();
+        old_entry.parent_ref.name = "old-gw".into();
+        let observed = HttpRouteStatus {
+            parents: vec![old_entry, foreign_entry()],
+        };
+
+        let written = reconcile_http_route_status(desired.clone(), Some(&observed), OURS)
+            .expect("our entry changed");
+        assert_eq!(
+            written.parents,
+            vec![foreign_entry(), desired.parents[0].clone()]
+        );
+    }
+
+    #[test]
+    fn route_reconcile_skips_unchanged_entries_in_any_order() {
+        let state = route_state(vec![backend_ref("echo", Some(8080))]);
+        let observed = HttpRouteStatus {
+            parents: vec![route_status(&state).parents.remove(0), foreign_entry()],
+        };
+        let resolution = resolve(&state, OURS);
+        let desired = build(&resolution, &t(200)).http_routes.remove(0).1;
+        assert_eq!(
+            reconcile_http_route_status(desired, Some(&observed), OURS),
+            None
+        );
+    }
+
+    #[test]
+    fn work_clears_our_entry_from_a_detached_route_and_skips_unrelated_ones() {
+        let mut state = route_state(vec![backend_ref("echo", Some(8080))]);
+        state.http_routes[0].spec.parent_refs = None;
+        let mut unrelated = state.http_routes[0].clone();
+        unrelated.metadata.name = Some("unrelated".into());
+        unrelated.status = Some(HttpRouteStatus {
+            parents: vec![foreign_entry()],
+        });
+        let mut ours = foreign_entry();
+        ours.controller_name = OURS.into();
+        state.http_routes[0].status = Some(HttpRouteStatus {
+            parents: vec![ours, foreign_entry()],
+        });
+        state.http_routes.push(unrelated);
+
+        let resolution = resolve(&state, OURS);
+        let work = build_work(&resolution, &t(100));
+        assert_eq!(work.controller_name, OURS);
+        assert_eq!(
+            work.http_routes.len(),
+            1,
+            "the unrelated route is left alone"
+        );
+        let (observed, desired) = &work.http_routes[0];
+        let written = reconcile_http_route_status(desired.clone(), observed.status.as_ref(), OURS)
+            .expect("our stale entry is removed");
+        assert_eq!(written.parents, vec![foreign_entry()]);
     }
 }
