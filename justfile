@@ -89,5 +89,33 @@ down:
     docker rm -f cloud-provider-kind 2>/dev/null || true
     kind delete cluster --name {{CLUSTER}}
 
+# Print a cluster summary and collect logs after a failed e2e run:
+# kind's node and pod logs under /tmp/kind-logs, cloud-provider-kind's
+# under /tmp/e2e-logs/cloud-provider-kind. Every step is best-effort;
+# one missing piece must not hide the rest.
+[group('e2e')]
+diagnostics:
+    #!/usr/bin/env bash
+    kubectl get pods -A -o wide
+    kubectl get gateway,httproute -A
+    # Every replica serves data planes, so every replica's log matters,
+    # not just the one `logs deployment/...` would pick.
+    kubectl -n gateway-system logs -l app=gateway-cp --prefix --tail=200
+    kind export logs /tmp/kind-logs --name {{CLUSTER}}
+    # cloud-provider-kind and its per-Service Envoy containers run
+    # beside the cluster, so `kind export logs` misses them. The Envoys
+    # of deleted Services were saved by cloud-provider-kind itself
+    # (`up` enables its log dumping).
+    cpk=/tmp/e2e-logs/cloud-provider-kind
+    mkdir -p "$cpk/live"
+    docker logs cloud-provider-kind > "$cpk/cloud-provider-kind.log" 2>&1
+    docker ps -a --format '{{{{.Names}}\t{{{{.Status}}\t{{{{.Label "io.x-k8s.cloud-provider-kind.loadbalancer.name"}}' > "$cpk/containers.txt"
+    docker network inspect kind > "$cpk/network.json"
+    for c in $(docker ps -a --filter name=kindccm- --format '{{{{.Names}}'); do
+        docker logs "$c" > "$cpk/live/$c.log" 2>&1
+    done
+    cp -r {{CPK_LOG_DIR}} "$cpk/deleted"
+    exit 0
+
 [group('e2e')]
 ci: up test-e2e down

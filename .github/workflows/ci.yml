@@ -72,24 +72,7 @@ jobs:
           E2E_LOG_DIR: /tmp/e2e-logs/namespaces
       - name: Diagnostics
         if: failure()
-        run: |
-          kubectl get pods -A -o wide || true
-          kubectl get gateway,httproute -A || true
-          kubectl -n gateway-system logs deployment/gateway-cp --tail=200 || true
-          kind export logs /tmp/kind-logs --name gateway-e2e || true
-          # cloud-provider-kind and its per-Service Envoy containers run
-          # beside the cluster, so `kind export logs` misses them. The
-          # Envoys of deleted Services were saved by cloud-provider-kind
-          # itself (`just up` enables its log dumping).
-          cpk=/tmp/e2e-logs/cloud-provider-kind
-          mkdir -p "$cpk/live"
-          docker logs cloud-provider-kind > "$cpk/cloud-provider-kind.log" 2>&1 || true
-          docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Label "io.x-k8s.cloud-provider-kind.loadbalancer.name"}}' > "$cpk/containers.txt" || true
-          docker network inspect kind > "$cpk/network.json" || true
-          for c in $(docker ps -a --filter name=kindccm- --format '{{.Names}}'); do
-            docker logs "$c" > "$cpk/live/$c.log" 2>&1 || true
-          done
-          cp -r /tmp/cloud-provider-kind-logs "$cpk/deleted" || true
+        run: just diagnostics
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
