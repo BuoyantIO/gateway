@@ -6,8 +6,9 @@
 //! the same way an external client finds the gateway. All e2e
 //! listeners bind port 80, so URLs carry the bare address.
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use http::StatusCode;
@@ -90,8 +91,69 @@ impl Driver {
     }
 }
 
+/// Every outcome a wait loop saw before giving up, grouped by what
+/// happened, in first-seen order.
+///
+/// A timeout used to report only the last status and the last error,
+/// which hides the sequence that tells the failures apart: "503, then
+/// resets from then on" is a path that worked and broke, while "resets
+/// throughout" is one that never worked.
+struct Attempts {
+    started: Instant,
+    outcomes: Vec<Outcome>,
+}
+
+struct Outcome {
+    what: String,
+    count: u32,
+    first: Duration,
+    last: Duration,
+}
+
+impl Attempts {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            outcomes: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, what: String) {
+        let at = self.started.elapsed();
+        if let Some(o) = self.outcomes.iter_mut().find(|o| o.what == what) {
+            o.count += 1;
+            o.last = at;
+        } else {
+            self.outcomes.push(Outcome {
+                what,
+                count: 1,
+                first: at,
+                last: at,
+            });
+        }
+    }
+}
+
+impl fmt::Display for Attempts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let total: u32 = self.outcomes.iter().map(|o| o.count).sum();
+        write!(f, "after {total} unexpected outcome(s):")?;
+        for o in &self.outcomes {
+            write!(
+                f,
+                "\n  {}x between +{:.1}s and +{:.1}s: {}",
+                o.count,
+                o.first.as_secs_f64(),
+                o.last.as_secs_f64(),
+                o.what
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Poll the gateway until a GET for `(host, path)` returns
-/// `expected_status`. Retries with backoff for up to ~30 seconds.
+/// `expected_status`. Retries with backoff until [`WAIT_DEADLINE`].
 ///
 /// # Errors
 /// Returns an error if the gateway doesn't reach the expected state
@@ -103,20 +165,19 @@ pub async fn wait_until_routed(
     expected_status: StatusCode,
 ) -> Result<reqwest::Response> {
     let driver = Driver::new(gateway_addr);
-    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
+    let mut attempts = Attempts::new();
+    let deadline = attempts.started + WAIT_DEADLINE;
     let mut backoff = Duration::from_millis(250);
-    let mut last_seen: Option<StatusCode> = None;
-    let mut last_err: Option<String> = None;
     loop {
         match driver.get(host, path, HeaderMap::new()).await {
             Ok(resp) if resp.status() == expected_status => return Ok(resp),
-            Ok(resp) => last_seen = Some(resp.status()),
-            Err(e) => last_err = Some(format!("{e:#}")),
+            Ok(resp) => attempts.record(resp.status().to_string()),
+            Err(e) => attempts.record(format!("error: {e:#}")),
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_routed timed out: host={host} path={path} \
-                 wanted={expected_status} last_seen={last_seen:?} last_err={last_err:?}"
+                 wanted={expected_status} {attempts}"
             );
         }
         tokio::time::sleep(backoff).await;
@@ -146,10 +207,9 @@ pub async fn wait_until_redirected(
         .build()
         .context("building no-redirect reqwest client")?;
     let url = format!("http://{gateway_addr}{path}");
-    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
+    let mut attempts = Attempts::new();
+    let deadline = attempts.started + WAIT_DEADLINE;
     let mut backoff = Duration::from_millis(250);
-    let mut last_seen: Option<StatusCode> = None;
-    let mut last_err: Option<String> = None;
     loop {
         match client
             .get(&url)
@@ -158,13 +218,13 @@ pub async fn wait_until_redirected(
             .await
         {
             Ok(resp) if resp.status() == expected_status => return Ok(resp),
-            Ok(resp) => last_seen = Some(resp.status()),
-            Err(e) => last_err = Some(format!("{e:#}")),
+            Ok(resp) => attempts.record(resp.status().to_string()),
+            Err(e) => attempts.record(format!("error: {e:#}")),
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_redirected timed out: host={host} path={path} \
-                 wanted={expected_status} last_seen={last_seen:?} last_err={last_err:?}"
+                 wanted={expected_status} {attempts}"
             );
         }
         tokio::time::sleep(backoff).await;
@@ -207,20 +267,19 @@ pub async fn wait_until_routed_tls(
 ) -> Result<reqwest::Response> {
     let client = tls_client(host, gateway_addr)?;
     let url = format!("https://{host}:80{path}");
-    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
+    let mut attempts = Attempts::new();
+    let deadline = attempts.started + WAIT_DEADLINE;
     let mut backoff = Duration::from_millis(250);
-    let mut last_seen: Option<StatusCode> = None;
-    let mut last_err: Option<String> = None;
     loop {
         match client.get(&url).send().await {
             Ok(resp) if resp.status() == expected_status => return Ok(resp),
-            Ok(resp) => last_seen = Some(resp.status()),
-            Err(e) => last_err = Some(format!("{e:#}")),
+            Ok(resp) => attempts.record(resp.status().to_string()),
+            Err(e) => attempts.record(format!("error: {e:#}")),
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             anyhow::bail!(
                 "wait_until_routed_tls timed out: host={host} path={path} \
-                 wanted={expected_status} last_seen={last_seen:?} last_err={last_err:?}"
+                 wanted={expected_status} {attempts}"
             );
         }
         tokio::time::sleep(backoff).await;
@@ -282,7 +341,7 @@ pub async fn post_sse(
     take: Option<u64>,
 ) -> Result<Sse> {
     let url = format!("http://{gateway_addr}{path}");
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let resp = stream_client()?
         .post(&url)
         .header(reqwest::header::HOST, host)
@@ -324,4 +383,24 @@ pub async fn post_sse(
         sse.body.push_str(&String::from_utf8_lossy(&frame));
     }
     Ok(sse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempts_group_repeats_in_first_seen_order() {
+        let mut attempts = Attempts::new();
+        attempts.record("503 Service Unavailable".into());
+        attempts.record("error: reset".into());
+        attempts.record("error: reset".into());
+
+        let report = attempts.to_string();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(lines[0], "after 3 unexpected outcome(s):");
+        assert!(lines[1].starts_with("  1x ") && lines[1].ends_with(": 503 Service Unavailable"));
+        assert!(lines[2].starts_with("  2x ") && lines[2].ends_with(": error: reset"));
+        assert_eq!(lines.len(), 3);
+    }
 }
