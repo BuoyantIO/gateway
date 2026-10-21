@@ -94,12 +94,22 @@ jobs:
                DP_IMAGE_TAG="${{ needs.meta.outputs.version }}" \
                up
           just test-e2e
+        env:
+          # Each test saves its namespace's pod logs and events here
+          # before deleting the namespace.
+          E2E_LOG_DIR: /tmp/e2e-logs/namespaces
       - name: Diagnostics
         if: failure()
-        run: |
-          kubectl get pods -A -o wide || true
-          kubectl get gateway,httproute -A || true
-          kubectl -n gateway-system logs deployment/gateway-cp --tail=200 || true
+        run: just diagnostics
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kind-logs
+          path: |
+            /tmp/kind-logs
+            /tmp/e2e-logs
+          retention-days: 3
       - name: Save images
         if: ${{ needs.meta.outputs.is_release == 'true' }}
         run: |
