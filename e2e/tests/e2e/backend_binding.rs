@@ -3,12 +3,13 @@
 //! and states what it resolves to: a route referencing the claimed
 //! kind serves through the binding's backends with the binding's
 //! extensions in the chain, an unclaimed foreign ref answers 500,
-//! and duplicate claims resolve nothing.
+//! duplicate claims resolve nothing, and an Extension in another
+//! namespace is used only once it admits the binding's.
 
 use std::time::Duration;
 
 use anyhow::Result;
-use gateway_cp::crd::BackendBinding;
+use gateway_cp::crd::{BackendBinding, Extension};
 use gateway_e2e::fixtures::{
     apply_backend_binding, apply_extension, apply_gateway, apply_http_route, backend_binding,
     delete_backend_binding, extension, update_backend_binding_spec,
@@ -16,6 +17,7 @@ use gateway_e2e::fixtures::{
 use gateway_e2e::{Scope, deploy_echo, gateway, gateway_address, http_route, wait_until_routed};
 use http::StatusCode;
 use kube::Api;
+use kube::api::{Patch, PatchParams};
 use serde_json::json;
 
 const CLAIM: (&str, &str, &str) = ("kinference.buoyant.io", "InferencePool", "pool");
@@ -189,6 +191,73 @@ async fn conflicting_claims_show_on_both_bindings() -> Result<()> {
     assert_eq!(reason, "Conflicted");
     let reason = wait_for_condition(&bindings, "second", "Accepted", "False").await?;
     assert_eq!(reason, "Conflicted");
+    Ok(())
+}
+
+/// A binding listing an Extension from another namespace is refused
+/// while that Extension admits only its own, and its claimed ref
+/// answers 500 rather than serving without the extension. Admitting
+/// all namespaces heals it.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires kind cluster — run via `just test-e2e`"]
+async fn a_cross_namespace_extension_serves_only_with_its_consent() -> Result<()> {
+    let scope = Scope::new("binding").await?;
+    let owner = Scope::new("binding-ext").await?;
+    let ns = scope.name();
+    let ext_ns = owner.name();
+    let client = scope.client();
+    let bindings: Api<BackendBinding> = Api::namespaced(client.clone(), ns);
+
+    deploy_echo(client, ns, "echo", None).await?;
+    apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
+    apply_extension(
+        client,
+        &extension(
+            ext_ns,
+            "mark",
+            "request_header_modifier",
+            json!({ "add": [{ "name": "x-test-bound", "value": "via-other-ns" }] }),
+        ),
+    )
+    .await?;
+    let ext_ref = format!("{ext_ns}/mark");
+    apply_backend_binding(
+        client,
+        &backend_binding(ns, "pool", CLAIM, &[("workers", "echo", 8080)], &[&ext_ref]),
+    )
+    .await?;
+    apply_http_route(
+        client,
+        &http_route(ns, "gw", "route")
+            .hostnames(["app.example"])
+            .path_prefix("/")
+            .foreign_backend(CLAIM.0, CLAIM.1, CLAIM.2)
+            .build(),
+    )
+    .await?;
+
+    let reason = wait_for_condition(&bindings, "pool", "Accepted", "False").await?;
+    assert_eq!(reason, "RefNotPermitted");
+    wait_until_routed(&addr, "app.example", "/", StatusCode::INTERNAL_SERVER_ERROR).await?;
+
+    Api::<Extension>::namespaced(client.clone(), ext_ns)
+        .patch(
+            "mark",
+            &PatchParams::default(),
+            &Patch::Merge(json!({
+                "spec": { "allowedReferences": { "namespaces": { "from": "All" } } },
+            })),
+        )
+        .await?;
+
+    wait_for_condition(&bindings, "pool", "Accepted", "True").await?;
+    let resp = wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
+    assert_eq!(
+        resp.headers().get("x-echo-bound").unwrap(),
+        "via-other-ns",
+        "the admitted extension must run ahead of the rule"
+    );
     Ok(())
 }
 
