@@ -3571,6 +3571,7 @@ mod tests {
                 request_body: Some(crate::crd::RequestBodyLimit::Stream),
                 max_buffer_bytes: None,
             },
+            allowed_references: crate::crd::AllowedReferences::default(),
             config: serde_json::json!({ "add": [ { "name": "x-a", "value": "1" } ] }),
         };
         let mut ext = crate::crd::Extension::new(name, spec);

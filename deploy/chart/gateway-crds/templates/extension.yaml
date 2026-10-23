@@ -55,6 +55,23 @@ spec:
                       type: integer
                       format: int64
                       minimum: 1
+                allowedReferences:
+                  description: >-
+                    Which BackendBindings outside this object's
+                    namespace may list it. Its own namespace is always
+                    admitted.
+                  type: object
+                  properties:
+                    namespaces:
+                      type: object
+                      properties:
+                        from:
+                          description: >-
+                            Same admits only this namespace; All
+                            admits every namespace.
+                          type: string
+                          enum: [Same, All]
+                          default: Same
                 config:
                   description: >-
                     Opaque class config, handed to the class verbatim.

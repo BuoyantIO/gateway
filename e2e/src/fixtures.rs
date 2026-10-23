@@ -22,9 +22,10 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
 use gateway_cp::crd::{
-    ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding, BackendBindingSpec, BackendTls,
-    BindingBackendRef, BindingObjectReference, Claim, Extension, ExtensionSpec, FailureMode,
-    GatewayBackend, GatewayBackendSpec, Limits, LocalSecretReference, SecretKeyReference,
+    AllowedReferences, ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding,
+    BackendBindingSpec, BackendTls, BindingBackendRef, BindingObjectReference, Claim, Extension,
+    ExtensionSpec, FailureMode, GatewayBackend, GatewayBackendSpec, Limits, LocalSecretReference,
+    SecretKeyReference,
 };
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
@@ -900,6 +901,7 @@ pub fn extension(ns: &str, name: &str, class: &str, config: serde_json::Value) -
             class: class.into(),
             failure_mode: FailureMode::default(),
             limits: Limits::default(),
+            allowed_references: AllowedReferences::default(),
             config,
         },
     );
