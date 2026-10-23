@@ -1,6 +1,9 @@
 //! `Extension` is a filter implementation a route names. Typed fields
 //! are the ones the gateway host acts on; `config` is opaque and
-//! belongs to the class.
+//! belongs to the class. Its config may carry material its owner
+//! doesn't mean to share, such as a header holding a credential, so
+//! a binding in another namespace may use it only if
+//! `allowedReferences` admits that namespace.
 //!
 //! `GatewayBackend` is a destination outside the cluster, named by a
 //! route's `backendRefs` where a Service would otherwise go. It says
@@ -300,11 +303,20 @@ pub struct BackendBindingSpec {
     pub claim: Claim,
     /// What the claimed ref resolves to.
     pub backend_refs: Vec<BindingBackendRef>,
-    /// `Extension` objects in the binding's namespace, prepended in
-    /// order to the filter chain of any rule whose ref this binding
-    /// claims.
+    /// `Extension` objects prepended in order to the filter chain of
+    /// any rule whose ref this binding claims.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extensions: Vec<String>,
+    pub extensions: Vec<ExtensionReference>,
+}
+
+/// An `Extension` a binding prepends.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct ExtensionReference {
+    pub name: String,
+    /// Absent is the binding's own. Any other namespace must be
+    /// admitted by the Extension's `allowedReferences`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// The (group, kind, name) of a backendRef, held as opaque strings.
@@ -422,7 +434,10 @@ mod tests {
                     },
                 },
             ],
-            "extensions": ["pool-picker"],
+            "extensions": [
+                { "name": "pool-picker" },
+                { "name": "chat-picker", "namespace": "kinference" },
+            ],
         });
         let spec: BackendBindingSpec = serde_json::from_value(raw.clone()).expect("valid spec");
         assert_eq!(spec.claim.kind, "InferencePool");
@@ -437,7 +452,8 @@ mod tests {
             spec.backend_refs[1].target.namespace.as_deref(),
             Some("egress")
         );
-        assert_eq!(spec.extensions, vec!["pool-picker"]);
+        assert_eq!(spec.extensions[0].namespace, None);
+        assert_eq!(spec.extensions[1].namespace.as_deref(), Some("kinference"));
         assert_eq!(serde_json::to_value(&spec).unwrap(), raw);
     }
 

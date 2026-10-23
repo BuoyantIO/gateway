@@ -98,21 +98,33 @@ spec:
                             maximum: 65535
                 extensions:
                   description: >-
-                    Extension objects in the binding's namespace,
-                    prepended in order to the filter chain of any rule
-                    whose ref this binding claims.
+                    Extension objects prepended in order to the filter
+                    chain of any rule whose ref this binding claims.
                   type: array
                   items:
-                    type: string
-                    minLength: 1
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                        minLength: 1
+                      namespace:
+                        description: >-
+                          Absent is the binding's own. Any other
+                          namespace must be admitted by the
+                          Extension's allowedReferences, or the
+                          binding is not accepted.
+                        type: string
+                        minLength: 1
             status:
               type: object
               properties:
                 conditions:
                   description: >-
                     Accepted says the spec itself can stand in for a
-                    ref: the claim is complete and every target is of
-                    a native kind.
+                    ref: the claim is complete, every target is of a
+                    native kind, and every Extension it lists from
+                    another namespace admits it.
                   type: array
                   items:
                     type: object
