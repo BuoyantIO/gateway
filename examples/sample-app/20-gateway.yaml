@@ -3,10 +3,6 @@ kind: Gateway
 metadata:
   name: api-gateway
   namespace: demo
-  annotations:
-    # The provisioned Service defaults to LoadBalancer; the demo is
-    # driven via port-forward, so ClusterIP is enough.
-    gateway.buoyant.io/service-type: ClusterIP
 spec:
   gatewayClassName: buoyant-gateway
   listeners:

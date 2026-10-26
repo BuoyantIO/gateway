@@ -23,7 +23,7 @@ And then deploy the Gateway CR and retrieve the gateway's IP, used in the tests
 further down below:
 
 ```bash
-kubectl --context kind-gateway-e2e apply -f examples/gateway.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/gateway.yml
 # Wait a little bit until the IP is provisioned
 GW=$(kubectl --context kind-gateway-e2e -n default get svc llm-gw-gatewayd -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 ```
@@ -130,7 +130,7 @@ Now back into the current repo, deploy the HTTPRoute pointing to the `smoke`
 InferencePool:
 
 ```bash
-kubectl --context kind-gateway-e2e apply -f examples/httproute-smoke.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/httproute-smoke.yml
 ```
 
 And test the traffic with:
@@ -155,15 +155,15 @@ And back into the current repo, apply the following manifests:
 
 ```bash
 # InferencePool pointing to the dummy and databricks destinations
-kubectl --context kind-gateway-e2e apply -f examples/inferencepool.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/inferencepool.yml
 # InferenceWorkerSet wrapping the dummy worker
-kubectl --context kind-gateway-e2e apply -f examples/inferenceworkerset-dummy.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/inferenceworkerset-dummy.yml
 # InferenceProvider wrapping the databricks gateway backend
-kubectl --context kind-gateway-e2e apply -f examples/inferenceprovider-databricks.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/inferenceprovider-databricks.yml
 # GatewayBackend providing URL and OAuth2 setup for Databricks
-envsubst < examples/gatewaybackend-databricks.yml | kubectl --context kind-gateway-e2e apply -f -
+envsubst < examples/kinference/gatewaybackend-databricks.yml | kubectl --context kind-gateway-e2e apply -f -
 # InferencePolicy for load-balancing between the dummy worker and the Databricks instance
-kubectl --context kind-gateway-e2e apply -f examples/inferencepolicy-split.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/inferencepolicy-split.yml
 ```
 
 Set up the secret to authenticate against Databricks:
@@ -177,7 +177,7 @@ kubectl -n default create secret generic databricks-oauth --from-literal=client-
 Deploy the HTTPRoute pointing to the `inference-all` InferencePool:
 
 ```bash
-kubectl --context kind-gateway-e2e apply -f examples/httproute-all.yml
+kubectl --context kind-gateway-e2e apply -f examples/kinference/httproute-all.yml
 ```
 
 Repeat this request a few times; it should land on the local vLLM about half
