@@ -42,6 +42,15 @@ helm upgrade --install gateway deploy/chart/gateway \
     --set dataPlane.image.tag=latest
 ```
 
+## Multi-arch build
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile \
+    -t gateway-data-plane:latest .
+docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.cp \
+    -t gateway-control-plane:latest .
+```
+
 ## Deploy an example
 
 Applying the `Gateway` makes the control plane provision a gatewayd

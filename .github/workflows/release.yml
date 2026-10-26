@@ -64,14 +64,45 @@ jobs:
       is_release: ${{ steps.release.outputs.is_release }}
       version: ${{ steps.version.outputs.version }}
 
-  # The publish gate: build the release-named images, install the chart
-  # from source pointing at them, and run the full e2e suite. Nothing is
-  # pushed unless this job is green. The tested image bytes are handed
-  # to the publish job as an artifact, so what is pushed is exactly what
-  # was tested.
-  test:
+  # Build the release-named images once, for both platforms, as OCI
+  # archives. Each test leg runs e2e against its own platform's image
+  # from them, and publish pushes them unchanged, so the pushed
+  # manifests are exactly the ones tested.
+  build:
     needs: meta
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Build images
+        run: |
+          version='${{ needs.meta.outputs.version }}'
+          mkdir -p /tmp/images
+          docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.cp \
+            -t "$DOCKER_REGISTRY/gateway-cp:$version" \
+            -o type=oci,dest=/tmp/images/gateway-cp.tar .
+          docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile \
+            -t "$DOCKER_REGISTRY/gatewayd:$version" \
+            -o type=oci,dest=/tmp/images/gatewayd.tar .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gateway-images
+          path: /tmp/images
+          retention-days: 1
+
+  # The publish gate: on each platform, install the chart from source
+  # pointing at the build's images and run the full e2e suite. Nothing
+  # is pushed unless every leg is green.
+  test:
+    needs: [meta, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -86,13 +117,26 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           save-if: "false"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: gateway-images
+          path: /tmp/images
+      - name: Load images
+        run: |
+          version='${{ needs.meta.outputs.version }}'
+          for image in gateway-cp gatewayd; do
+            skopeo copy "oci-archive:/tmp/images/$image.tar" \
+              "docker-archive:/tmp/$image-docker.tar:$DOCKER_REGISTRY/$image:$version"
+            docker load -i "/tmp/$image-docker.tar"
+          done
       - name: E2E against release images
         run: |
-          just CP_IMAGE_REPO="$DOCKER_REGISTRY/gateway-cp" \
+          just --no-deps \
+               CP_IMAGE_REPO="$DOCKER_REGISTRY/gateway-cp" \
                CP_IMAGE_TAG="${{ needs.meta.outputs.version }}" \
                DP_IMAGE_REPO="$DOCKER_REGISTRY/gatewayd" \
                DP_IMAGE_TAG="${{ needs.meta.outputs.version }}" \
-               up
+               image-echo up
           just test-e2e
         env:
           # Each test saves its namespace's pod logs and events here
@@ -105,23 +149,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: kind-logs
+          name: kind-logs-${{ matrix.os }}
           path: |
             /tmp/kind-logs
             /tmp/e2e-logs
           retention-days: 3
-      - name: Save images
-        if: ${{ needs.meta.outputs.is_release == 'true' }}
-        run: |
-          docker save -o /tmp/gateway-images.tar \
-            "$DOCKER_REGISTRY/gateway-cp:${{ needs.meta.outputs.version }}" \
-            "$DOCKER_REGISTRY/gatewayd:${{ needs.meta.outputs.version }}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ needs.meta.outputs.is_release == 'true' }}
-        with:
-          name: gateway-images.tar
-          path: /tmp/gateway-images.tar
-          retention-days: 1
 
   publish:
     if: ${{ needs.meta.outputs.is_release == 'true' }}
@@ -134,18 +166,23 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: gateway-images.tar
-          path: /tmp
+          name: gateway-images
+          path: /tmp/images
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
         with:
           registry: ghcr.io
           username: buoyantio
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push images
+        # skopeo is preinstalled on ubuntu-24.04 and reads docker login's
+        # credentials. --preserve-digests fails rather than push anything
+        # but the tested manifests.
         run: |
-          docker load -i /tmp/gateway-images.tar
-          docker push "$DOCKER_REGISTRY/gateway-cp:${{ needs.meta.outputs.version }}"
-          docker push "$DOCKER_REGISTRY/gatewayd:${{ needs.meta.outputs.version }}"
+          version='${{ needs.meta.outputs.version }}'
+          for image in gateway-cp gatewayd; do
+            skopeo copy --all --preserve-digests "oci-archive:/tmp/images/$image.tar" \
+              "docker://$DOCKER_REGISTRY/$image:$version"
+          done
       - name: Publish charts
         # Both charts are versioned in lockstep: one release tag stamps
         # gateway-crds and gateway alike.
