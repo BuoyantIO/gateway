@@ -3571,6 +3571,7 @@ mod tests {
                 request_body: Some(crate::crd::RequestBodyLimit::Stream),
                 max_buffer_bytes: None,
             },
+            allowed_references: crate::crd::AllowedReferences::default(),
             config: serde_json::json!({ "add": [ { "name": "x-a", "value": "1" } ] }),
         };
         let mut ext = crate::crd::Extension::new(name, spec);
@@ -3722,6 +3723,7 @@ mod tests {
 
     /// A binding claiming `kinference.buoyant.io/InferencePool claim_name`,
     /// resolving to one Service target per (name, service, port).
+    /// An extension written `ns/name` names that namespace.
     fn binding(
         ns: &str,
         name: &str,
@@ -3748,7 +3750,19 @@ mod tests {
                     },
                 })
                 .collect(),
-            extensions: extensions.iter().map(|e| (*e).to_string()).collect(),
+            extensions: extensions
+                .iter()
+                .map(|e| match e.split_once('/') {
+                    Some((ns, name)) => crate::crd::ExtensionReference {
+                        name: name.into(),
+                        namespace: Some(ns.into()),
+                    },
+                    None => crate::crd::ExtensionReference {
+                        name: (*e).into(),
+                        namespace: None,
+                    },
+                })
+                .collect(),
         };
         let mut b = crate::crd::BackendBinding::new(name, spec);
         b.metadata.namespace = Some(ns.into());
@@ -3927,6 +3941,65 @@ mod tests {
             names,
             vec!["picker", "r~r0~f0", "user"],
             "prepended first; spec filters keep their positional names"
+        );
+    }
+
+    /// A route in `demo` through a binding listing `kinference/picker`,
+    /// with that Extension admitting references `from`.
+    fn cross_namespace_extension_state(from: crate::crd::FromNamespaces) -> K8sState {
+        let mut state = binding_state(vec![http_route(
+            "demo",
+            "r",
+            vec![parent_ref("api", Some("demo"), None)],
+            vec![rule(Some("/"), vec![foreign_ref("pool", None)], vec![])],
+        )]);
+        state.backend_bindings = vec![binding(
+            "demo",
+            "pool",
+            "pool",
+            &[("w", "workers", 8000)],
+            &["kinference/picker"],
+        )];
+        let mut picker = extension_object("kinference", "picker");
+        picker.spec.allowed_references.namespaces.from = from;
+        state.extensions = vec![picker];
+        state
+    }
+
+    #[test]
+    fn an_admitted_cross_namespace_extension_is_referenced_and_emitted() {
+        let state = cross_namespace_extension_state(crate::crd::FromNamespaces::All);
+
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        let pb::http_filter::Kind::ExtensionRef(er) =
+            route.filters[0].kind.as_ref().expect("kind set");
+        assert_eq!(
+            (er.namespace.as_str(), er.name.as_str()),
+            ("kinference", "picker")
+        );
+        assert!(
+            s.extensions
+                .contains_key(&ExtensionKey::new("kinference", "picker"))
+        );
+    }
+
+    #[test]
+    fn a_refused_cross_namespace_extension_is_never_emitted() {
+        let state = cross_namespace_extension_state(crate::crd::FromNamespaces::Same);
+
+        let out = translate(&state, OURS);
+        let s = out.get(&("demo".into(), "api".into())).unwrap();
+        let route = s.routes.values().next().unwrap();
+        assert!(route.filters.is_empty(), "{:?}", route.filters);
+        assert!(
+            s.extensions.is_empty(),
+            "the Extension's config must not reach this route's data plane"
+        );
+        assert_eq!(
+            route.backend_refs[0].name, "demo/pool~kinference.buoyant.io~InferencePool",
+            "the claimed ref answers 500"
         );
     }
 

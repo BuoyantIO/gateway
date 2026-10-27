@@ -22,9 +22,10 @@ use gateway_api::apis::standard::httproutes::{
     HttpRouteRulesMatchesQueryParamsType, HttpRouteSpec,
 };
 use gateway_cp::crd::{
-    ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding, BackendBindingSpec, BackendTls,
-    BindingBackendRef, BindingObjectReference, Claim, Extension, ExtensionSpec, FailureMode,
-    GatewayBackend, GatewayBackendSpec, Limits, LocalSecretReference, SecretKeyReference,
+    AllowedReferences, ApiKeyAuth, BackendAuth, BackendAuthType, BackendBinding,
+    BackendBindingSpec, BackendTls, BindingBackendRef, BindingObjectReference, Claim, Extension,
+    ExtensionReference, ExtensionSpec, FailureMode, GatewayBackend, GatewayBackendSpec, Limits,
+    LocalSecretReference, SecretKeyReference,
 };
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
@@ -900,6 +901,7 @@ pub fn extension(ns: &str, name: &str, class: &str, config: serde_json::Value) -
             class: class.into(),
             failure_mode: FailureMode::default(),
             limits: Limits::default(),
+            allowed_references: AllowedReferences::default(),
             config,
         },
     );
@@ -1007,7 +1009,8 @@ pub async fn apply_gateway_backend(client: &Client, object: &GatewayBackend) -> 
 
 /// A `BackendBinding` claiming `(group, kind, name)`, resolving to
 /// one Service ref per `(name, service, port)` entry, with
-/// `extensions` prepended to using rules. Empty `refs` builds the
+/// `extensions` prepended to using rules, each a bare name or
+/// `namespace/name`. Empty `refs` builds the
 /// spec the control plane rejects with `NoBackendRefs`.
 pub fn backend_binding(
     ns: &str,
@@ -1037,7 +1040,19 @@ pub fn backend_binding(
                     },
                 })
                 .collect(),
-            extensions: extensions.iter().map(|e| (*e).to_string()).collect(),
+            extensions: extensions
+                .iter()
+                .map(|e| match e.split_once('/') {
+                    Some((ns, name)) => ExtensionReference {
+                        name: name.into(),
+                        namespace: Some(ns.into()),
+                    },
+                    None => ExtensionReference {
+                        name: (*e).into(),
+                        namespace: None,
+                    },
+                })
+                .collect(),
         },
     );
     object.metadata.namespace = Some(ns.into());

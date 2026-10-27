@@ -1,6 +1,9 @@
 //! `Extension` is a filter implementation a route names. Typed fields
 //! are the ones the gateway host acts on; `config` is opaque and
-//! belongs to the class.
+//! belongs to the class. Its config may carry material its owner
+//! doesn't mean to share, such as a header holding a credential, so
+//! a binding in another namespace may use it only if
+//! `allowedReferences` admits that namespace.
 //!
 //! `GatewayBackend` is a destination outside the cluster, named by a
 //! route's `backendRefs` where a Service would otherwise go. It says
@@ -33,6 +36,8 @@ pub struct ExtensionSpec {
     pub failure_mode: FailureMode,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub allowed_references: AllowedReferences,
     /// Handed to the class verbatim; the gateway never reads a key
     /// inside it. The schema is the class's contract.
     #[serde(default)]
@@ -56,6 +61,29 @@ pub struct Limits {
     pub request_body: Option<RequestBodyLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_buffer_bytes: Option<u64>,
+}
+
+/// Which `BackendBinding`s outside this object's namespace may list
+/// it. Its own namespace is always admitted.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct AllowedReferences {
+    #[serde(default)]
+    pub namespaces: ReferenceNamespaces,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct ReferenceNamespaces {
+    #[serde(default)]
+    pub from: FromNamespaces,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum FromNamespaces {
+    /// Only bindings in the Extension's own namespace.
+    #[default]
+    Same,
+    /// Bindings in any namespace.
+    All,
 }
 
 /// The request-body modes an operator may grant.
@@ -275,11 +303,20 @@ pub struct BackendBindingSpec {
     pub claim: Claim,
     /// What the claimed ref resolves to.
     pub backend_refs: Vec<BindingBackendRef>,
-    /// `Extension` objects in the binding's namespace, prepended in
-    /// order to the filter chain of any rule whose ref this binding
-    /// claims.
+    /// `Extension` objects prepended in order to the filter chain of
+    /// any rule whose ref this binding claims.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extensions: Vec<String>,
+    pub extensions: Vec<ExtensionReference>,
+}
+
+/// An `Extension` a binding prepends.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct ExtensionReference {
+    pub name: String,
+    /// Absent is the binding's own. Any other namespace must be
+    /// admitted by the Extension's `allowedReferences`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// The (group, kind, name) of a backendRef, held as opaque strings.
@@ -364,6 +401,21 @@ mod tests {
         assert_eq!(spec.failure_mode, FailureMode::Open);
         assert_eq!(spec.limits.request_body, Some(RequestBodyLimit::Stream));
         assert_eq!(spec.config["pool"]["namespace"], "inference");
+        assert_eq!(
+            spec.allowed_references.namespaces.from,
+            FromNamespaces::Same,
+            "an Extension admits only its own namespace unless it says otherwise"
+        );
+    }
+
+    #[test]
+    fn allowed_references_parse() {
+        let raw = serde_json::json!({
+            "class": "kinference_selector",
+            "allowedReferences": { "namespaces": { "from": "All" } },
+        });
+        let spec: ExtensionSpec = serde_json::from_value(raw).expect("valid spec");
+        assert_eq!(spec.allowed_references.namespaces.from, FromNamespaces::All);
     }
 
     #[test]
@@ -382,7 +434,10 @@ mod tests {
                     },
                 },
             ],
-            "extensions": ["pool-picker"],
+            "extensions": [
+                { "name": "pool-picker" },
+                { "name": "chat-picker", "namespace": "kinference" },
+            ],
         });
         let spec: BackendBindingSpec = serde_json::from_value(raw.clone()).expect("valid spec");
         assert_eq!(spec.claim.kind, "InferencePool");
@@ -397,7 +452,8 @@ mod tests {
             spec.backend_refs[1].target.namespace.as_deref(),
             Some("egress")
         );
-        assert_eq!(spec.extensions, vec!["pool-picker"]);
+        assert_eq!(spec.extensions[0].namespace, None);
+        assert_eq!(spec.extensions[1].namespace.as_deref(), Some("kinference"));
         assert_eq!(serde_json::to_value(&spec).unwrap(), raw);
     }
 

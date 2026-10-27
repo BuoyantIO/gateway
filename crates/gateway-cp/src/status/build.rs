@@ -387,7 +387,8 @@ fn gateway_backend_status(br: &GatewayBackendResolution<'_>, now: &Time) -> Gate
 }
 
 /// One condition, `Accepted`: can this spec stand in for a claimed
-/// ref, and is it the claim's only claimant. Whether the targets it
+/// ref, is it the claim's only claimant, and does every Extension it
+/// lists from another namespace admit it. Whether the targets it
 /// names exist is decided where they are resolved and not reported
 /// here yet.
 fn backend_binding_status(bb: &BackendBindingResolution<'_>, now: &Time) -> BackendBindingStatus {
@@ -397,6 +398,9 @@ fn backend_binding_status(bb: &BackendBindingResolution<'_>, now: &Time) -> Back
             (true, "Accepted", "binding is accepted".to_string())
         }
         BackendBindingOutcome::Conflicted { message } => (false, "Conflicted", message.clone()),
+        BackendBindingOutcome::RefNotPermitted { message } => {
+            (false, "RefNotPermitted", message.clone())
+        }
         BackendBindingOutcome::Invalid { reason, message } => (false, *reason, message.clone()),
     };
     BackendBindingStatus {
@@ -1259,6 +1263,34 @@ mod tests {
             "the message names the other claimant: {}",
             accepted.message
         );
+    }
+
+    #[test]
+    fn a_binding_refused_by_an_extension_is_not_accepted() {
+        let mut object = binding_object(vec![service_binding_ref()]);
+        object.spec.extensions = vec![crate::crd::ExtensionReference {
+            name: "picker".into(),
+            namespace: Some("kinference".into()),
+        }];
+        let mut picker = crate::crd::Extension::new(
+            "picker",
+            crate::crd::ExtensionSpec {
+                class: "kinference_selector".into(),
+                failure_mode: crate::crd::FailureMode::default(),
+                limits: crate::crd::Limits::default(),
+                allowed_references: crate::crd::AllowedReferences::default(),
+                config: serde_json::Value::Null,
+            },
+        );
+        picker.metadata.namespace = Some("kinference".into());
+        let mut state = fixture_state();
+        state.extensions = vec![picker];
+        state.backend_bindings = vec![object];
+
+        let status = binding_status(&state);
+        let accepted = find(&status.conditions, "Accepted");
+        assert_eq!(accepted.status, "False");
+        assert_eq!(accepted.reason, "RefNotPermitted");
     }
 
     // ---------- HTTPRoute ----------

@@ -424,6 +424,11 @@ pub enum BackendBindingOutcome<'a> {
     /// every claimant is conflicted, whatever the arrival order, and
     /// none resolves. `message` names the others.
     Conflicted { message: String },
+    /// An extension it lists is in another namespace and its
+    /// `allowedReferences` doesn't admit the binding's. The binding
+    /// never enters the claim index, so the claimed ref answers 500
+    /// rather than running without that extension.
+    RefNotPermitted { message: String },
     /// The spec cannot stand in for anything; the binding never
     /// enters the claim index. `reason` is the status condition
     /// reason.
@@ -486,6 +491,7 @@ pub fn resolve<'a>(state: &'a K8sState, controller_name: &'a str) -> Resolution<
         &services_by_id,
         &slices_by_service,
         &dialables_by_id,
+        &extensions_by_id,
     );
     let bindings_by_claim = index_claims(&backend_bindings);
     demote_conflicting_claims(&mut backend_bindings, &bindings_by_claim);
@@ -1016,10 +1022,13 @@ fn substitute_ref<'a>(
             outcome: r.outcome.clone(),
         });
     }
-    for name in &binding.object.spec.extensions {
+    for ext in &binding.object.spec.extensions {
         let entry = PrependedExtension {
-            namespace: binding.namespace.clone(),
-            name: name.clone(),
+            namespace: ext
+                .namespace
+                .clone()
+                .unwrap_or_else(|| binding.namespace.clone()),
+            name: ext.name.clone(),
         };
         if !prepends.contains(&entry) {
             prepends.push(entry);
@@ -1100,16 +1109,17 @@ fn demote_conflicting_claims(
     }
 }
 
-/// Decide every `BackendBinding` once: spec validation, then one
-/// resolution per backendRef through the same path a route's own
-/// refs take. A target that does not exist leaves its ref
-/// unresolved rather than failing the binding — it substitutes, the
-/// traffic 500s, and it heals when the object lands.
+/// Decide every `BackendBinding` once: spec validation, extension
+/// consent, then one resolution per backendRef through the same path
+/// a route's own refs take. A target that does not exist leaves its
+/// ref unresolved rather than failing the binding — it substitutes,
+/// the traffic 500s, and it heals when the object lands.
 fn resolve_backend_bindings<'a>(
     objects: &'a [crd::BackendBinding],
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
     dialables_by_id: &HashMap<(&str, &str), usize>,
+    extensions_by_id: &HashMap<(&str, &str), &'a crd::Extension>,
 ) -> Vec<BackendBindingResolution<'a>> {
     let mut out = Vec::with_capacity(objects.len());
     for object in objects {
@@ -1119,8 +1129,10 @@ fn resolve_backend_bindings<'a>(
         ) else {
             continue;
         };
-        let outcome = match validate_backend_binding(object) {
-            Err(invalid) => invalid,
+        let checked = validate_backend_binding(object)
+            .and_then(|()| check_extension_consent(object, namespace, extensions_by_id));
+        let outcome = match checked {
+            Err(refused) => refused,
             Ok(()) => BackendBindingOutcome::Accepted {
                 refs: object
                     .spec
@@ -1217,6 +1229,37 @@ fn validate_backend_binding(
                     r.target.kind.as_deref().unwrap_or("Service"),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Every extension the binding lists from another namespace must be
+/// admitted by that Extension's `allowedReferences`. An absent
+/// Extension passes: it exposes nothing, its ref answers 500 until it
+/// lands, and it is checked on the pass that sees it.
+fn check_extension_consent(
+    object: &crd::BackendBinding,
+    binding_ns: &str,
+    extensions_by_id: &HashMap<(&str, &str), &crd::Extension>,
+) -> Result<(), BackendBindingOutcome<'static>> {
+    for r in &object.spec.extensions {
+        let ns = r.namespace.as_deref().unwrap_or(binding_ns);
+        if ns == binding_ns {
+            continue;
+        }
+        let Some(ext) = extensions_by_id.get(&(ns, r.name.as_str())) else {
+            continue;
+        };
+        let from = ext.spec.allowed_references.namespaces.from;
+        if from != crd::FromNamespaces::All {
+            return Err(BackendBindingOutcome::RefNotPermitted {
+                message: format!(
+                    "Extension {ns}/{} does not admit references from namespace \
+                     {binding_ns} (allowedReferences.namespaces.from: {from:?})",
+                    r.name
+                ),
+            });
         }
     }
     Ok(())
@@ -3262,6 +3305,157 @@ mod tests {
 
     const CLAIM: (&str, &str, &str) = ("kinference.buoyant.io", "InferencePool", "pool");
 
+    fn ext_ref(name: &str, ns: Option<&str>) -> crd::ExtensionReference {
+        crd::ExtensionReference {
+            name: name.into(),
+            namespace: ns.map(String::from),
+        }
+    }
+
+    fn extension(ns: &str, name: &str, from: crd::FromNamespaces) -> crd::Extension {
+        let mut ext = crd::Extension::new(
+            name,
+            crd::ExtensionSpec {
+                class: "kinference_selector".into(),
+                failure_mode: crd::FailureMode::default(),
+                limits: crd::Limits::default(),
+                allowed_references: crd::AllowedReferences {
+                    namespaces: crd::ReferenceNamespaces { from },
+                },
+                config: serde_json::Value::Null,
+            },
+        );
+        ext.metadata.namespace = Some(ns.into());
+        ext
+    }
+
+    /// A route in `demo` through a binding that lists `kinference/picker`.
+    fn cross_namespace_state(picker: Option<crd::Extension>) -> K8sState {
+        let mut b = binding(
+            "demo",
+            "pool",
+            CLAIM,
+            vec![binding_ref("workers", None, None)],
+        );
+        b.spec.extensions = vec![ext_ref("picker", Some("kinference"))];
+        let mut s = state(vec![], vec![]);
+        s.extensions = picker.into_iter().collect();
+        s.backend_bindings = vec![b];
+        s.http_routes = vec![route(
+            "demo",
+            "r",
+            vec![parent("gw", None)],
+            None,
+            vec![foreign_ref(None)],
+        )];
+        s
+    }
+
+    #[test]
+    fn an_extension_admitting_all_namespaces_is_prepended_from_its_own() {
+        let s = cross_namespace_state(Some(extension(
+            "kinference",
+            "picker",
+            crd::FromNamespaces::All,
+        )));
+        let r = resolve(&s, OURS);
+
+        assert!(matches!(
+            r.backend_bindings[0].outcome,
+            BackendBindingOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            r.routes[0].rule_prepends[0],
+            vec![PrependedExtension {
+                namespace: "kinference".into(),
+                name: "picker".into(),
+            }]
+        );
+        assert!(
+            r.routes[0]
+                .extensions
+                .iter()
+                .any(|e| e.namespace == "kinference" && e.object.is_some()),
+            "the Extension is found in its own namespace"
+        );
+    }
+
+    #[test]
+    fn an_extension_admitting_only_its_namespace_refuses_the_binding() {
+        let s = cross_namespace_state(Some(extension(
+            "kinference",
+            "picker",
+            crd::FromNamespaces::Same,
+        )));
+        let r = resolve(&s, OURS);
+
+        let BackendBindingOutcome::RefNotPermitted { message } = &r.backend_bindings[0].outcome
+        else {
+            panic!("expected RefNotPermitted");
+        };
+        assert!(
+            message.contains("kinference/picker") && message.contains("namespace demo"),
+            "the message names the Extension and the refused namespace: {message}"
+        );
+        assert!(
+            r.bindings_by_claim.is_empty(),
+            "a refused binding claims nothing"
+        );
+        let backends = &r.routes[0].rule_backends[0];
+        assert_eq!(backends.len(), 1);
+        assert!(
+            matches!(backends[0].outcome, BackendOutcome::UnsupportedKind { .. }),
+            "the claimed ref answers 500 rather than routing without the extension"
+        );
+        assert!(
+            r.routes[0].rule_prepends[0].is_empty(),
+            "{:?}",
+            r.routes[0].rule_prepends[0]
+        );
+        assert!(
+            r.routes[0].extensions.is_empty(),
+            "the refused Extension is not emitted for the route"
+        );
+    }
+
+    #[test]
+    fn an_absent_cross_namespace_extension_is_unresolved_not_refused() {
+        let s = cross_namespace_state(None);
+        let r = resolve(&s, OURS);
+
+        assert!(matches!(
+            r.backend_bindings[0].outcome,
+            BackendBindingOutcome::Accepted { .. }
+        ));
+        assert!(
+            r.routes[0]
+                .extensions
+                .iter()
+                .any(|e| e.namespace == "kinference" && e.object.is_none()),
+            "the ref is emitted unresolved and answers 500 until the object lands"
+        );
+    }
+
+    #[test]
+    fn a_same_namespace_extension_needs_no_consent() {
+        let mut b = binding(
+            "demo",
+            "pool",
+            CLAIM,
+            vec![binding_ref("workers", None, None)],
+        );
+        b.spec.extensions = vec![ext_ref("picker", Some("demo"))];
+        let mut s = state(vec![], vec![]);
+        s.extensions = vec![extension("demo", "picker", crd::FromNamespaces::Same)];
+        s.backend_bindings = vec![b];
+        let r = resolve(&s, OURS);
+
+        assert!(matches!(
+            r.backend_bindings[0].outcome,
+            BackendBindingOutcome::Accepted { .. }
+        ));
+    }
+
     #[test]
     fn binding_outcomes_cover_every_case() {
         let mut s = state(vec![], vec![]);
@@ -3497,7 +3691,7 @@ mod tests {
                 binding_ref("missing", None, None),
             ],
         );
-        b.spec.extensions = vec!["picker".into()];
+        b.spec.extensions = vec![ext_ref("picker", None)];
 
         let mut s = state(vec![], vec![]);
         s.services = vec![
