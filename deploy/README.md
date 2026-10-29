@@ -1,8 +1,8 @@
 # Deploy
 
-Helm charts and sample manifests for running the gateway control
-plane and a sample data plane on a Kubernetes cluster (kind or any
-standard distribution).
+Helm charts for running the gateway control plane on a Kubernetes
+cluster (kind or any standard distribution). The sample manifests
+applied below live in `examples/` at the repo root.
 
 ## Layout
 
@@ -17,13 +17,12 @@ deploy/
 │       ├── Chart.yaml                       # headless Service, GatewayClass
 │       ├── values.yaml                      # controlPlane.image / dataPlane.image
 │       └── templates/
-└── manifests/
-    └── examples/
-        └── sample-app/
-            ├── namespace.yaml               # demo namespace
-            ├── gateway.yaml                 # demo/api-gateway, HTTP :80
-            ├── httproute.yaml               # PathPrefix / -> echo:8080
-            └── echo.yaml                    # hashicorp/http-echo backend
+examples/
+└── sample-app/                              # numbered so `kubectl apply -f` creates
+    ├── 00-namespace.yaml                    # the demo namespace first
+    ├── 10-echo.yaml                         # hashicorp/http-echo backend
+    ├── 20-gateway.yaml                      # demo/api-gateway, HTTP :80
+    └── 30-httproute.yaml                    # Exact /healthz, PathPrefix / -> echo:8080
 ```
 
 The data plane is not part of the chart: the control plane
@@ -61,7 +60,7 @@ helm upgrade --install gateway deploy/chart/gateway \
     --set controlPlane.image.tag=latest \
     --set dataPlane.image.repository=gateway-data-plane \
     --set dataPlane.image.tag=latest
-kubectl apply -f deploy/manifests/examples/sample-app/
+kubectl apply -f examples/sample-app/
 ```
 
 Image values default to the published `cr.kinference.ai/buoyantio` images at
