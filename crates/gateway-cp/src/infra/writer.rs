@@ -49,9 +49,13 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// Run the writer until `shutdown` resolves. Reconciles on every
 /// desired-set change and on every event from the managed-children
 /// watches; a failed pass retries with doubling backoff until a pass
-/// succeeds.
+/// succeeds, and a pass in flight when leadership drops is abandoned.
+/// The watches run on `watch_client`; the writes go through
+/// `write_client`, which should carry a short read timeout (the
+/// watches need the long one).
 pub async fn run(
-    client: Client,
+    watch_client: Client,
+    write_client: Client,
     mut desired_rx: watch::Receiver<Vec<GatewayInfra>>,
     mut is_leader: watch::Receiver<bool>,
     shutdown: impl Future<Output = ()>,
@@ -64,23 +68,23 @@ pub async fn run(
     let (sa_store, sa_writer) = reflector::store::<ServiceAccount>();
     let mut sa_stream = reflector::reflector(
         sa_writer,
-        watcher::watcher(Api::all(client.clone()), managed.clone()),
+        watcher::watcher(Api::all(watch_client.clone()), managed.clone()),
     )
     .boxed();
     let (svc_store, svc_writer) = reflector::store::<Service>();
     let mut svc_stream = reflector::reflector(
         svc_writer,
-        watcher::watcher(Api::all(client.clone()), managed.clone()),
+        watcher::watcher(Api::all(watch_client.clone()), managed.clone()),
     )
     .boxed();
     let (dep_store, dep_writer) = reflector::store::<Deployment>();
     let mut dep_stream = reflector::reflector(
         dep_writer,
-        watcher::watcher(Api::all(client.clone()), managed),
+        watcher::watcher(Api::all(watch_client), managed),
     )
     .boxed();
 
-    let mut reconciler = Reconciler::new(client, sa_store, svc_store, dep_store);
+    let mut reconciler = Reconciler::new(write_client, sa_store, svc_store, dep_store);
     let mut retry_delay = RETRY_INITIAL;
     let mut retry_pending = false;
 
@@ -102,8 +106,17 @@ pub async fn run(
             continue;
         }
 
+        // Cancelling mid-pass is safe: `last_applied` only records
+        // applies that completed, and the next pass redoes the rest.
         let desired = desired_rx.borrow_and_update().clone();
-        match reconciler.reconcile(&desired).await {
+        let result = tokio::select! {
+            result = reconciler.reconcile(&desired) => result,
+            _ = is_leader.wait_for(|leader| !leader) => {
+                tracing::info!("leadership lost mid-pass; abandoning infra reconcile");
+                continue;
+            }
+        };
+        match result {
             Ok(()) => {
                 retry_pending = false;
                 retry_delay = RETRY_INITIAL;

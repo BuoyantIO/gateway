@@ -10,7 +10,17 @@
 //! `resourceVersion` of the last-seen lease rides along), so two
 //! replicas racing for the same claim cannot both win: the loser
 //! gets a conflict, re-reads, and backs off.
+//!
+//! Single-writer holds only if the holder stops acting as leader
+//! before a rival may claim, however slow the apiserver is. So
+//! leadership is published as "held, and short of the step-down
+//! point" ([`STEP_DOWN_MARGIN`] before expiry), never as "the last
+//! write succeeded"; every lease request is bounded by
+//! [`REQUEST_TIMEOUT`]; and while one is in flight, a timer demotes
+//! the replica the moment its claim reaches the step-down point, so
+//! a hung renewal can never keep it leader past its expiry.
 
+use std::pin::pin;
 use std::time::Duration;
 
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
@@ -29,6 +39,14 @@ const LEASE_DURATION: Duration = Duration::from_secs(15);
 const RENEW_GRACE: Duration = Duration::from_secs(10);
 /// Delay before re-deciding after an apiserver error or conflict.
 const RETRY: Duration = Duration::from_secs(2);
+/// Stop acting as leader this long before the claim expires: slack
+/// for clock skew against the rival and for writes already in
+/// flight when leadership drops.
+const STEP_DOWN_MARGIN: Duration = Duration::from_secs(3);
+/// Bound on one lease request (or the read-then-create pair). Well
+/// under `RENEW_GRACE - STEP_DOWN_MARGIN`, so a hung renewal fails
+/// and retries while the claim is still good.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the elector should do next, decided from the last-known
 /// lease state. Pure so the claiming rules are unit-testable.
@@ -44,7 +62,8 @@ enum Action {
 
 /// Run the elector until `shutdown` resolves, publishing leadership
 /// transitions on `tx`. Apiserver errors are retried forever; if our
-/// own claim lapses meanwhile the channel demotes to follower.
+/// own claim reaches its step-down point meanwhile, even with a
+/// request still in flight, the channel demotes to follower.
 pub async fn run(
     client: kube::Client,
     namespace: &str,
@@ -53,12 +72,19 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) {
     let api: Api<Lease> = Api::namespaced(client, namespace);
-    let mut shutdown = std::pin::pin!(shutdown);
+    let mut shutdown = pin!(shutdown);
     let mut known: Option<Lease> = None;
 
     loop {
         if known.is_none() {
-            known = fetch_or_create(&api, namespace).await;
+            // No claim of ours is known here, so nothing to step
+            // down from while the read is in flight.
+            known = guarded(&tx, None, fetch_or_create(&api, namespace))
+                .await
+                .unwrap_or_else(|| {
+                    tracing::warn!("lease read timed out; retrying");
+                    None
+                });
         }
 
         let now = Timestamp::now();
@@ -66,20 +92,30 @@ pub async fn run(
             Action::Claim => match known.take() {
                 // Fetch failed above: retry it.
                 None => RETRY,
-                Some(prev) => match claim(&api, &identity, prev, now).await {
-                    Ok(lease) => {
-                        known = Some(lease);
-                        // Successful claims re-decide immediately and
-                        // land in WaitUntil; rejections re-read first.
-                        Duration::ZERO
-                    }
-                    Err(e) => {
-                        if !is_conflict(&e) {
-                            tracing::warn!(error = %e, "lease claim failed; retrying");
+                Some(prev) => {
+                    let step_down = step_down_of(prev.spec.as_ref(), &identity);
+                    match guarded(&tx, step_down, claim(&api, &identity, prev, now)).await {
+                        Some(Ok(lease)) => {
+                            known = Some(lease);
+                            // Successful claims re-decide immediately
+                            // and land in WaitUntil; rejections re-read
+                            // first.
+                            Duration::ZERO
                         }
-                        RETRY
+                        Some(Err(e)) => {
+                            if !is_conflict(&e) {
+                                tracing::warn!(error = %e, "lease claim failed; retrying");
+                            }
+                            RETRY
+                        }
+                        // The write may or may not have landed; the
+                        // re-read after RETRY finds out.
+                        None => {
+                            tracing::warn!("lease claim timed out; retrying");
+                            RETRY
+                        }
                     }
-                },
+                }
             },
             Action::WaitUntil(t) => {
                 // Wake just past the boundary so the re-decide lands
@@ -96,6 +132,8 @@ pub async fn run(
                 () = &mut shutdown => break,
                 () = tokio::time::sleep(wait) => {}
             }
+            // The sleep may have overrun our step-down point.
+            publish(&tx, spec_of(known.as_ref()), &identity, Timestamp::now());
             // A rival's claim may have been renewed (or vacated)
             // while we slept; never claim from a stale view.
             if !is_current_holder(spec_of(known.as_ref()), &identity, Timestamp::now()) {
@@ -104,15 +142,42 @@ pub async fn run(
         }
     }
 
+    // Stop acting as leader before vacating: once the lease is free
+    // the peer may claim at once.
+    set_leader(&tx, false);
+
     // Held at shutdown: vacate so the peer claims immediately
     // instead of waiting out our expiry.
     if is_current_holder(spec_of(known.as_ref()), &identity, Timestamp::now())
         && let Some(lease) = known
-        && let Err(e) = vacate(&api, lease).await
     {
-        tracing::warn!(error = %e, "failed to vacate lease on shutdown");
+        match guarded(&tx, None, vacate(&api, lease)).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => tracing::warn!(error = %e, "failed to vacate lease on shutdown"),
+            None => tracing::warn!("lease vacate timed out on shutdown"),
+        }
     }
-    let _ = tx.send(false);
+}
+
+/// Await one lease request under [`REQUEST_TIMEOUT`]; `None` means
+/// it timed out. If `step_down` (our claim's step-down point, `None`
+/// when we hold no claim) passes while the request is in flight,
+/// demote on `tx` first and keep waiting.
+async fn guarded<F: Future>(
+    tx: &watch::Sender<bool>,
+    step_down: Option<Timestamp>,
+    request: F,
+) -> Option<F::Output> {
+    let mut request = pin!(tokio::time::timeout(REQUEST_TIMEOUT, request));
+    if let Some(at) = step_down {
+        tokio::select! {
+            out = &mut request => return out.ok(),
+            () = tokio::time::sleep(millis_until(Timestamp::now(), at)) => {
+                set_leader(tx, false);
+            }
+        }
+    }
+    request.await.ok()
 }
 
 /// Get the lease, creating it empty on first contact. `None` only on
@@ -218,7 +283,10 @@ async fn vacate(api: &Api<Lease>, mut lease: Lease) -> Result<(), kube::Error> {
 }
 
 fn publish(tx: &watch::Sender<bool>, spec: Option<&LeaseSpec>, identity: &str, now: Timestamp) {
-    let leader = is_current_holder(spec, identity, now);
+    set_leader(tx, step_down_of(spec, identity).is_some_and(|at| now < at));
+}
+
+fn set_leader(tx: &watch::Sender<bool>, leader: bool) {
     tx.send_if_modified(|v| {
         if *v == leader {
             false
@@ -235,6 +303,14 @@ fn is_current_holder(spec: Option<&LeaseSpec>, identity: &str, now: Timestamp) -
         s.holder_identity.as_deref() == Some(identity)
             && expiry_of(s).is_some_and(|expiry| now < expiry)
     })
+}
+
+/// When `identity` must stop acting as leader under this claim:
+/// [`STEP_DOWN_MARGIN`] before expiry. `None` if the claim isn't
+/// ours (or can't be honored).
+fn step_down_of(spec: Option<&LeaseSpec>, identity: &str) -> Option<Timestamp> {
+    let spec = spec.filter(|s| s.holder_identity.as_deref() == Some(identity))?;
+    Some(expiry_of(spec)? - STEP_DOWN_MARGIN)
 }
 
 fn expiry_of(spec: &LeaseSpec) -> Option<Timestamp> {
@@ -342,5 +418,45 @@ mod tests {
         assert!(!is_current_holder(Some(&s), ME, ts(115)));
         assert!(!is_current_holder(Some(&s), OTHER, ts(110)));
         assert!(!is_current_holder(None, ME, ts(110)));
+    }
+
+    #[test]
+    fn leadership_ends_at_the_step_down_point() {
+        // Expires at t=115; steps down 3s earlier.
+        let s = spec(ME, 100);
+        assert_eq!(step_down_of(Some(&s), ME), Some(ts(112)));
+        assert_eq!(step_down_of(Some(&s), OTHER), None);
+        assert_eq!(step_down_of(None, ME), None);
+
+        let (tx, rx) = watch::channel(false);
+        publish(&tx, Some(&s), ME, ts(111));
+        assert!(*rx.borrow());
+        publish(&tx, Some(&s), ME, ts(112));
+        assert!(!*rx.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_request_demotes_at_step_down_then_times_out() {
+        let (tx, rx) = watch::channel(true);
+        let step_down = Timestamp::now() + Duration::from_secs(1);
+        let mut request = pin!(guarded(&tx, Some(step_down), std::future::pending::<()>()));
+
+        // Still leader while the step-down point is ahead.
+        let early = tokio::time::timeout(Duration::from_millis(500), request.as_mut()).await;
+        assert!(early.is_err());
+        assert!(*rx.borrow());
+
+        // Paused time auto-advances through the step-down sleep and
+        // the request timeout.
+        assert_eq!(request.await, None);
+        assert!(!*rx.borrow());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prompt_request_keeps_leadership() {
+        let (tx, rx) = watch::channel(true);
+        let step_down = Timestamp::now() + Duration::from_secs(1);
+        assert_eq!(guarded(&tx, Some(step_down), async { 7 }).await, Some(7));
+        assert!(*rx.borrow());
     }
 }

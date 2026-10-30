@@ -44,6 +44,9 @@ const CONFLICT_RETRIES: usize = 3;
 
 /// Run the writer until `shutdown` resolves. Only the leader writes;
 /// while following, work (and retries) sit parked until promotion.
+/// A pass in flight when leadership drops is abandoned, so a demoted
+/// replica's writes stop with its leadership. `client` should carry
+/// a short read timeout: a hung write stalls every status update.
 pub async fn run(
     client: Client,
     mut work_rx: watch::Receiver<StatusWork>,
@@ -70,7 +73,14 @@ pub async fn run(
         }
 
         let work = work_rx.borrow_and_update().clone();
-        match write_all(&client, &work).await {
+        let result = tokio::select! {
+            result = write_all(&client, &work) => result,
+            _ = is_leader.wait_for(|leader| !leader) => {
+                tracing::info!("leadership lost mid-pass; abandoning status writes");
+                continue;
+            }
+        };
+        match result {
             Ok(()) => {
                 retry_pending = false;
                 retry_delay = RETRY_INITIAL;
