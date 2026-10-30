@@ -18,7 +18,7 @@ nothing in the data plane reads Kubernetes.
 
 ```sh
 just lint         # cargo fmt --check + clippy --workspace --all-targets -D warnings
-just lint-chart   # helm lint deploy/chart/gateway
+just lint-chart   # helm lint charts/gateway
 just test-unit    # cargo test --workspace
 just up           # build images, create the gateway-e2e kind cluster, install the chart
 just test-e2e     # cargo test -p gateway-e2e -- --ignored

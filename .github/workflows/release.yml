@@ -189,7 +189,7 @@ jobs:
         run: |
           version='${{ needs.meta.outputs.version }}'
           for chart in gateway-crds gateway; do
-            helm package "deploy/chart/$chart" \
+            helm package "charts/$chart" \
               --version "$version" \
               --app-version "$version"
             helm push "$chart-$version.tgz" "oci://$DOCKER_REGISTRY/charts"
