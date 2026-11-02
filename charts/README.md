@@ -1,4 +1,4 @@
-# Deploy
+# Charts
 
 Helm charts for running the gateway control plane on a Kubernetes
 cluster (kind or any standard distribution). The sample manifests
@@ -7,16 +7,15 @@ applied below live in `examples/` at the repo root.
 ## Layout
 
 ```
-deploy/
+charts/
 ├── README.md
-├── chart/
-│   ├── gateway-crds/                        # Helm chart: the gateway.linkerd.io
-│   │   ├── Chart.yaml                       # CRDs, installed before the gateway
-│   │   └── templates/                       # chart and upgraded like any release
-│   └── gateway/                             # Helm chart: CP Deployment, RBAC,
-│       ├── Chart.yaml                       # headless Service, GatewayClass
-│       ├── values.yaml                      # controlPlane.image / dataPlane.image
-│       └── templates/
+├── gateway-crds/                            # Helm chart: the gateway.linkerd.io
+│   ├── Chart.yaml                           # CRDs, installed before the gateway
+│   └── templates/                           # chart and upgraded like any release
+└── gateway/                                 # Helm chart: CP Deployment, RBAC,
+    ├── Chart.yaml                           # headless Service, GatewayClass
+    ├── values.yaml                          # controlPlane.image / dataPlane.image
+    └── templates/
 examples/
 └── sample-app/                              # numbered so `kubectl apply -f` creates
     ├── 00-namespace.yaml                    # the demo namespace first
@@ -52,9 +51,9 @@ pointed at the local images), and the sample app:
 
 ```sh
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
-helm upgrade --install gateway-crds deploy/chart/gateway-crds \
+helm upgrade --install gateway-crds charts/gateway-crds \
     --namespace gateway-system --create-namespace
-helm upgrade --install gateway deploy/chart/gateway \
+helm upgrade --install gateway charts/gateway \
     --namespace gateway-system \
     --set controlPlane.image.repository=gateway-control-plane \
     --set controlPlane.image.tag=latest \
