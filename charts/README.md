@@ -62,7 +62,9 @@ built images.
 - The controller writes status. `kubectl get gtw` shows the address
   from the provisioned Service and the `Programmed` condition, each
   listener entry carries `attachedRoutes`, and the `GatewayClass` is
-  marked `Accepted`. `HTTPRoute.status.parents` is not written yet.
+  marked `Accepted`. The controller also writes its own entries in each
+  `HTTPRoute`'s `status.parents`, which report attachment and backend
+  resolution.
 - The control plane resolves backend endpoints from `EndpointSlice`s,
   one endpoint per ready pod address, and the data plane balances
   across them per request. A Service with no ready pods answers 503.

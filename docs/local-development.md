@@ -96,8 +96,9 @@ because the hostname that the client sent is not in the route's
 
 `kubectl get gateway -A` shows the address and the `Programmed`
 condition, each listener's status carries `attachedRoutes`, and the
-`GatewayClass` is `Accepted`. The control plane does not write
-`HTTPRoute.status.parents` yet.
+`GatewayClass` is `Accepted`. The control plane also writes its own
+entries in each `HTTPRoute`'s `status.parents`, which report attachment
+and backend resolution.
 
 Every control-plane replica serves data planes, so read every replica's
 log:

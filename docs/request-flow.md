@@ -78,9 +78,9 @@ things live beside the config. Per-endpoint runtime state, the
 persists across requests. The extension `Registry` holds one
 `ExtensionBuilder` per plugin.
 
-The control plane does not emit a dialable backend yet. Today one only
-arrives through static config, including the TLS block that it
-originates with.
+A dialable backend arrives either through static config or from a
+`GatewayBackend` that the control plane resolved, in both cases with the
+TLS block that the gateway originates with.
 
 Requests never observe a partially applied configuration. Partial
 config, out-of-order references and resyncs are resolved at apply time,
