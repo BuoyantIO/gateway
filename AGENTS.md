@@ -1,17 +1,14 @@
 # AGENTS.md
 
-## What this is
-
-A Kubernetes Gateway API implementation in Rust: a control plane
-(`gateway-cp`) that watches `Gateway`/`HTTPRoute` resources and
-provisions the data plane (`gatewayd`) that serves the traffic.
-Config flows one way, CP to DP, over a streaming gRPC channel;
-nothing in the data plane reads Kubernetes.
+The prose, comment, logging and commit rules below are shared with the
+Kinference repository, whose `AGENTS.md` is the canonical copy. Change
+them there first.
 
 ## Architecture
 
-`ARCHITECTURE.md` is the high-level map of the codebase. Read it before you add
-or move code, and change it in the same pull request as any move.
+`ARCHITECTURE.md` is the map of the code: how the code is grouped, which
+way imports go and where new code goes. Read it before you add or move
+code, and change it in the same pull request as any move.
 
 ## Prose style for all text, including commit messages and PR descriptions
 
@@ -91,6 +88,52 @@ same change: renamed or removed items, moved logic, changed defaults. Never
 leave a doc comment attached to the wrong item, and re-read edited comments
 so they still parse as sentences.
 
+## Logging
+
+gateway-cp and gatewayd log through `tracing`. Both default to `info`,
+so the operator reads every INFO, WARN and ERROR line in production. Log
+volume should grow with events, not with traffic.
+
+### Levels
+
+- ERROR: something needs fixing, and the gateway can't recover on its
+  own.
+- WARN: the gateway is degraded or misconfigured. Log a WARN line once
+  per cause, never once per request. Latch the line, or let a metric
+  count the repeats.
+- INFO: lifecycle and state changes. Examples are startup, readiness,
+  shutdown, a data plane connecting or disconnecting, a Gateway being
+  provisioned, and a leadership change. Each event logs one INFO line.
+  The request path never logs at INFO.
+- DEBUG: per-request decisions.
+- TRACE: per-event and per-frame detail, such as each body frame or
+  each watch event.
+
+### Don't log
+
+- An event that a metric already counts, unless the line adds context that
+  the metric can't hold.
+- An event that another line already logs. Log the event once, where the
+  state changes.
+- A task exiting on cancel, or a config value that the operator can read
+  in the config file.
+- A path that can't happen. Use `debug_assert!` or `unreachable!` instead.
+
+### Messages and fields
+
+- A message is one short lowercase phrase that says what happened:
+  "admin server listening", "config applied".
+- Don't start a message with a module prefix. The subscriber already
+  prints the target.
+- Put values in fields, not in the message text.
+- Don't explain the code in a message. When the operator has to change a
+  setting, name the setting.
+- No caps for emphasis and no em dashes.
+- Use the same field names in every crate: `namespace`, `name`, `bind`,
+  `listener`, `route`, `backend`, `error`.
+- Record an error as `error = &err as &dyn std::error::Error`. The
+  subscriber then prints the error's sources too.
+
 ## Commits and pull requests
 
 PRs are merged with a merge commit, not squashed, so each commit lands on
@@ -117,59 +160,3 @@ readers, not just reviewers:
 - Body: the overall why and what, and anything that spans commits. Don't
   repeat each commit's message.
 - No checklists nor review chatter
-
-## Commands
-
-`just` drives everything (`just --list`). `protoc`
-(`protobuf-compiler`) must be installed: two crates compile protos in
-`build.rs`.
-
-```sh
-just lint         # cargo fmt --check + clippy --workspace --all-targets -D warnings
-just lint-chart   # helm lint charts/gateway
-just test-unit    # cargo test --workspace
-just up           # build images, create the gateway-e2e kind cluster, install the chart
-just test-e2e     # cargo test -p gateway-e2e -- --ignored
-just down         # delete the cluster and the cloud-provider-kind container
-just ci           # up + test-e2e + down
-```
-
-Single unit test:
-
-```sh
-cargo test -p gateway-cp diff::tests::value_change_yields_upsert
-```
-
-Single e2e test (needs `just up` first; every e2e test is
-`#[ignore]`d so `cargo test --workspace` skips them):
-
-```sh
-cargo test -p gateway-e2e --test e2e -- --ignored routing::exact_beats_prefix
-```
-
-Note `e2e/README.md` is stale on two points: the runner is
-`just test-e2e` (not `just test`), and the suite is one test binary
-named `e2e` (not one per file), so `--test e2e` plus a
-`module::test_name` filter is how you narrow it.
-
-## Conventions
-
-- Edition 2024, toolchain pinned by `rust-toolchain.toml`,
-  `max_width = 100`.
-- Workspace lints: `unsafe_code` is forbidden, clippy `pedantic` is
-  warned, and CI runs clippy with `-D warnings`. Generated proto
-  modules are the only place blanket `allow`s are acceptable.
-- Prefer a module-level `//!` doc that explains the module's role and
-  its invariants. This codebase leans heavily on those; several
-  ("what `resolve` decides", the Store's promotion rules, why the
-  drain barrier is drop-counted) carry information found nowhere
-  else. Keep them accurate.
-- Rust file order, matching tokio's style: module doc, `use` groups
-  (`std`, external crates, `crate`/`super`, blank line between,
-  alphabetical within a group; rustfmt does not reorder between
-  groups), `mod` declarations, `pub use`, consts, then types with the
-  principal type first and each type's `impl`s (inherent and trait)
-  immediately below it, then free functions, then an inline
-  `#[cfg(test)] mod tests`.
-- Unit tests live inline in the module they cover; `tests/` holds
-  integration tests only.
