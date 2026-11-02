@@ -3,6 +3,7 @@
 //! over to the survivor, which then drives the full pipeline
 //! (provisioning, config push, status) on its own. Throughout and
 //! after the handover, no two replicas act as leader at once.
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -28,6 +29,11 @@ const HANDOVER_DEADLINE: Duration = Duration::from_secs(45);
 const SINGLE_LEADER_WINDOW: Duration = Duration::from_secs(60);
 /// The CP admin port, which serves `/leader`.
 const CP_ADMIN_PORT: u16 = 15021;
+/// How long a running CP replica may go without answering `/leader`
+/// before the check fails: enough for a replacement pod to start its
+/// admin server or a brief proxy hiccup, short of hiding a broken
+/// endpoint for the whole window.
+const UNANSWERED_LIMIT: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires kind cluster — run via `just test`"]
@@ -112,10 +118,18 @@ async fn leader_election_single_writer_and_failover() -> Result<()> {
 /// acts as leader, failing if two ever say yes in the same sample.
 /// A legitimate handover can't trip this: the old holder steps down
 /// before its lease expires, and only then may a rival claim.
-/// Replicas that don't answer (starting, terminating) are skipped.
+///
+/// A replica that doesn't answer (starting, briefly unreachable) is
+/// skipped for that sample, but only for [`UNANSWERED_LIMIT`] in a
+/// row. And at least one sample must hear from every running replica
+/// with exactly one leader among them, so the check can't pass
+/// without having observed anything.
 async fn at_most_one_leader(client: &Client, window: Duration) -> Result<()> {
     let pods: Api<Pod> = Api::namespaced(client.clone(), CP_NAMESPACE);
     let deadline = Instant::now() + window;
+    // Per pod: when its current run of unanswered samples began.
+    let mut unanswered_since: HashMap<String, Instant> = HashMap::new();
+    let mut confirmed = false;
     while Instant::now() < deadline {
         let running: Vec<String> = pods
             .list(&ListParams::default().labels("app=gateway-cp"))
@@ -130,22 +144,46 @@ async fn at_most_one_leader(client: &Client, window: Duration) -> Result<()> {
             .collect();
         let answers =
             futures::future::join_all(running.iter().map(|pod| is_leader(client, pod))).await;
-        let leaders: Vec<&String> = running
-            .iter()
-            .zip(answers)
-            .filter_map(|(pod, answer)| matches!(answer, Ok(true)).then_some(pod))
-            .collect();
+        let now = Instant::now();
+        unanswered_since.retain(|pod, _| running.contains(pod));
+        let mut leaders: Vec<&String> = Vec::new();
+        let mut all_answered = true;
+        for (pod, answer) in running.iter().zip(answers) {
+            match answer {
+                Ok(leader) => {
+                    unanswered_since.remove(pod);
+                    if leader {
+                        leaders.push(pod);
+                    }
+                }
+                Err(e) => {
+                    all_answered = false;
+                    let since = *unanswered_since.entry(pod.clone()).or_insert(now);
+                    ensure!(
+                        now.duration_since(since) < UNANSWERED_LIMIT,
+                        "CP replica {pod} hasn't answered /leader for {UNANSWERED_LIMIT:?}: {e:#}"
+                    );
+                }
+            }
+        }
         ensure!(
             leaders.len() <= 1,
             "more than one CP replica acts as leader: {leaders:?}"
         );
+        confirmed |= all_answered && !running.is_empty() && leaders.len() == 1;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    ensure!(
+        confirmed,
+        "no sample heard from every CP replica with exactly one leader"
+    );
     Ok(())
 }
 
 /// Ask one CP pod's admin server (through the apiserver pod proxy)
-/// whether it currently acts as leader.
+/// whether it currently acts as leader. Non-2xx responses are errors
+/// (`request_text` maps them to `kube::Error::Api`), and so is any
+/// body other than the two the endpoint defines.
 async fn is_leader(client: &Client, pod: &str) -> Result<bool> {
     let uri = format!("/api/v1/namespaces/{CP_NAMESPACE}/pods/{pod}:{CP_ADMIN_PORT}/proxy/leader");
     let req = http::Request::get(&uri)
@@ -155,7 +193,11 @@ async fn is_leader(client: &Client, pod: &str) -> Result<bool> {
         .request_text(req)
         .await
         .with_context(|| format!("GET {uri}"))?;
-    Ok(body.trim() == "leader")
+    match body.trim() {
+        "leader" => Ok(true),
+        "follower" => Ok(false),
+        other => anyhow::bail!("GET {uri}: unexpected body {other:?}"),
+    }
 }
 
 /// Current `holderIdentity`, if the lease exists and one is set.
