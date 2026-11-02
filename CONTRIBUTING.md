@@ -6,9 +6,11 @@ with a coding agent. Agents get the same rules, in more detail, from
 
 ## Architecture
 
-[ARCHITECTURE.md](ARCHITECTURE.md) is the map of the server: how the code is
-grouped, which way imports go and where new code goes. Read it before you add
-or move code, and change it in the same pull request as any move.
+[ARCHITECTURE.md](ARCHITECTURE.md) describes the crate graph and which way
+its dependencies point, how config flows from the control plane to the data
+plane, and what each stage of that path and of the request path decides. Read
+it before you add or move code, and update it in the same pull request as any
+change to those boundaries.
 
 ## Code comments
 
