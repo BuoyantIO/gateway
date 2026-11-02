@@ -5,6 +5,6 @@ bench/results
 docs
 .claude
 .github
-deploy
+charts
 *.md
 justfile

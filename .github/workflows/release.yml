@@ -16,11 +16,21 @@ on:
         type: boolean
         required: false
         default: false
+  # Every PR and every push to main gets a dry run: build, then e2e
+  # against the release-named images. This is the repo's only e2e run
+  # (ci.yml has none), so the path a release takes is the one tested.
+  # Nothing is published; inputs are empty, so is_release is false and
+  # the version falls back to 0.0.0-undefined.
+  pull_request:
+  push:
+    branches: [main]
 
 # Release runs must never be cancelled mid-flight; dispatches queue up
-# behind one another.
+# behind one another. Dry runs stay out of that queue: one group per PR,
+# where a new push cancels the previous run, and one per main commit.
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}${{ github.event_name == 'pull_request' && format('-pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -44,11 +54,11 @@ jobs:
             echo "::error::version '$version' is not semver (expected e.g. 0.1.0, without the v prefix)"
             exit 1
           fi
-          if [[ ${{ inputs.publish }} == true && -z $version ]]; then
+          if [[ '${{ inputs.publish }}' == true && -z $version ]]; then
             echo "::error::publish requires the version input"
             exit 1
           fi
-          if [[ ${{ inputs.publish }} == true && '${{ github.ref }}' != refs/heads/main ]]; then
+          if [[ '${{ inputs.publish }}' == true && '${{ github.ref }}' != refs/heads/main ]]; then
             echo "::error::publish is only allowed from the main branch (got '${{ github.ref_name }}')"
             exit 1
           fi
@@ -57,7 +67,7 @@ jobs:
             exit 1
           fi
       - id: release
-        run: echo "is_release=${{ inputs.publish == true }}" >> "$GITHUB_OUTPUT"
+        run: echo "is_release=${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}" >> "$GITHUB_OUTPUT"
       - id: version
         run: echo "version=${{ inputs.version || '0.0.0-undefined' }}" >> "$GITHUB_OUTPUT"
     outputs:
@@ -116,7 +126,7 @@ jobs:
           install_only: true
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
-          save-if: "false"
+          save-if: ${{ github.event_name == 'push' }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: gateway-images
@@ -155,6 +165,15 @@ jobs:
             /tmp/e2e-logs
           retention-days: 3
 
+  ready-for-merge:
+    name: Ready for merge (release)
+    if: always()
+    needs: [meta, build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'
+
   publish:
     if: ${{ needs.meta.outputs.is_release == 'true' }}
     needs: [meta, test]
@@ -189,7 +208,7 @@ jobs:
         run: |
           version='${{ needs.meta.outputs.version }}'
           for chart in gateway-crds gateway; do
-            helm package "deploy/chart/$chart" \
+            helm package "charts/$chart" \
               --version "$version" \
               --app-version "$version"
             helm push "$chart-$version.tgz" "oci://$DOCKER_REGISTRY/charts"

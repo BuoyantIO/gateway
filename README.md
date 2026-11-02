@@ -34,7 +34,7 @@ helm upgrade --install gateway oci://ghcr.io/buoyantio/charts/gateway \
 docker build -f Dockerfile    -t gateway-data-plane:latest    .
 docker build -f Dockerfile.cp -t gateway-control-plane:latest .
 kind load docker-image gateway-data-plane:latest gateway-control-plane:latest --name gateway
-helm upgrade --install gateway deploy/chart/gateway \
+helm upgrade --install gateway charts/gateway \
     --namespace gateway-system --create-namespace \
     --set controlPlane.image.repository=gateway-control-plane \
     --set controlPlane.image.tag=latest \
