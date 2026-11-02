@@ -62,7 +62,7 @@ longer sends.
 
 ## Request path
 
-`documents/request-lifecycle.md` is the canonical description of one
+`docs/request-lifecycle.md` is the canonical description of one
 request from accepted socket to end of response, including every
 error status and metric reason. Read it before touching
 `crates/gateway-runtime/src/proxy/`; keep it updated when behavior
