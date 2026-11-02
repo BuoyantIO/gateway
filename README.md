@@ -1,89 +1,79 @@
-# gateway
+# Buoyant Gateway
 
-A Kubernetes Gateway API implementation: a control plane (`gateway-cp`)
-that watches `Gateway`/`HTTPRoute` resources and provisions the data
-plane (`gatewayd`) that serves the traffic.
+The Buoyant Gateway is a Kubernetes Gateway API implementation in Rust.
+It is built to serve inference traffic alongside
+[Kinference](https://github.com/Kinference-AI/kinference), and it works
+as a plain HTTP gateway without it.
 
-## Set up a kind cluster
+The gateway has two parts. The control plane, gateway-cp, watches
+`Gateway` and `HTTPRoute` resources and provisions one data-plane
+Deployment for each `Gateway` that it owns. The data plane, gatewayd,
+terminates TLS, matches each request to a route, runs the route's
+filters and proxies the request to a backend.
 
-Requires `docker`, `kind`, `kubectl`, and `helm`.
+Config flows one way, from the control plane to the data planes, over a
+streaming gRPC channel. Nothing in the data plane reads Kubernetes.
 
-```sh
-kind create cluster --name gateway
-docker run -d --name cloud-provider-kind --network kind \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    registry.k8s.io/cloud-provider-kind/cloud-controller-manager:v0.9.0
-kubectl apply --server-side --force-conflicts -f \
-    https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
-```
+Everything that touches a request is an extension, including the
+Gateway API core filters. Kinference attaches as the
+`kinference_selector` extension: the data plane streams the request body
+to the Kinference Picker and dispatches the request to the endpoint that
+the Picker returns.
 
-`cloud-provider-kind` assigns IPs to `LoadBalancer` Services in the
-cluster (host-routable on Linux).
+## Quick start
 
-## Install from published images
+See [the Kinference getting started
+guide](https://kinference.ai/getting-started/), which installs the
+gateway charts and Kinference together.
 
-```sh
-helm upgrade --install gateway oci://ghcr.io/buoyantio/charts/gateway \
-    --version 0.1.0-alpha.2 \
-    --namespace gateway-system --create-namespace
-```
+## Documentation
 
-## Install from source
+- [Architecture](ARCHITECTURE.md): the map of the code. Vocabulary,
+  what each crate owns, and where new code goes.
+- [Request flow](docs/request-flow.md): how each binary boots, one
+  request from the accepted socket to the end of the response, and the
+  loops that keep the config current.
+- [Local development](docs/local-development.md): how to build, run and
+  test the gateway on a kind cluster.
+- [Contributing](CONTRIBUTING.md): how to contribute to the project.
 
-```sh
-docker build -f Dockerfile    -t gateway-data-plane:latest    .
-docker build -f Dockerfile.cp -t gateway-control-plane:latest .
-kind load docker-image gateway-data-plane:latest gateway-control-plane:latest --name gateway
-helm upgrade --install gateway charts/gateway \
-    --namespace gateway-system --create-namespace \
-    --set controlPlane.image.repository=gateway-control-plane \
-    --set controlPlane.image.tag=latest \
-    --set dataPlane.image.repository=gateway-data-plane \
-    --set dataPlane.image.tag=latest
-```
+## CRDs
 
-## Multi-arch build
+The gateway configures itself from the Gateway API resources and from
+three custom resources of its own in the `gateway.linkerd.io` group.
+`GatewayBackend` names a destination outside the cluster, `Extension`
+names a filter implementation and its config, and `BackendBinding`
+resolves a backend ref of a kind that the gateway has no schema for. The
+schemas are in [charts/gateway-crds](charts/gateway-crds/templates). See
+[the Kinference CRD reference](https://kinference.ai/reference/crds/)
+for the `GatewayBackend` documentation.
 
-```sh
-docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile \
-    -t gateway-data-plane:latest .
-docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.cp \
-    -t gateway-control-plane:latest .
-```
+## Known limitations
 
-## Deploy an example
+The gateway is alpha software. It has not seen sustained production
+exposure. Run at your own risk.
 
-Applying the `Gateway` makes the control plane provision a gatewayd
-`Deployment` and `LoadBalancer` `Service` in the `demo` namespace:
+The current implementation lacks several parts of the Gateway API,
+including:
 
-```sh
-kubectl apply -f examples/sample-app/
-```
+* `TCPRoute`, `TLSRoute` and `GRPCRoute`. The control plane watches
+  `HTTPRoute` only.
+* `allowedRoutes` enforcement. A route attaches to any listener that
+  its parentRef selects.
+* `ReferenceGrant` enforcement. A cross-namespace certificateRef is
+  accepted without a grant.
 
-Send traffic to the Gateway's LoadBalancer address:
+## Copyright and license
 
-```sh
-kubectl -n demo wait --for=condition=available deployment/api-gateway-gatewayd --timeout=120s
-GATEWAY_IP=$(kubectl -n demo get gateway api-gateway -o jsonpath='{.status.addresses[0].value}')
-curl -H 'Host: app.example.com' http://$GATEWAY_IP/    # hello from echo
-curl -H 'Host: other.example.com' http://$GATEWAY_IP/  # 404
-```
+The Buoyant Gateway is copyright 2026 Buoyant, Inc.
 
-## Tear down
+The Buoyant Gateway is licensed under the Apache License, Version 2.0
+(the "License"); you may not use these files except in compliance with
+the License. You may obtain a copy of the License at
+https://www.apache.org/licenses/LICENSE-2.0 .
 
-```sh
-kind delete cluster --name gateway
-docker rm -f cloud-provider-kind
-```
-
-## Development
-
-Requires the Rust toolchain (pinned via `rust-toolchain.toml`) and
-[`just`](https://github.com/casey/just).
-
-```sh
-just lint       # fmt + clippy
-just test-unit  # workspace unit tests
-just up         # build images + kind cluster for e2e
-just test-e2e   # e2e tests against that cluster
-```
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
