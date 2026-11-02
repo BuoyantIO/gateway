@@ -1,80 +1,32 @@
 # gateway-e2e
 
-End-to-end test harness. Stands up a real kind cluster with the
-control plane + CRDs, then each test applies its own Gateway,
-HTTPRoute, and backend in a unique namespace and drives HTTP
-through. The control plane provisions the data plane from the
-Gateway; the harness only adds a fixed-`NodePort` Service over the
-provisioned pods so tests can reach them from the host.
+End-to-end tests for the gateway on a kind cluster. Each test creates
+its own namespace, applies a `Gateway`, an `HTTPRoute` and a backend as
+typed objects, and drives HTTP through the `LoadBalancer` address that
+the Gateway's status reports. The control plane provisions the data
+plane from the `Gateway`, the same way that it does outside the tests.
+[docs/local-development.md](../docs/local-development.md) says how to
+bring the cluster up, how to run the suite or one test, and where the
+logs go when a test fails.
 
 ## Test backends
 
-All three live in the one `gateway-test-echo:e2e` image, selected by
-the container's `command`:
+All three backends live in the one `gateway-test-echo:e2e` image, and
+the container's `command` selects one:
 
-- `echo` — replies `"{method} {path}"` and reflects `X-Test-*`
-  request headers as `X-Echo-*`. Most tests assert through it.
-- `grpc_echo` — the same idea over gRPC, behind a Service whose
+- `echo` replies with `"{method} {path}"` and reflects every `X-Test-*`
+  request header as an `X-Echo-*` response header. Most tests assert
+  through it.
+- `grpc_echo` does the same over gRPC, behind a Service whose
   `appProtocol: grpc` makes the gateway dial h2c.
-- `openai_mock` — a mock inference provider for the egress path. It
-  terminates the TLS the gateway originates, checks the credential
-  the `GatewayBackend` presents, and streams a completion as
-  `text/event-stream` with a configurable gap before the first token
-  (`ttft-ms`) and a configurable tail (`tokens`, `gap-ms`). A
-  plaintext side port serves `/__stats`, one record per request
-  saying what it saw and how much of the response it got to send;
-  `fixtures::provider_stats` reads it through the apiserver pod
-  proxy.
-
-## Prerequisites
-
-- `docker`
-- `kind`
-- `kubectl`
-- `just` (`cargo install just`)
-- A Rust toolchain (pinned by `rust-toolchain.toml`).
-
-`just up` also starts a
-[cloud-provider-kind](https://github.com/kubernetes-sigs/cloud-provider-kind)
-container so `LoadBalancer` Services in the cluster get IPs from the
-docker network. Those IPs are host-routable on Linux; on macOS
-cloud-provider-kind needs its sudo tunnel mode instead of the
-container, which this setup doesn't automate — Linux is the primary
-target.
-
-## Running locally
-
-```sh
-just up        # build images, create kind cluster, deploy CP + CRDs
-just test      # run the e2e suite
-just down      # tear everything down
-```
-
-For a single test:
-
-```sh
-cargo test -p gateway-e2e --test routing -- --ignored exact_beats_prefix
-```
-
-All tests are `#[ignore]`d so they're not run by
-`cargo test --workspace`. The justfile passes `--ignored` for you.
-
-## Debugging failures
-
-A test's namespace, and with it its gatewayd and backend logs, is
-deleted when the test ends. Set `E2E_LOG_DIR` to keep them: each test
-then saves its pods' logs and its namespace's events to
-`$E2E_LOG_DIR/<namespace>/` before deleting it.
-
-Traffic reaches a Gateway through a cloud-provider-kind Envoy
-container (`kindccm-*`) that lives outside the cluster. `just up`
-starts cloud-provider-kind with log dumping on, so the Envoy log of
-every deleted `LoadBalancer` Service lands in
-`/tmp/cloud-provider-kind-logs/<namespace>_<service>.log`; live ones
-are in `docker logs`.
-
-CI does all of this and, when the suite fails, uploads it with the
-`kind export logs` output as the `kind-logs` artifact.
+- `openai_mock` is a mock inference provider for the egress path. It
+  terminates the TLS that the gateway originates, checks the credential
+  that the `GatewayBackend` presents, and streams a completion as
+  `text/event-stream`. Its flags set the gap before the first token
+  (`ttft-ms`) and the tail (`tokens`, `gap-ms`). A plaintext side port
+  serves `/__stats`, one record per request, which says what the mock
+  saw and how much of the response it sent; the fixtures read it
+  through the apiserver pod proxy.
 
 ## How tests are structured
 
@@ -82,24 +34,24 @@ Each test follows the same shape:
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires kind cluster — run via `just test`"]
+#[ignore = "requires kind cluster, run via just test-e2e"]
 async fn my_feature_works() -> Result<()> {
-    // 1. Per-test namespace. Auto-deleted on scope drop, including
-    //    on panic from a failed assertion.
+    // 1. A namespace for this test alone. The scope deletes it on
+    //    drop, including when an assertion panics.
     let scope = Scope::new("my-feature").await?;
     let ns = scope.name();
     let client = scope.client();
 
-    // 2. Expose the (to-be-provisioned) DP on the host NodePort and
-    //    deploy an echo backend.
-    expose_dp(client, ns, "gw").await?;
+    // 2. An echo backend.
     deploy_echo(client, ns, "echo", None).await?;
 
-    // 3. Apply the Gateway. Typed; no YAML. The CP provisions the
-    //    gatewayd Deployment + Service from it.
+    // 3. The Gateway, as a typed object. The control plane provisions
+    //    the gatewayd Deployment and Service from it, and the status
+    //    reports the address once the Service has one.
     apply_gateway(client, &gateway(ns, "gw", 80, None)).await?;
+    let addr = gateway_address(client, ns, "gw").await?;
 
-    // 4. Apply the HTTPRoute via the chainable builder.
+    // 4. The HTTPRoute, through the chainable builder.
     apply_http_route(
         client,
         &http_route(ns, "gw", "route")
@@ -110,20 +62,17 @@ async fn my_feature_works() -> Result<()> {
     )
     .await?;
 
-    // 5. Poll until the data path is wired. (No status writeback
-    //    in the gateway yet, so we probe the data path directly.)
-    //    Returns the first response that matches the expected
-    //    status.
-    let resp = wait_until_routed("app.example", "/", StatusCode::OK).await?;
+    // 5. Poll until the data path answers with the expected status.
+    //    The call returns the first response that matches.
+    let resp = wait_until_routed(&addr, "app.example", "/", StatusCode::OK).await?;
 
     // 6. Assert. The echo replies "{method} {path}" and reflects
-    //    `X-Test-*` request headers as `X-Echo-*` response
-    //    headers, so most assertions go through that mechanism.
+    //    X-Test-* request headers as X-Echo-* response headers.
     assert_eq!(resp.text().await?, "GET /");
     Ok(())
 }
 ```
 
-The namespace lives only for the test. On `Drop` it's deleted
-cascade-style by the apiserver, which GCs every resource the test
-created.
+The namespace lives only for the test. When the scope drops, the
+apiserver deletes the namespace and garbage-collects every resource
+that the test created in it.
