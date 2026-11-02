@@ -165,6 +165,15 @@ jobs:
             /tmp/e2e-logs
           retention-days: 3
 
+  ready-for-merge:
+    name: Ready for merge (release)
+    if: always()
+    needs: [meta, build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'
+
   publish:
     if: ${{ needs.meta.outputs.is_release == 'true' }}
     needs: [meta, test]

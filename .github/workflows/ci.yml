@@ -47,3 +47,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: just test-unit
+
+  ready-for-merge:
+    name: Ready for merge (ci)
+    if: always()
+    needs: [lint, test-unit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'
