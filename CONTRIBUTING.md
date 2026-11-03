@@ -6,11 +6,9 @@ with a coding agent. Agents get the same rules, in more detail, from
 
 ## Architecture
 
-[ARCHITECTURE.md](ARCHITECTURE.md) describes the crate graph and which way
-its dependencies point, how config flows from the control plane to the data
-plane, and what each stage of that path and of the request path decides. Read
-it before you add or move code, and update it in the same pull request as any
-change to those boundaries.
+[ARCHITECTURE.md](ARCHITECTURE.md) is the map of the code: how the code is
+grouped, which way imports go and where new code goes. Read it before you add
+or move code, and change it in the same pull request as any move.
 
 ## Code comments
 
@@ -29,10 +27,31 @@ Doc comments state a brief contract; one or two sentences is usually enough.
 When you change code, update or delete the comments that describe it in the
 same change.
 
+## Rust conventions
+
+- The workspace uses edition 2024. `rust-toolchain.toml` pins the toolchain
+  and `rustfmt.toml` sets `max_width = 100`.
+- The workspace lints forbid `unsafe_code` and warn on clippy `pedantic`.
+  CI runs clippy with `-D warnings`. Generated proto modules are the only
+  place where a blanket `allow` is acceptable.
+- Every module starts with a `//!` doc that explains the module's role and
+  its invariants. Several of those docs carry information that exists
+  nowhere else, such as what `resolve` decides, the Store's promotion rules
+  and why the drain barrier is drop-counted. Keep them accurate.
+- A Rust file follows tokio's order: module doc, `use` groups, `mod`
+  declarations, `pub use`, consts, then types, then free functions, then an
+  inline `#[cfg(test)] mod tests`. The `use` groups are `std`, external
+  crates, then `crate` and `super`, with a blank line between groups and
+  alphabetical order within a group. rustfmt does not reorder between
+  groups. The principal type comes first, and each type's inherent and
+  trait `impl`s follow it directly.
+- Unit tests live inline in the module that they cover. `tests/` holds
+  integration tests only.
+
 ## Commits
 
-PRs are merged with a merge commit, not squashed, so your commits land on
-`main` as you wrote them.
+Maintainers merge PRs with a merge commit rather than squashing them, so
+your commits land on `main` as you wrote them.
 
 - Make each commit one logical change: the feature or fix, its tests, docs
   and unrelated small fixes go in separate commits when they make sense on
@@ -60,18 +79,17 @@ To see one entry per merged PR, use `git log --first-parent main`.
 
 ### Ultimate Human Accountability ###
 
-The human author submitting a contribution remains entirely and solely
-accountable for its content, correctness, security, and runtime functionality.
-Utilizing an LLM or AI tool does not shift, diminish, or share accountability
-with the software tool, model provider, or AI platform.
+The human who submits a contribution remains entirely and solely
+accountable for its content, correctness, security and runtime behavior.
+An LLM or AI tool does not shift, diminish or share that accountability
+with the tool, the model provider or the AI platform.
 
-- Architectural & Logic Mastery: The human contributor must thoroughly
-understand and be able to explain the entirety of their submission.
-- Maintainer review focuses entirely on the safety, logic, and quality of the
-contribution, regardless of whether generative AI or LLMs were used to create
-it.
-- Tool-assisted submissions must still adhere to all contribution guidelines
-set above in this document.
+- Architectural & Logic Mastery: The contributor must understand the whole
+submission thoroughly and be able to explain it.
+- Maintainers review the safety, logic and quality of every contribution,
+whether or not the contributor used generative AI or LLMs to create it.
+- A tool-assisted submission must still follow all the contribution
+guidelines above.
 
 ### Attribution and Co-Author Guidelines ###
 
@@ -79,19 +97,19 @@ Attributing AI tools, models, or assistant platforms (for example, via
 `Co-authored-by:` commit message trailers or pull request descriptions) is
 **optional**.
 
-- **Optional Tool Attribution:** Contributors who wish to acknowledge AI tool
-usage may optionally include a commit trailer or PR footnote.
-- **No Legal Co-Authorship:** AI tools and LLMs cannot be designated as legal
-copyright holders or primary authors, as accountability rests exclusively with
-the human contributor.
+- **Optional Tool Attribution:** A contributor who wants to acknowledge the
+AI tools that they used may add a commit trailer or a PR footnote.
+- **No Legal Co-Authorship:** Nobody may name an AI tool or LLM as a legal
+copyright holder or a primary author, because accountability rests only
+with the human contributor.
 
 ### Maintainer Authority and Enforcement ###
 
 Gateway maintainers reserve the right to:
 
-- Reject or close pull requests or issues that exhibit evidence of hallucinated
-content or lack of human oversight.
-- Require additional explanation, architectural rationale, or smaller
-surface-area iteration for complex AI-assisted contributions.
+- Reject or close pull requests or issues that show signs of hallucinated
+content or of a lack of human oversight.
+- Require more explanation, a rationale for the design, or smaller
+iterations for complex AI-assisted contributions.
 - Block or restrict contributors who repeatedly submit unvalidated AI-generated
 pull requests.

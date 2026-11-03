@@ -1,8 +1,10 @@
-# kinference manual verification
+# Kinference manual verification
 
-Drives a real request through the full path: client → gateway DP →
-`kinference_selector` extension → kinference Picker → dummy vLLM → streamed
-response + reports.
+How to drive a real inference request through the full path. The client
+sends a chat completion to the gateway data plane, the
+`kinference_selector` extension streams the body to the Kinference
+Picker, the Picker picks a dummy vLLM worker, and the response streams
+back while the extension reports the first and the final token.
 
 ## 1. Gateway cluster
 
@@ -12,25 +14,25 @@ From the `gateway` repo root:
 just up
 ```
 
-Builds the DP/CP/echo images (the DP registers `kinference_selector` at
-startup), creates kind cluster `gateway-e2e` (kubectl context
-`kind-gateway-e2e`), installs the Gateway API CRDs, the `gateway-crds`
-chart (the `Extension` and `BackendBinding` CRDs ship there, not in the
-`gateway` chart), the `gateway` chart, and cloud-provider-kind so
-`LoadBalancer` Services get host-routable IPs.
+The recipe builds the data-plane, control-plane and echo images, creates
+the kind cluster `gateway-e2e` with the kubectl context
+`kind-gateway-e2e`, installs the Gateway API CRDs, the `gateway-crds`
+chart, the `gateway` chart and cloud-provider-kind, so that
+`LoadBalancer` Services get host-routable IPs. The data plane registers
+`kinference_selector` at startup. The `Extension` and `BackendBinding`
+CRDs ship in the `gateway-crds` chart, not in the `gateway` chart.
 
-And then deploy the Gateway CR and retrieve the gateway's IP, used in the tests
-further down below:
+Then apply the `Gateway` and read its IP, which the requests below use:
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f examples/kinference/gateway.yml
-# Wait a little bit until the IP is provisioned
+# Wait a little until the IP is provisioned
 GW=$(kubectl --context kind-gateway-e2e -n default get svc llm-gw-gatewayd -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 ```
 
-## 2. Get kinference into the cluster
+## 2. Get Kinference into the cluster
 
-From the `llm-monitor` repo root:
+From the Kinference repo root:
 
 ```bash
 just image
@@ -40,8 +42,8 @@ just image
 kind load docker-image kinference:latest --name gateway-e2e
 ```
 
-Install the CRD chart, then the workload chart into `default` — the
-namespace the chart's default config names in `[policy]` and
+Install the CRD chart, then the workload chart, into `default`. That is
+the namespace that the chart's default config names in `[policy]` and
 `[kubernetes]`:
 
 ```bash
@@ -61,58 +63,61 @@ kubectl --context kind-gateway-e2e wait --for=condition=available \
     deployment/kinference --timeout=180s
 ```
 
-`extension.enabled=true` has the chart create the `chat-picker`
-`Extension` (class `kinference_selector`, pointing at
-`kinference.default.svc:50051`) — the gateway cluster must exist first,
-since `Extension` is the gateway's CRD. The picker holds per-request
-state, so that `service` target must resolve to a single instance; the
-chart's one replica does.
+`extension.enabled=true` makes the chart create the `chat-picker`
+`Extension`, of class `kinference_selector`, pointing at
+`kinference.default.svc:50051`. The gateway cluster must exist first,
+because `Extension` is the gateway's CRD. The picker holds per-request
+state, so the `service` target must resolve to a single instance, and
+the chart's one replica does.
 
-The chart's default config also sets `[policy] backend_bindings = true`:
-kinference publishes one `BackendBinding` per `InferencePool`, each
-listing `chat-picker`, so no gateway plumbing is written by hand below.
+The chart's default config also sets `[policy] backend_bindings = true`.
+Kinference then publishes one `BackendBinding` per `InferencePool`, each
+listing `chat-picker`, so none of the steps below writes gateway
+plumbing by hand.
 
 ## 3. Dummy worker
 
-Still from the `llm-monitor` repo root. The dummy vLLM is CPU-only
+Still from the Kinference repo root. The dummy vLLM runs on the CPU
 and answers nonsense:
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f tests/e2e/manifests/dummy-vllm.yaml
 ```
 
-Wait for the engine (first run pulls the CPU image and fetches the
-model config/tokenizer):
+Wait for the engine. The first run pulls the CPU image and fetches the
+model config and tokenizer:
 
 ```bash
 kubectl --context kind-gateway-e2e rollout status deployment/dummy-vllm --timeout=420s
 ```
 
-## 4. Tests!
+## 4. Tests
 
-If you want, you can enable the extension's per-request debug logs:
+To see the extension's per-request debug logs, set the data plane's
+log filter through the Gateway annotation:
 
 ```bash
 kubectl --context kind-gateway-e2e -n default annotate gateway llm-gw gateway.buoyant.io/dp-log-filter='info,extension=debug' --overwrite
 ```
 
-And see them with:
+Then follow the data plane's log:
+
 ```bash
 kubectl --context kind-gateway-e2e logs deploy/llm-gw-gatewayd -f
 ```
 
 ### Option A: Only test the dummy worker
 
-Deploy the InferenceWokerSet that wraps the dummy worker, and the
-single-destination InferencePool pointing to it:
+Apply the `InferenceWorkerSet` that wraps the dummy worker, and the
+single-destination `InferencePool` that points to it:
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f tests/e2e/manifests/workerset.yaml
 kubectl --context kind-gateway-e2e apply -f tests/e2e/manifests/pool.yaml
 ```
 
-Then check kinference discovered the worker and published the binding
-for the pool:
+Then check that Kinference discovered the worker and published the
+binding for the pool:
 
 ```bash
 kubectl --context kind-gateway-e2e logs deploy/kinference | tail -20
@@ -124,16 +129,16 @@ kubectl --context kind-gateway-e2e get backendbindings
 
 The `smoke` binding must show `Accepted: True`.
 
-#### Deploy route and test traffic
+#### Deploy the route and send traffic
 
-Now back into the current repo, deploy the HTTPRoute pointing to the `smoke`
-InferencePool:
+Back in the `gateway` repo, apply the `HTTPRoute` that points to the
+`smoke` `InferencePool`:
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f examples/kinference/httproute-smoke.yml
 ```
 
-And test the traffic with:
+Then send a request:
 
 ```bash
 curl -sN "http://$GW/v1/chat/completions" \
@@ -142,16 +147,16 @@ curl -sN "http://$GW/v1/chat/completions" \
   -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "max_tokens": 64, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "say hi"}]}'
 ```
 
-### Option B: Test load-balance between dummy worker and Databricks provider
+### Option B: Load-balance between the dummy worker and a Databricks provider
 
-The following assumes you have access to a Databricks instance. Set its
-credentials in the following env vars:
+This option needs access to a Databricks instance. Put its credentials
+in these environment variables:
 
 - `DATABRICKS_SUBDOMAIN`
 - `DATABRICKS_CLIENT_ID`
 - `DATABRICKS_SECRET`
 
-And back into the current repo, apply the following manifests:
+Back in the `gateway` repo, apply the manifests:
 
 ```bash
 # InferencePool pointing to the dummy and databricks destinations
@@ -166,24 +171,25 @@ envsubst < examples/kinference/gatewaybackend-databricks.yml | kubectl --context
 kubectl --context kind-gateway-e2e apply -f examples/kinference/inferencepolicy-split.yml
 ```
 
-Set up the secret to authenticate against Databricks:
+Create the secret that authenticates against Databricks:
 
 ```bash
 kubectl -n default create secret generic databricks-oauth --from-literal=client-secret=${DATABRICKS_SECRET}
 ```
 
-#### Deploy route and test traffic
+#### Deploy the route and send traffic
 
-Deploy the HTTPRoute pointing to the `inference-all` InferencePool:
+Apply the `HTTPRoute` that points to the `inference-all`
+`InferencePool`:
 
 ```bash
 kubectl --context kind-gateway-e2e apply -f examples/kinference/httproute-all.yml
 ```
 
-Repeat this request a few times; it should land on the local vLLM about half
-the time and on Databricks the other half. Note that when landing on Databricks
-the first time, it'll take several minutes to warm up, responding with an error
-first, but then stabilizing:
+Repeat this request a few times. About half of the requests land on
+the local vLLM and the other half on Databricks. The first request that
+lands on Databricks takes several minutes to warm up, so it answers
+with an error first and then stabilizes:
 
 ```bash
 curl -sN "http://$GW/v1/chat/completions" \

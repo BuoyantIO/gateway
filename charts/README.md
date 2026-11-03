@@ -1,8 +1,7 @@
 # Charts
 
 Helm charts for running the gateway control plane on a Kubernetes
-cluster (kind or any standard distribution). The sample manifests
-applied below live in `examples/` at the repo root.
+cluster. The sample manifests live in `examples/` at the repo root.
 
 ## Layout
 
@@ -24,91 +23,48 @@ examples/
     └── 30-httproute.yaml                    # Exact /healthz, PathPrefix / -> echo:8080
 ```
 
-The data plane is not part of the chart: the control plane
-provisions a gatewayd `Deployment` + `Service`
-(`api-gateway-gatewayd`) in the Gateway's namespace when the Gateway
-is applied. The chart pins the gatewayd image the provisioner
-deploys via `dataPlane.image` (rendered into the CP's `--dp-image`
-flag).
+The data plane is not part of the chart. When a `Gateway` is applied,
+the control plane provisions a gatewayd `Deployment` and `Service` in
+the Gateway's namespace. The chart pins the gatewayd image that the
+provisioner deploys through `dataPlane.image`, which it renders into the
+control plane's `--dp-image` flag.
 
-## Install from local builds
+## Install
 
-From the repo root:
+[docs/local-development.md](../docs/local-development.md) walks through
+an install from local builds on a kind cluster, with the sample app and
+the requests that verify it.
 
-```sh
-docker build -f Dockerfile     -t gateway-data-plane:latest    .
-docker build -f Dockerfile.cp  -t gateway-control-plane:latest .
-```
+The `gateway-crds` chart must be installed before the `gateway` chart,
+because the control plane watches those CRDs at startup. On a cluster
+that installed a pre-split `gateway` chart, the CRDs already exist
+without Helm ownership metadata, so the first
+`helm install gateway-crds` there needs `--take-ownership`, or a
+one-time label and annotate of the three CRDs with the release
+metadata.
 
-For kind:
-
-```sh
-kind load docker-image gateway-data-plane:latest gateway-control-plane:latest
-```
-
-Install the Gateway API CRDs, the two charts (the workload chart
-pointed at the local images), and the sample app:
-
-```sh
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
-helm upgrade --install gateway-crds charts/gateway-crds \
-    --namespace gateway-system --create-namespace
-helm upgrade --install gateway charts/gateway \
-    --namespace gateway-system \
-    --set controlPlane.image.repository=gateway-control-plane \
-    --set controlPlane.image.tag=latest \
-    --set dataPlane.image.repository=gateway-data-plane \
-    --set dataPlane.image.tag=latest
-kubectl apply -f examples/sample-app/
-```
-
-Image values default to the published `cr.kinference.ai/buoyantio` images at
-the chart's `appVersion`; the overrides above are only needed for locally built
-images.
-
-The `gateway-crds` chart must be installed first: the control plane
-watches those CRDs at startup. On a cluster that installed a
-pre-split `gateway` chart the CRDs already exist without Helm
-ownership metadata (Helm's `crds/` directory installs them
-untracked), so the first `helm install gateway-crds` there needs
-`--take-ownership` (or a one-time label/annotate of the three CRDs
-with the release metadata).
-
-## Verify
-
-```sh
-kubectl -n demo wait --for=condition=available deployment/api-gateway-gatewayd --timeout=120s
-kubectl -n demo port-forward svc/api-gateway-gatewayd 8080:80
-curl -H 'Host: app.example.com'   http://localhost:8080/         # -> "hello from echo" (catch-all PathPrefix `/`)
-curl -H 'Host: app.example.com'   http://localhost:8080/healthz  # -> "hello from echo" (Exact `/healthz`)
-curl -H 'Host: app.example.com'   http://localhost:8080/healthzz # -> "hello from echo" (falls back to PathPrefix, NOT Exact)
-curl -H 'Host: other.example.com' http://localhost:8080/         # -> 404 (hostname not matched)
-```
-
-The sample `HTTPRoute` is scoped to `app.example.com` via
-`spec.hostnames` and declares two rules:
-
-- `Exact /healthz` — wins over the catch-all for that one path.
-- `PathPrefix /` — catch-all.
-
-`/healthzz` is the critical case: it confirms `Exact` doesn't
-prefix-match (it falls through to the PathPrefix instead).
+The image values default to `cr.kinference.ai/buoyantio/gateway-cp` and
+`cr.kinference.ai/buoyantio/gatewayd` at the chart's `appVersion`. The
+overrides in the local-development guide are needed only for locally
+built images.
 
 ## Notes
 
-- The control plane provisions the data plane: applying an owned
-  `Gateway` yields a gatewayd `Deployment`, `Service`, and
+- The control plane provisions the data plane. Applying an owned
+  `Gateway` yields a gatewayd `Deployment`, `Service` and
   `ServiceAccount` named `{gateway}-gatewayd` in the Gateway's
-  namespace, owner-referenced so deleting the Gateway cleans them
-  up. Two per-Gateway annotations steer it:
-  `gateway.buoyant.io/service-type: ClusterIP|NodePort|LoadBalancer`
-  (default `LoadBalancer`) and
-  `gateway.buoyant.io/provisioning: disabled` to opt a Gateway out
-  and deploy gatewayd by hand (`--client-id={ns}/{gw-name}`).
-- The controller writes status: `kubectl get gtw` shows ADDRESS
-  (from the provisioned Service) and PROGRAMMED, listener entries
-  carry `attachedRoutes`, and the GatewayClass is marked `Accepted`.
-  `HTTPRoute.status.parents` is not written yet.
-- The control plane resolves backend endpoints from `EndpointSlice`s
-  (one endpoint per ready pod address); the data plane balances
+  namespace, each with an owner reference, so deleting the `Gateway`
+  cleans them up. Two per-Gateway annotations steer it:
+  `gateway.buoyant.io/service-type` picks `ClusterIP`, `NodePort` or
+  `LoadBalancer`, with `LoadBalancer` as the default, and
+  `gateway.buoyant.io/provisioning: disabled` opts a `Gateway` out so
+  that you deploy gatewayd by hand with `--client-id={ns}/{gw-name}`.
+- The controller writes status. `kubectl get gtw` shows the address
+  from the provisioned Service and the `Programmed` condition, each
+  listener entry carries `attachedRoutes`, and the `GatewayClass` is
+  marked `Accepted`. The controller also writes its own entries in each
+  `HTTPRoute`'s `status.parents`, which report attachment and backend
+  resolution.
+- The control plane resolves backend endpoints from `EndpointSlice`s,
+  one endpoint per ready pod address, and the data plane balances
   across them per request. A Service with no ready pods answers 503.
