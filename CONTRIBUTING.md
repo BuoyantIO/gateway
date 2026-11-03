@@ -63,6 +63,15 @@ your commits land on `main` as you wrote them.
   `git rebase -i --autosquash` before merging. The final branch shouldn't
   contain "address review" or "fix typo" commits.
 
+## Sign your commits
+
+Every commit needs a `Signed-off-by` trailer with your name and email.
+The trailer states that you wrote the change or have the right to submit
+it under the project's license, as the
+[Developer Certificate of Origin](https://developercertificate.org)
+describes. `git commit -s` adds the trailer. A check on each pull request
+rejects commits without one.
+
 ## Pull requests
 
 The PR title and description become the merge commit message, so write them
