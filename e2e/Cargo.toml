@@ -26,6 +26,7 @@ path = "src/bin/openai_mock.rs"
 [dependencies]
 anyhow = "1"
 bytes = "1"
+futures = "0.3"
 gateway-api = "0.21"
 gateway-config = { path = "../crates/gateway-config" }
 gateway-cp = { path = "../crates/gateway-cp" }

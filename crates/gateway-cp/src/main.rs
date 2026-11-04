@@ -67,6 +67,12 @@ fn default_pod_name() -> String {
 /// are all short, bounded operations.
 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Read timeout on the client that writes to the apiserver (lease,
+/// status, infra). kube's default (295s, sized for watches) would
+/// let one hung write stall a writer, or a lease renewal, for
+/// minutes; watches keep the default on their own client.
+const WRITE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Keepalive on the data-plane config streams; see the matching
 /// constants in `gateway_cp_client`.
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -120,6 +126,7 @@ fn spawn_drain_driver(
 /// fails startup instead of leaving a silently unready pod.
 async fn spawn_admin(
     addr: SocketAddr,
+    is_leader: watch::Receiver<bool>,
     drain: drain::Watch,
 ) -> anyhow::Result<(
     watch::Sender<admin::ReadyState>,
@@ -130,7 +137,7 @@ async fn spawn_admin(
         shutting_down: false,
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let handle = tokio::spawn(admin::serve(listener, ready_rx, drain));
+    let handle = tokio::spawn(admin::serve(listener, ready_rx, is_leader, drain));
     tracing::info!(admin = %addr, "admin server listening");
     Ok((ready_tx, handle))
 }
@@ -159,6 +166,18 @@ fn spawn_elector(
     (is_leader, handle)
 }
 
+/// The apiserver clients: one for watches, with kube's long default
+/// read timeout, and one for writes (lease, status, infra) bounded
+/// by [`WRITE_READ_TIMEOUT`].
+async fn kube_clients() -> anyhow::Result<(kube::Client, kube::Client)> {
+    let config = kube::Config::infer().await?;
+    let writer = kube::Client::try_from(kube::Config {
+        read_timeout: Some(WRITE_READ_TIMEOUT),
+        ..config.clone()
+    })?;
+    Ok((kube::Client::try_from(config)?, writer))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -169,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let client = kube::Client::try_default().await?;
+    let (client, writer_client) = kube_clients().await?;
     let state = Arc::new(ServerState::new());
 
     // One drain channel is the whole shutdown story: the Watch side
@@ -182,52 +201,53 @@ async fn main() -> anyhow::Result<()> {
     let (admin_signal, admin_watch) = drain::channel();
     let driver = spawn_drain_driver(drain_signal, admin_signal)?;
 
-    // Admin server: readiness flips once the watch loop has run a
-    // full pass over synced reflectors.
-    let (ready_tx, admin_handle) = spawn_admin(args.admin_addr, admin_watch).await?;
-
     // Leader election: every replica translates and serves data
     // planes, but only the lease holder writes status and reconciles
     // infra. The elector task publishes transitions on a watch
-    // channel the writer tasks and watch loop consume.
+    // channel the writer tasks, watch loop and admin server consume.
     let (is_leader, lease_handle) = spawn_elector(
-        client.clone(),
+        writer_client.clone(),
         args.pod_namespace.clone(),
         args.pod_name.clone(),
         drain_watch.clone(),
     );
 
+    // Admin server: readiness flips once the watch loop has run a
+    // full pass over synced reflectors.
+    let (ready_tx, admin_handle) =
+        spawn_admin(args.admin_addr, is_leader.clone(), admin_watch).await?;
+
     // Data-plane provisioning: the watch loop publishes desired
     // infra into a channel and the writer task owns the apiserver
     // writes. Inactive unless both flags are set.
-    let (infra_publisher, writer_handle) =
-        if let (Some(dp_image), Some(cp_url)) = (args.dp_image, args.cp_url) {
-            let config = InfraConfig {
-                dp_image,
-                cp_url,
-                admin_port: args.dp_admin_port,
-            };
-            let (tx, rx) = watch::channel(Vec::new());
-            let writer_client = client.clone();
-            let leader = is_leader.clone();
-            let w = drain_watch.clone();
-            let handle = tokio::spawn(async move {
-                infra_writer::run(writer_client, rx, leader, stopped(w.clone())).await;
-                drop(w);
-            });
-            tracing::info!("data-plane provisioning enabled");
-            (Some(InfraPublisher { config, tx }), Some(handle))
-        } else {
-            tracing::info!("data-plane provisioning disabled (--dp-image / --cp-url unset)");
-            (None, None)
+    let (infra_publisher, writer_handle) = if let (Some(dp_image), Some(cp_url)) =
+        (args.dp_image, args.cp_url)
+    {
+        let config = InfraConfig {
+            dp_image,
+            cp_url,
+            admin_port: args.dp_admin_port,
         };
+        let (tx, rx) = watch::channel(Vec::new());
+        let (watch_client, writer_client) = (client.clone(), writer_client.clone());
+        let leader = is_leader.clone();
+        let w = drain_watch.clone();
+        let handle = tokio::spawn(async move {
+            infra_writer::run(watch_client, writer_client, rx, leader, stopped(w.clone())).await;
+            drop(w);
+        });
+        tracing::info!("data-plane provisioning enabled");
+        (Some(InfraPublisher { config, tx }), Some(handle))
+    } else {
+        tracing::info!("data-plane provisioning disabled (--dp-image / --cp-url unset)");
+        (None, None)
+    };
 
     // Status writeback: the watch loop publishes desired status per
     // pass; this task owns the apiserver writes. Always on — writing
     // status is a controller duty, not an optional feature.
     let (status_tx, status_rx) = watch::channel(StatusWork::default());
     let status_handle = {
-        let writer_client = client.clone();
         let leader = is_leader.clone();
         let w = drain_watch.clone();
         tokio::spawn(async move {

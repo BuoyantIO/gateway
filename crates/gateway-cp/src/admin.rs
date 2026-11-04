@@ -1,4 +1,5 @@
-//! Admin HTTP server: the probe endpoints kubelet hits.
+//! Admin HTTP server: the probe endpoints kubelet hits, plus this
+//! replica's leadership.
 //!
 //! `GET /healthz/ready` answers 200 once the watch loop has finished
 //! a full pass with every reflector past its initial sync — the
@@ -10,6 +11,11 @@
 //!
 //! `GET /healthz/alive` answers 200 unconditionally: liveness means
 //! "the process and its runtime respond", nothing deeper.
+//!
+//! `GET /leader` answers 200 with `leader` or `follower`: whether
+//! this replica currently acts as the lease holder (writes status,
+//! reconciles infra). Lets tests check that at most one replica
+//! does.
 
 use std::convert::Infallible;
 use std::pin::pin;
@@ -44,7 +50,12 @@ impl ReadyState {
 /// `main` so a bad `--admin-addr` fails startup instead of leaving
 /// a silently unready pod). Runs until `drain` fires; in-flight
 /// probe responses finish under the drain barrier.
-pub async fn serve(listener: TcpListener, ready: watch::Receiver<ReadyState>, drain: drain::Watch) {
+pub async fn serve(
+    listener: TcpListener,
+    ready: watch::Receiver<ReadyState>,
+    leader: watch::Receiver<bool>,
+    drain: drain::Watch,
+) {
     let mut stop = pin!(drain.clone().signaled());
     loop {
         tokio::select! {
@@ -59,11 +70,13 @@ pub async fn serve(listener: TcpListener, ready: watch::Receiver<ReadyState>, dr
                     }
                 };
                 let ready = ready.clone();
+                let leader = leader.clone();
                 let drain = drain.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let state = ready.borrow().clone();
-                        let response = respond(req.method(), req.uri().path(), &state);
+                        let leader = *leader.borrow();
+                        let response = respond(req.method(), req.uri().path(), &state, leader);
                         async move { Ok::<_, Infallible>(response) }
                     });
                     let conn = http1::Builder::new()
@@ -87,7 +100,7 @@ pub async fn serve(listener: TcpListener, ready: watch::Receiver<ReadyState>, dr
     }
 }
 
-fn respond(method: &Method, path: &str, state: &ReadyState) -> Response<Full<Bytes>> {
+fn respond(method: &Method, path: &str, state: &ReadyState, leader: bool) -> Response<Full<Bytes>> {
     if *method != Method::GET && *method != Method::HEAD {
         return response(StatusCode::NOT_FOUND, Bytes::from_static(b"not found\n"));
     }
@@ -104,6 +117,8 @@ fn respond(method: &Method, path: &str, state: &ReadyState) -> Response<Full<Byt
             };
             response(StatusCode::SERVICE_UNAVAILABLE, Bytes::from(body))
         }
+        "/leader" if leader => response(StatusCode::OK, Bytes::from_static(b"leader\n")),
+        "/leader" => response(StatusCode::OK, Bytes::from_static(b"follower\n")),
         _ => response(StatusCode::NOT_FOUND, Bytes::from_static(b"not found\n")),
     }
 }
@@ -132,10 +147,18 @@ mod tests {
     async fn spawn_admin(
         ready: watch::Receiver<ReadyState>,
     ) -> (std::net::SocketAddr, drain::Signal) {
+        let (_, leader) = watch::channel(false);
+        spawn_admin_with_leader(ready, leader).await
+    }
+
+    async fn spawn_admin_with_leader(
+        ready: watch::Receiver<ReadyState>,
+        leader: watch::Receiver<bool>,
+    ) -> (std::net::SocketAddr, drain::Signal) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (signal, watch) = drain::channel();
-        tokio::spawn(serve(listener, ready, watch));
+        tokio::spawn(serve(listener, ready, leader, watch));
         (addr, signal)
     }
 
@@ -186,6 +209,21 @@ mod tests {
 
         let response = get(addr, "/healthz/alive").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn leader_reports_current_leadership() {
+        let (_ready_tx, ready) = watch::channel(pending(&[]));
+        let (leader_tx, leader) = watch::channel(false);
+        let (addr, _stop) = spawn_admin_with_leader(ready, leader).await;
+
+        let response = get(addr, "/leader").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("follower\n"), "{response}");
+
+        leader_tx.send_replace(true);
+        let response = get(addr, "/leader").await;
+        assert!(response.ends_with("\r\n\r\nleader\n"), "{response}");
     }
 
     #[tokio::test]
