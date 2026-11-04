@@ -55,7 +55,7 @@ helm upgrade --install gateway charts/gateway \
 The image overrides point the chart at the local builds. Without them
 the chart pulls the published images at its `appVersion`. To run the
 published charts instead of a local build, follow
-[the getting started guide](https://kinference.ai/getting-started/).
+[the getting started guide](https://kinference.ai/docs/getting-started/).
 
 ## See it work
 

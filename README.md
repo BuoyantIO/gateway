@@ -23,7 +23,7 @@ the Picker returns.
 ## Quick start
 
 See [the Kinference getting started
-guide](https://kinference.ai/getting-started/), which installs the
+guide](https://kinference.ai/docs/getting-started/), which installs the
 gateway charts and Kinference together.
 
 ## Documentation
@@ -45,7 +45,7 @@ three custom resources of its own in the `gateway.linkerd.io` group.
 names a filter implementation and its config, and `BackendBinding`
 resolves a backend ref of a kind that the gateway has no schema for. The
 schemas are in [charts/gateway-crds](charts/gateway-crds/templates). See
-[the Kinference CRD reference](https://kinference.ai/reference/crds/)
+[the Kinference CRD reference](https://kinference.ai/docs/reference/crds/)
 for the `GatewayBackend` documentation.
 
 ## Known limitations
