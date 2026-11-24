@@ -10,6 +10,42 @@ const HEAD_CAP: usize = 2 * 1024;
 /// The usage object rides at or near the end.
 const TAIL_CAP: usize = 64 * 1024;
 
+/// What `ReportFinalToken` says about one response.
+pub(crate) struct Usage {
+    /// `""` when the response named no model.
+    pub(crate) model: String,
+    pub(crate) prompt_tokens: Option<u64>,
+    pub(crate) completion_tokens: Option<u64>,
+    pub(crate) cached_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// The usage of a Messages response. The prompt count is the sum
+    /// of the three input counts, and stays absent when all three are.
+    pub(crate) fn messages(
+        model: String,
+        input: Option<u64>,
+        output: Option<u64>,
+        cache_read: Option<u64>,
+        cache_creation: Option<u64>,
+    ) -> Self {
+        let prompt_tokens = [input, cache_read, cache_creation]
+            .into_iter()
+            .flatten()
+            .reduce(u64::saturating_add);
+        Self {
+            model,
+            prompt_tokens,
+            completion_tokens: output,
+            cached_tokens: cache_read,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.prompt_tokens.is_none() && self.completion_tokens.is_none()
+    }
+}
+
 /// Bounded head + rolling tail of the response body.
 #[derive(Default)]
 pub(crate) struct Capture {
@@ -28,6 +64,33 @@ impl Capture {
             let drain = self.tail.len() - TAIL_CAP;
             self.tail.drain(0..drain);
         }
+    }
+
+    /// The usage of a chat-completion response.
+    pub(crate) fn usage(&self) -> Usage {
+        Usage {
+            model: self.model(),
+            prompt_tokens: self.prompt_tokens(),
+            completion_tokens: self.completion_tokens(),
+            cached_tokens: self.cached_tokens(),
+        }
+    }
+
+    /// The usage of a Messages response that is one JSON document.
+    /// vLLM writes `model` after `content`, so the tail is the second
+    /// place to look.
+    pub(crate) fn messages_usage(&self) -> Usage {
+        let model = extract_model(&self.head)
+            .or_else(|| extract_model(&self.tail))
+            .unwrap_or_default();
+        let count = |field| extract_usage_uint(&self.tail, field);
+        Usage::messages(
+            model,
+            count("input_tokens"),
+            count("output_tokens"),
+            count("cache_read_input_tokens"),
+            count("cache_creation_input_tokens"),
+        )
     }
 
     /// The served model, `""` when none was found in the head.
@@ -195,6 +258,34 @@ mod tests {
         assert_eq!(c.prompt_tokens(), Some(3));
         assert_eq!(c.completion_tokens(), Some(9));
         assert_eq!(c.cached_tokens(), Some(99));
+    }
+
+    /// A Messages document sums the three input counts.
+    #[test]
+    fn messages_json_yields_model_and_usage() {
+        let mut c = Capture::default();
+        c.feed(
+            b"{\"id\": \"msg_1\", \"content\": [], \"model\": \"claude-x\", \"usage\": {\"input_tokens\": 3, \"cache_creation_input_tokens\": 4, \"cache_read_input_tokens\": 5, \"output_tokens\": 9}}",
+        );
+        let usage = c.messages_usage();
+        assert_eq!(usage.model, "claude-x");
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.cached_tokens, Some(5));
+        assert_eq!(usage.completion_tokens, Some(9));
+    }
+
+    /// A null cache count stays unset and adds nothing to the prompt count.
+    #[test]
+    fn messages_json_null_counts_stay_absent() {
+        let mut c = Capture::default();
+        c.feed(
+            b"{\"usage\": {\"input_tokens\": 3, \"cache_read_input_tokens\": null, \"output_tokens\": 9}}",
+        );
+        let usage = c.messages_usage();
+        assert_eq!(usage.prompt_tokens, Some(3));
+        assert_eq!(usage.cached_tokens, None);
+        assert!(!usage.is_empty());
+        assert!(Capture::default().messages_usage().is_empty());
     }
 
     #[test]

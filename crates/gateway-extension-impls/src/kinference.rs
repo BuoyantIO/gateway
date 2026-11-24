@@ -14,6 +14,7 @@ pub mod proto {
     tonic::include_proto!("kinference.v1");
 }
 
+mod messages;
 mod usage;
 
 use std::net::SocketAddr;
@@ -201,6 +202,7 @@ impl ExtensionBuilder for KinferenceSelectorBuilder {
             ttft_reported: false,
             provider: false,
             api_call: ApiCall::ChatCompletions,
+            events: None,
             itl: usage::Itl::default(),
             capture: usage::Capture::default(),
         })
@@ -231,13 +233,15 @@ struct KinferenceSelector {
     /// than `NOT_DISPATCHED`.
     provider: bool,
     api_call: ApiCall,
+    /// Set when a Messages response is an event stream.
+    events: Option<messages::Events>,
     itl: usage::Itl,
     capture: usage::Capture,
 }
 
 impl KinferenceSelector {
     /// Sends the pick's one `ReportFirstToken`. Later calls do nothing.
-    fn report_first(&mut self, now: Instant) {
+    fn report_first(&mut self, now: Instant, upstream_status: i32) {
         if std::mem::replace(&mut self.ttft_reported, true) {
             return;
         }
@@ -247,13 +251,13 @@ impl KinferenceSelector {
         tracing::debug!(target: LOG,
             response_id = self.response_id,
             ttft_ms,
-            status = self.upstream_status,
+            status = upstream_status,
             "kinference: reporting first token"
         );
         self.reporter.send(Report::First(ReportFirstTokenRequest {
             response_id: self.response_id,
             observed_ttft_ms: ttft_ms,
-            upstream_status: self.upstream_status,
+            upstream_status,
         }));
     }
 }
@@ -449,48 +453,75 @@ impl Extension for KinferenceSelector {
 
     fn on_response_start(&mut self, head: &mut http::response::Parts, _cx: &mut Cx) {
         self.upstream_status = i32::from(head.status.as_u16());
+        if self.api_call == ApiCall::Messages && is_event_stream(&head.headers) {
+            self.events = Some(messages::Events::default());
+        }
     }
 
     fn on_response_body(&mut self, chunk: Bytes, _end_of_stream: bool, _cx: &mut Cx) {
         if self.response_id == 0 || chunk.is_empty() {
             return;
         }
-        // A token-count response holds no tokens and no usage.
-        if self.api_call == ApiCall::MessagesCountTokens {
-            return;
-        }
         let now = Instant::now();
-        self.report_first(now);
-        self.itl.record(now);
-        self.capture.feed(&chunk);
+        match self.api_call {
+            ApiCall::ChatCompletions => {
+                self.report_first(now, self.upstream_status);
+                self.itl.record(now);
+                self.capture.feed(&chunk);
+            }
+            ApiCall::Messages => {
+                // A response that is one JSON document has no delta
+                // event, so its first token is the end of the response.
+                let Some(events) = self.events.as_mut() else {
+                    self.capture.feed(&chunk);
+                    return;
+                };
+                let fed = events.feed(&chunk);
+                if fed.error {
+                    self.report_first(now, 500);
+                }
+                if fed.tokens > 0 {
+                    self.report_first(now, self.upstream_status);
+                }
+                for _ in 0..fed.tokens {
+                    self.itl.record(now);
+                }
+            }
+            // A token-count response holds no tokens and no usage.
+            ApiCall::MessagesCountTokens => {}
+        }
     }
 
     fn on_response_end(&mut self, end: &ResponseEnd, _cx: &mut Cx) {
         if self.response_id == 0 {
             return;
         }
-        let token_count = self.api_call == ApiCall::MessagesCountTokens;
-        if end.upstream && token_count {
-            self.report_first(Instant::now());
+        if end.upstream && self.api_call != ApiCall::ChatCompletions {
+            self.report_first(Instant::now(), self.upstream_status);
         }
         let response_id = std::mem::take(&mut self.response_id);
         if end.upstream {
-            if token_count {
-                return;
-            }
-            let prompt = self.capture.prompt_tokens();
-            let completion = self.capture.completion_tokens();
+            let usage = match (self.api_call, &self.events) {
+                (ApiCall::MessagesCountTokens, _) => return,
+                (ApiCall::Messages, Some(events)) => events.usage(),
+                (ApiCall::Messages, None) => self.capture.messages_usage(),
+                (ApiCall::ChatCompletions, _) => self.capture.usage(),
+            };
             let counts = self.itl.counts();
             // Nothing measured, nothing to report.
-            if prompt.is_none() && completion.is_none() && counts.is_empty() {
+            if usage.is_empty() && counts.is_empty() {
                 tracing::debug!(target: LOG,
                     response_id,
                     "kinference: no usage and no arrival gaps; skipping ReportFinalToken"
                 );
                 return;
             }
-            let cached = self.capture.cached_tokens();
-            let model = self.capture.model();
+            let usage::Usage {
+                model,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                cached_tokens: cached,
+            } = usage;
             tracing::debug!(target: LOG,
                 response_id,
                 %model,
@@ -684,6 +715,14 @@ fn api_call_of(path: &str) -> ApiCall {
     }
 }
 
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 fn clamp_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -832,6 +871,7 @@ qos: Batch
             ttft_reported: false,
             provider: false,
             api_call: ApiCall::ChatCompletions,
+            events: None,
             itl: usage::Itl::default(),
             capture: usage::Capture::default(),
         }
@@ -1116,6 +1156,86 @@ qos: Batch
         ext.on_response_body(Bytes::from_static(chunk.as_bytes()), false, &mut Cx::new());
     }
 
+    const MESSAGE_START: &str = "event: message_start\ndata: {\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":4,\"cache_read_input_tokens\":6,\"output_tokens\":1}}}\n\n";
+    const DELTA: &str = "event: content_block_delta\ndata: {}\n\n";
+    const MESSAGE_DELTA: &str = "event: message_delta\ndata: {\"usage\":{\"output_tokens\":9}}\n\n";
+
+    /// A Messages stream reports the first token at the first
+    /// `content_block_delta` and the usage of its events at the end.
+    #[tokio::test]
+    async fn a_messages_stream_reports_at_the_first_delta() {
+        let (mut ext, mut rx) = dispatched_selector(ApiCall::Messages);
+        respond_with(&mut ext, StatusCode::OK, "text/event-stream; charset=utf-8");
+
+        body(&mut ext, MESSAGE_START);
+        assert!(rx.try_recv().is_err(), "message_start is not a token");
+        body(&mut ext, DELTA);
+        let Ok(Report::First(first)) = rx.try_recv() else {
+            panic!("expected a first-token report");
+        };
+        assert_eq!(first.upstream_status, 200);
+        body(&mut ext, DELTA);
+        body(&mut ext, MESSAGE_DELTA);
+        ext.on_response_end(&ended(StatusCode::OK, true), &mut Cx::new());
+
+        let Ok(Report::Final(last)) = rx.try_recv() else {
+            panic!("expected a final-token report");
+        };
+        assert_eq!(last.model, "m");
+        assert_eq!(last.prompt_tokens, 10);
+        assert_eq!(last.cached_tokens, Some(6));
+        assert_eq!(last.completion_tokens, 9);
+        assert_eq!(last.itl_bucket_counts.iter().sum::<u32>(), 1);
+        assert!(rx.try_recv().is_err(), "one report of each kind");
+    }
+
+    /// An `error` event before the first token reports the status 500.
+    #[tokio::test]
+    async fn a_messages_error_event_reports_an_upstream_failure() {
+        let (mut ext, mut rx) = dispatched_selector(ApiCall::Messages);
+        respond_with(&mut ext, StatusCode::OK, "text/event-stream");
+        body(&mut ext, "event: error\ndata: {\"type\":\"error\"}\n\n");
+        ext.on_response_end(&ended(StatusCode::OK, true), &mut Cx::new());
+
+        let Ok(Report::First(first)) = rx.try_recv() else {
+            panic!("expected a first-token report");
+        };
+        assert_eq!(first.upstream_status, 500);
+        assert!(rx.try_recv().is_err(), "no second report");
+    }
+
+    /// A Messages response that is one JSON document reports the first
+    /// token when the response ends.
+    #[tokio::test]
+    async fn a_messages_document_reports_at_the_end() {
+        let (mut ext, mut rx) = dispatched_selector(ApiCall::Messages);
+        respond_with(&mut ext, StatusCode::OK, "application/json");
+        body(
+            &mut ext,
+            "{\"model\":\"m\",\"usage\":{\"input_tokens\":4,\"output_tokens\":9}}",
+        );
+        assert!(rx.try_recv().is_err(), "a document has no delta event");
+        ext.on_response_end(&ended(StatusCode::OK, true), &mut Cx::new());
+
+        assert!(matches!(rx.try_recv(), Ok(Report::First(_))));
+        let Ok(Report::Final(last)) = rx.try_recv() else {
+            panic!("expected a final-token report");
+        };
+        assert_eq!(last.prompt_tokens, 4);
+        assert_eq!(last.cached_tokens, None);
+        assert_eq!(last.completion_tokens, 9);
+    }
+
+    /// A chat-completion response reports the first token at the first
+    /// body chunk, whatever the chunk holds.
+    #[tokio::test]
+    async fn a_chat_completion_reports_at_the_first_chunk() {
+        let (mut ext, mut rx) = dispatched_selector(ApiCall::ChatCompletions);
+        respond_with(&mut ext, StatusCode::OK, "text/event-stream");
+        body(&mut ext, MESSAGE_START);
+        assert!(matches!(rx.try_recv(), Ok(Report::First(_))));
+    }
+
     /// A token-count response reports the upstream status at the end
     /// and sends no final-token report.
     #[tokio::test]
@@ -1162,6 +1282,8 @@ qos: Batch
         body: Vec<Bytes>,
         aborts: mpsc::UnboundedSender<AbortRequest>,
         picks: mpsc::UnboundedSender<PickRequest>,
+        firsts: mpsc::UnboundedSender<ReportFirstTokenRequest>,
+        finals: mpsc::UnboundedSender<ReportFinalTokenRequest>,
     }
 
     #[tonic::async_trait]
@@ -1210,8 +1332,9 @@ qos: Batch
 
         async fn report_first_token(
             &self,
-            _request: tonic::Request<ReportFirstTokenRequest>,
+            request: tonic::Request<ReportFirstTokenRequest>,
         ) -> Result<tonic::Response<ReportFirstTokenResponse>, tonic::Status> {
+            let _ = self.firsts.send(request.into_inner());
             Ok(tonic::Response::new(ReportFirstTokenResponse {
                 acknowledged: true,
             }))
@@ -1219,8 +1342,9 @@ qos: Batch
 
         async fn report_final_token(
             &self,
-            _request: tonic::Request<ReportFinalTokenRequest>,
+            request: tonic::Request<ReportFinalTokenRequest>,
         ) -> Result<tonic::Response<ReportFinalTokenResponse>, tonic::Status> {
+            let _ = self.finals.send(request.into_inner());
             Ok(tonic::Response::new(ReportFinalTokenResponse {
                 acknowledged: true,
             }))
@@ -1246,8 +1370,23 @@ qos: Batch
         mpsc::UnboundedReceiver<AbortRequest>,
         mpsc::UnboundedReceiver<PickRequest>,
     ) {
+        let (service, intake) = spawn_reporting_picker(pick, body).await;
+        (service, intake.aborts, intake.picks)
+    }
+
+    /// What a scripted picker was told.
+    struct Intake {
+        aborts: mpsc::UnboundedReceiver<AbortRequest>,
+        picks: mpsc::UnboundedReceiver<PickRequest>,
+        firsts: mpsc::UnboundedReceiver<ReportFirstTokenRequest>,
+        finals: mpsc::UnboundedReceiver<ReportFinalTokenRequest>,
+    }
+
+    async fn spawn_reporting_picker(pick: PickResponse, body: Vec<Bytes>) -> (String, Intake) {
         let (aborts, abort_rx) = mpsc::unbounded_channel();
         let (picks, pick_rx) = mpsc::unbounded_channel();
+        let (firsts, first_rx) = mpsc::unbounded_channel();
+        let (finals, final_rx) = mpsc::unbounded_channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1257,11 +1396,19 @@ qos: Batch
                     body,
                     aborts,
                     picks,
+                    firsts,
+                    finals,
                 }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
         });
-        (addr.to_string(), abort_rx, pick_rx)
+        let intake = Intake {
+            aborts: abort_rx,
+            picks: pick_rx,
+            firsts: first_rx,
+            finals: final_rx,
+        };
+        (addr.to_string(), intake)
     }
 
     fn ok_pick(
@@ -1445,6 +1592,50 @@ qos: Batch
         dispatched(selected);
         let asked = picks.try_recv().expect("the picker was asked to pick");
         assert_eq!(asked.api_call, ApiCall::ChatCompletions as i32);
+    }
+
+    /// A Messages request over the wire: the Pick names the API call,
+    /// and both reports of the stream reach the picker.
+    #[tokio::test]
+    async fn a_messages_stream_reaches_the_picker() {
+        let pick = ok_pick(provider_pick("prod", "anthropic"), 0);
+        let (service, mut intake) = spawn_reporting_picker(pick, vec![]).await;
+
+        let parts = http::Request::builder()
+            .uri("/v1/messages")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let mut cx = Cx::new();
+        let (mut ext, _parts, selected) = run_select_on(&service, parts, &mut cx).await;
+        dispatched(selected);
+        let asked = intake.picks.try_recv().expect("the picker was asked");
+        assert_eq!(asked.api_call, ApiCall::Messages as i32);
+
+        respond_with(&mut ext, StatusCode::OK, "text/event-stream");
+        body(&mut ext, MESSAGE_START);
+        body(&mut ext, DELTA);
+        body(&mut ext, MESSAGE_DELTA);
+        ext.on_response_end(&ended(StatusCode::OK, true), &mut cx);
+
+        let wait = Duration::from_secs(2);
+        let first = tokio::time::timeout(wait, intake.firsts.recv())
+            .await
+            .expect("the first-token report must reach the picker")
+            .expect("picker running");
+        assert_eq!(first.response_id, 42);
+        assert_eq!(first.upstream_status, 200);
+        let last = tokio::time::timeout(wait, intake.finals.recv())
+            .await
+            .expect("the final-token report must reach the picker")
+            .expect("picker running");
+        assert_eq!(last.response_id, 42);
+        assert_eq!(last.model, "m");
+        assert_eq!(last.prompt_tokens, 10);
+        assert_eq!(last.cached_tokens, Some(6));
+        assert_eq!(last.completion_tokens, 9);
+        assert!(intake.aborts.try_recv().is_err(), "nothing to abort");
     }
 
     /// The pool is the rule's, not the object's: it is read off the
