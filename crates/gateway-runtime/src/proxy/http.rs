@@ -36,7 +36,7 @@ use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
