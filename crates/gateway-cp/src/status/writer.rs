@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::standard::httproutes::HttpRoute;
 use kube::api::{Api, PostParams};
 use kube::{Client, Resource, ResourceExt};
 use serde::Serialize;
@@ -165,7 +165,7 @@ async fn write_all(client: &Client, work: &StatusWork) -> Result<(), kube::Error
 
     for (observed, desired) in &work.http_routes {
         let namespace = observed.namespace().unwrap_or_default();
-        let api: Api<HTTPRoute> = Api::namespaced(client.clone(), &namespace);
+        let api: Api<HttpRoute> = Api::namespaced(client.clone(), &namespace);
         let result = write_object(
             &api,
             observed,
@@ -485,7 +485,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let route = HTTPRoute {
+        let route = HttpRoute {
             metadata: ObjectMeta {
                 namespace: Some("demo".into()),
                 name: Some("r".into()),
@@ -517,7 +517,7 @@ mod tests {
             requests.lock().unwrap().clone(),
             vec!["PUT /apis/gateway.networking.k8s.io/v1/namespaces/demo/httproutes/r/status"]
         );
-        let written: HTTPRoute = serde_json::from_slice(&bodies.lock().unwrap()[0]).unwrap();
+        let written: HttpRoute = serde_json::from_slice(&bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(
             written.status.unwrap().parents,
             vec![

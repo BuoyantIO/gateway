@@ -41,7 +41,7 @@ first:
 
 ```sh
 kubectl apply --server-side --force-conflicts -f \
-    https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+    https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 helm upgrade --install gateway-crds charts/gateway-crds \
     --namespace gateway-system --create-namespace
 helm upgrade --install gateway charts/gateway \

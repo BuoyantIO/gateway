@@ -295,8 +295,7 @@ async fn squatted_service_is_refused_but_siblings_apply() -> Result<()> {
         .spec
         .as_ref()
         .and_then(|s| s.ports.as_ref())
-        .map(|p| p.iter().map(|p| p.port).collect())
-        .unwrap_or_default();
+        .map_or_default(|p| p.iter().map(|p| p.port).collect());
     assert_eq!(ports, vec![9999], "squatted Service must not be modified");
     assert!(
         untouched

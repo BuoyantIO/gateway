@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteRulesFilters, HttpRouteRulesFiltersRequestRedirectPathType,
+    HttpRoute, HttpRouteRulesFilters, HttpRouteRulesFiltersRequestRedirectPathType,
     HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeaders, HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod,
     HttpRouteRulesMatchesPathType, HttpRouteRulesMatchesQueryParams,
@@ -51,7 +51,7 @@ use gateway_api::apis::standard::gateways::GatewayListeners;
 pub struct K8sState {
     pub gateway_classes: Vec<GatewayClass>,
     pub gateways: Vec<Gateway>,
-    pub http_routes: Vec<HTTPRoute>,
+    pub http_routes: Vec<HttpRoute>,
     pub services: Vec<Service>,
     pub endpoint_slices: Vec<EndpointSlice>,
     pub secrets: Vec<Secret>,
@@ -332,15 +332,11 @@ fn emit_routes_under_edge(
                 .collect()
         };
 
-        let backend_refs = route
-            .rule_backends
-            .get(rule_idx)
-            .map(|refs| {
-                refs.iter()
-                    .filter_map(|br| backend_ref_proto(br, route.route_ns))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let backend_refs = route.rule_backends.get(rule_idx).map_or_default(|refs| {
+            refs.iter()
+                .filter_map(|br| backend_ref_proto(br, route.route_ns))
+                .collect()
+        });
 
         // Binding-prepended extensions run ahead of the rule's own
         // filters. `filter_idx` stays the position in the spec, so a
@@ -349,8 +345,7 @@ fn emit_routes_under_edge(
         let mut filters: Vec<pb::HttpFilter> = route
             .rule_prepends
             .get(rule_idx)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+            .map_or_default(Vec::as_slice)
             .iter()
             .map(|p| pb::HttpFilter {
                 kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
@@ -675,13 +670,11 @@ fn translate_match(m: &HttpRouteRulesMatches) -> pb::HttpMatch {
     let header_matches = m
         .headers
         .as_deref()
-        .map(translate_header_matches)
-        .unwrap_or_default();
+        .map_or_default(translate_header_matches);
     let query_param_matches = m
         .query_params
         .as_deref()
-        .map(translate_query_param_matches)
-        .unwrap_or_default();
+        .map_or_default(translate_query_param_matches);
     pb::HttpMatch {
         host: String::new(),
         has_host: false,
@@ -1174,6 +1167,7 @@ mod tests {
         filters: Vec<HttpRouteRulesFilters>,
     ) -> HttpRouteRules {
         HttpRouteRules {
+            retry: None,
             matches: Some(vec![HttpRouteRulesMatches {
                 path: path.map(path_prefix),
                 headers: None,
@@ -1192,8 +1186,8 @@ mod tests {
         name: &str,
         parents: Vec<HttpRouteParentRefs>,
         rules: Vec<HttpRouteRules>,
-    ) -> HTTPRoute {
-        HTTPRoute {
+    ) -> HttpRoute {
+        HttpRoute {
             metadata: ObjectMeta {
                 namespace: Some(ns.into()),
                 name: Some(name.into()),
@@ -1667,6 +1661,7 @@ mod tests {
                 "r",
                 vec![parent_ref("api", Some("demo"), None)],
                 vec![HttpRouteRules {
+                    retry: None,
                     matches: Some(vec![HttpRouteRulesMatches {
                         path: Some(path_prefix("/")),
                         headers: None,
@@ -2264,7 +2259,7 @@ mod tests {
         parents: Vec<HttpRouteParentRefs>,
         rules: Vec<HttpRouteRules>,
         hostnames: Vec<String>,
-    ) -> HTTPRoute {
+    ) -> HttpRoute {
         let mut hr = http_route(ns, name, parents, rules);
         hr.spec.hostnames = Some(hostnames);
         hr
@@ -2430,6 +2425,7 @@ mod tests {
                 "r",
                 vec![parent_ref("api", Some("demo"), None)],
                 vec![HttpRouteRules {
+                    retry: None,
                     matches: Some(vec![HttpRouteRulesMatches {
                         path: Some(path_exact("/manifest.json")),
                         headers: None,
@@ -2481,6 +2477,7 @@ mod tests {
                 "r",
                 vec![parent_ref("api", Some("demo"), None)],
                 vec![HttpRouteRules {
+                    retry: None,
                     matches: Some(vec![HttpRouteRulesMatches {
                         path: Some(path_regex(pattern)),
                         headers: None,
@@ -2571,6 +2568,7 @@ mod tests {
 
     fn route_with_match(m: HttpRouteRulesMatches) -> HttpRouteRules {
         HttpRouteRules {
+            retry: None,
             matches: Some(vec![m]),
             backend_refs: Some(vec![backend_ref("svc", 8080)]),
             filters: Some(vec![]),
@@ -3769,7 +3767,7 @@ mod tests {
         b
     }
 
-    fn binding_state(routes: Vec<HTTPRoute>) -> K8sState {
+    fn binding_state(routes: Vec<HttpRoute>) -> K8sState {
         K8sState {
             gateway_classes: vec![gc("zd", OURS)],
             gateways: vec![gw(

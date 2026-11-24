@@ -11,7 +11,7 @@ use gateway_api::apis::standard::gateways::{
     GatewayListenersTlsCertificateRefs, GatewayListenersTlsMode, GatewaySpec,
 };
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
+    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
     HttpRouteRulesFilters, HttpRouteRulesFiltersExtensionRef,
     HttpRouteRulesFiltersRequestHeaderModifier, HttpRouteRulesFiltersRequestHeaderModifierAdd,
     HttpRouteRulesFiltersRequestRedirect, HttpRouteRulesFiltersRequestRedirectScheme,
@@ -219,6 +219,7 @@ pub fn http_route(ns: &str, parent_gw: &str, name: &str) -> HttpRouteBuilder {
 
 fn empty_rule() -> HttpRouteRules {
     HttpRouteRules {
+        retry: None,
         matches: Some(vec![HttpRouteRulesMatches {
             path: None,
             headers: None,
@@ -515,7 +516,7 @@ impl HttpRouteBuilder {
         self
     }
 
-    pub fn build(mut self) -> HTTPRoute {
+    pub fn build(mut self) -> HttpRoute {
         // commit any pending rule
         if self
             .pending
@@ -536,7 +537,7 @@ impl HttpRouteBuilder {
                 .push(std::mem::replace(&mut self.pending, empty_rule()));
         }
 
-        HTTPRoute {
+        HttpRoute {
             metadata: ObjectMeta {
                 namespace: Some(self.ns),
                 name: Some(self.name),
@@ -861,13 +862,13 @@ pub async fn apply_gateway(client: &Client, gw: &Gateway) -> Result<()> {
 ///
 /// # Errors
 /// Returns an error if the create call fails.
-pub async fn apply_http_route(client: &Client, hr: &HTTPRoute) -> Result<()> {
+pub async fn apply_http_route(client: &Client, hr: &HttpRoute) -> Result<()> {
     let ns = hr
         .metadata
         .namespace
         .as_deref()
         .context("HTTPRoute has no namespace")?;
-    Api::<HTTPRoute>::namespaced(client.clone(), ns)
+    Api::<HttpRoute>::namespaced(client.clone(), ns)
         .create(&PostParams::default(), hr)
         .await
         .with_context(|| {
@@ -884,7 +885,7 @@ pub async fn apply_http_route(client: &Client, hr: &HTTPRoute) -> Result<()> {
 /// # Errors
 /// Returns an error if the delete call fails.
 pub async fn delete_http_route(client: &Client, ns: &str, name: &str) -> Result<()> {
-    Api::<HTTPRoute>::namespaced(client.clone(), ns)
+    Api::<HttpRoute>::namespaced(client.clone(), ns)
         .delete(name, &DeleteParams::default())
         .await
         .with_context(|| format!("deleting HTTPRoute {ns}/{name}"))?;

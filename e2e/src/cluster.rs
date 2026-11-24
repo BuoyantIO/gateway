@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::{Event, Namespace, Pod};
 use kube::api::{DeleteParams, ListParams, LogParams, ObjectMeta, PostParams};
 use kube::{Api, Client};
-use rand::Rng;
-use rand::distributions::Alphanumeric;
+use rand::RngExt;
+use rand::distr::Alphanumeric;
 
 /// Connect to the cluster.
 ///
@@ -188,7 +188,7 @@ async fn save_namespace(client: &Client, ns: &str, dir: &Path) {
 }
 
 fn unique_name(prefix: &str) -> String {
-    let suffix: String = rand::thread_rng()
+    let suffix: String = rand::rng()
         .sample_iter(&Alphanumeric)
         .take(6)
         .map(|c| (c as char).to_ascii_lowercase())

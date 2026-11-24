@@ -132,7 +132,7 @@ fn build_server_config(secret: &TlsSecret) -> Result<Arc<ServerConfig>, rustls::
         .as_ref()
         .expect("caller checked the secret has a key")
         .clone_key();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()

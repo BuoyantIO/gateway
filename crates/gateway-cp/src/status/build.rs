@@ -20,7 +20,7 @@ use gateway_api::apis::standard::gateways::{
     GatewayStatusListenersSupportedKinds,
 };
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+    HttpRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
@@ -63,7 +63,7 @@ pub struct StatusWork {
     pub backend_bindings: Vec<(BackendBinding, BackendBindingStatus)>,
     /// Desired statuses hold only our parent entries; routes with
     /// none desired and none observed are left out.
-    pub http_routes: Vec<(HTTPRoute, HttpRouteStatus)>,
+    pub http_routes: Vec<(HttpRoute, HttpRouteStatus)>,
     /// Identifies our entries in `status.parents`.
     pub controller_name: String,
 }
@@ -445,7 +445,7 @@ fn resolved_refs_condition(resolved: &ResolvedDialable<'_>) -> (bool, &'static s
 fn http_route_statuses<'a>(
     resolution: &Resolution<'a>,
     now: &Time,
-) -> Vec<(&'a HTTPRoute, HttpRouteStatus)> {
+) -> Vec<(&'a HttpRoute, HttpRouteStatus)> {
     let mut by_route: HashMap<(&str, &str), Vec<HttpRouteStatusParents>> = HashMap::new();
     for rr in resolution
         .routes
@@ -471,11 +471,11 @@ fn http_route_statuses<'a>(
         .collect()
 }
 
-fn route_id(hr: &HTTPRoute) -> Option<GatewayId> {
+fn route_id(hr: &HttpRoute) -> Option<GatewayId> {
     Some((hr.metadata.namespace.clone()?, hr.metadata.name.clone()?))
 }
 
-fn has_parent_entry(hr: &HTTPRoute, controller_name: &str) -> bool {
+fn has_parent_entry(hr: &HttpRoute, controller_name: &str) -> bool {
     hr.status.as_ref().is_some_and(|s| {
         s.parents
             .iter()
@@ -819,7 +819,7 @@ mod tests {
             },
             status: None,
         };
-        let route = HTTPRoute {
+        let route = HttpRoute {
             metadata: ObjectMeta {
                 namespace: Some("demo".into()),
                 name: Some("r".into()),

@@ -13,7 +13,7 @@ gateway-config = { path = "../gateway-config" }
 gateway-cp-proto = { path = "../gateway-cp-proto" }
 gateway-state = { path = "../gateway-state" }
 http = "1"
-rand = "0.9"
+rand = "0.10"
 regex = "1"
 serde_yaml = "0.9"
 thiserror = "2"

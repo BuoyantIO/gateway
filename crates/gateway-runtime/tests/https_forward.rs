@@ -223,7 +223,7 @@ impl ServerCertVerifier for NoVerify {
 }
 
 fn client_config(alpn: &[&[u8]]) -> ClientConfig {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap()

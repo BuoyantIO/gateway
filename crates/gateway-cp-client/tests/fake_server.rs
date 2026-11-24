@@ -605,16 +605,12 @@ async fn blackholed_stream_is_detected_and_reconnects() {
         let store = store.clone();
         let key = key.clone();
         move || -> Vec<String> {
-            store
-                .read()
-                .backend(&key)
-                .map(|b| {
-                    b.endpoints()
-                        .iter()
-                        .map(|e| e.address.to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
+            store.read().backend(&key).map_or_default(|b| {
+                b.endpoints()
+                    .iter()
+                    .map(|e| e.address.to_string())
+                    .collect()
+            })
         }
     };
 
@@ -718,16 +714,12 @@ async fn failed_apply_ends_the_session_and_re_bootstraps() {
         let store = store.clone();
         let key = key.clone();
         move || -> Vec<String> {
-            store
-                .read()
-                .backend(&key)
-                .map(|b| {
-                    b.endpoints()
-                        .iter()
-                        .map(|e| e.address.to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
+            store.read().backend(&key).map_or_default(|b| {
+                b.endpoints()
+                    .iter()
+                    .map(|e| e.address.to_string())
+                    .collect()
+            })
         }
     };
 

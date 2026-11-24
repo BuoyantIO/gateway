@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::{Gateway, GatewayListeners, GatewayListenersTlsMode};
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteParentRefs, HttpRouteRulesBackendRefs,
+    HttpRoute, HttpRouteParentRefs, HttpRouteRulesBackendRefs,
 };
 use gateway_config::secret::SecretValue;
 use gateway_cp_proto::v1 as pb;
@@ -79,7 +79,7 @@ pub struct Resolution<'a> {
     pub routes: Vec<RouteResolution<'a>>,
     /// Every `HTTPRoute`, attached or not, so status can clear our
     /// entries from routes that no longer name an owned Gateway.
-    pub http_routes: Vec<&'a HTTPRoute>,
+    pub http_routes: Vec<&'a HttpRoute>,
 }
 
 pub struct GatewayResolution<'a> {
@@ -159,7 +159,7 @@ pub enum AddressKind {
 /// Gateway. parentRefs pointing at unknown or foreign Gateways
 /// produce an entry with `NoMatchingParent` and no edges.
 pub struct RouteResolution<'a> {
-    pub route: &'a HTTPRoute,
+    pub route: &'a HttpRoute,
     pub route_ns: &'a str,
     pub route_name: &'a str,
     pub parent_ref: &'a HttpRouteParentRefs,
@@ -771,7 +771,7 @@ fn has_certificate(secret: &Secret) -> bool {
 /// per-route memory across this route's parentRefs).
 #[allow(clippy::too_many_arguments)]
 fn resolve_route_parent<'a>(
-    hr: &'a HTTPRoute,
+    hr: &'a HttpRoute,
     route_ns: &'a str,
     route_name: &'a str,
     parent_ref: &'a HttpRouteParentRefs,
@@ -900,7 +900,7 @@ fn resolve_route_parent<'a>(
 /// watched objects. Refs are route-local: the namespace is the
 /// route's own.
 fn resolve_route_extensions<'a>(
-    hr: &'a HTTPRoute,
+    hr: &'a HttpRoute,
     route_ns: &str,
     extensions_by_id: &HashMap<(&str, &str), &'a crate::crd::Extension>,
 ) -> Vec<ExtRef<'a>> {
@@ -932,7 +932,7 @@ fn resolve_route_extensions<'a>(
 /// the per-rule extension prepend lists the substitutions brought
 /// with them.
 fn resolve_rule_backends<'a>(
-    hr: &'a HTTPRoute,
+    hr: &'a HttpRoute,
     route_ns: &str,
     services_by_id: &HashMap<(&str, &str), &'a Service>,
     slices_by_service: &HashMap<(&str, &str), Vec<&'a EndpointSlice>>,
@@ -1995,8 +1995,8 @@ mod tests {
         parents: Vec<HttpRouteParentRefs>,
         hostnames: Option<Vec<&str>>,
         backend_refs: Vec<HttpRouteRulesBackendRefs>,
-    ) -> HTTPRoute {
-        HTTPRoute {
+    ) -> HttpRoute {
+        HttpRoute {
             metadata: ObjectMeta {
                 namespace: Some(ns.into()),
                 name: Some(name.into()),
@@ -2159,7 +2159,7 @@ mod tests {
         }
     }
 
-    fn state(gateways: Vec<Gateway>, routes: Vec<HTTPRoute>) -> K8sState {
+    fn state(gateways: Vec<Gateway>, routes: Vec<HttpRoute>) -> K8sState {
         K8sState {
             gateway_classes: vec![gc("zd", OURS), gc("other", "example.com/other")],
             gateways,

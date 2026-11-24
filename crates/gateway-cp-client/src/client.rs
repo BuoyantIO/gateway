@@ -8,7 +8,7 @@ use std::time::Duration;
 use gateway_cp_proto::v1 as pb;
 use gateway_cp_proto::v1::config_stream_client::ConfigStreamClient;
 use gateway_state::{RegisteredKeys, Store};
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;

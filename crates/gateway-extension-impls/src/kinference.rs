@@ -430,10 +430,9 @@ impl Extension for KinferenceSelector {
         let now = Instant::now();
         if !self.ttft_reported {
             self.ttft_reported = true;
-            let ttft_ms = self
-                .dispatched_at
-                .map(|t| u32::try_from(now.duration_since(t).as_millis()).unwrap_or(u32::MAX))
-                .unwrap_or_default();
+            let ttft_ms = self.dispatched_at.map_or_default(|t| {
+                u32::try_from(now.duration_since(t).as_millis()).unwrap_or(u32::MAX)
+            });
             tracing::debug!(target: LOG,
                 response_id = self.response_id,
                 ttft_ms,
