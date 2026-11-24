@@ -300,7 +300,7 @@ pub(super) enum OriginateError {
 /// Compile a backend's TLS block to a client config. Called once per
 /// applied version of the backend, not per request.
 fn client_config(tls: &ActiveBackendTls) -> Result<Arc<ClientConfig>, OriginateError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()?;
     let mut config = if tls.insecure_skip_verify {

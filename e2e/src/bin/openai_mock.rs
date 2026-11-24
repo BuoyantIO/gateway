@@ -131,7 +131,7 @@ fn tls_config() -> anyhow::Result<ServerConfig> {
     let key = secret
         .key
         .ok_or_else(|| anyhow::anyhow!("baked leaf has no private key"))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()

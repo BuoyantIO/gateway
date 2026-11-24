@@ -101,7 +101,7 @@ async fn spawn_tls_upstream(alpn: &[AlpnProtocol]) -> u16 {
 /// made a new one.
 async fn spawn_counting_tls_upstream(alpn: &[AlpnProtocol]) -> (u16, Arc<AtomicUsize>) {
     let secret = TlsSecret::new("", "leaf", LEAF_CERT_PEM, LEAF_KEY_PEM).expect("valid leaf");
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
