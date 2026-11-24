@@ -42,9 +42,9 @@ failures as gRPC status directly:
   RESOURCE_EXHAUSTED (8)  per-request or server-wide buffer budget exceeded, or
                           a single chunk over the per-message decode limit
   DEADLINE_EXCEEDED (4)   PushBody idle longer than the inter-chunk budget
-  INVALID_ARGUMENT (3)    malformed request; Pick with body_stream_id = 0; a
-                          PushBody whose byte count disagrees with its
-                          `kinference-declared-length`
+  INVALID_ARGUMENT (3)    malformed request; Pick with body_stream_id = 0; Pick
+                          with an unknown api_call; a PushBody whose byte
+                          count disagrees with its `kinference-declared-length`
 
 Conformance:
 
@@ -117,6 +117,25 @@ message PickRequest {
   QosClass qos_class = 4;
 
   string tenant = 5;
+
+  ApiCall api_call = 6;
+}
+
+/*
+The API call of the client's request. The caller derives the value from the
+path of the client's request, without the query. The server never derives the
+value from the body.
+*/
+enum ApiCall {
+  CHAT_COMPLETIONS = 0; // every other path
+  MESSAGES = 1; // a path that ends in `/v1/messages`
+  /*
+  A path that ends in `/v1/messages/count_tokens`. The caller sends
+  ReportFirstToken when the response ends, and no ReportFinalToken. For a local
+  destination the server keeps no record of the pick, so ReportFirstToken
+  returns acknowledged = false.
+  */
+  MESSAGES_COUNT_TOKENS = 2;
 }
 
 message PickResponse {
@@ -158,11 +177,18 @@ message ProviderTarget {
   Path to dispatch on, REPLACING the path the client sent; empty means leave it
   alone. It is joined AFTER any path prefix the GatewayBackend's baseURL
   carries. Always starts with '/', and may carry a query string, which likewise
-  replaces the client's.
+  replaces the client's. Always empty for MESSAGES_COUNT_TOKENS.
   */
   string path = 2;
 }
 
+/*
+The caller sends exactly one ReportFirstToken for each dispatched pick.
+
+For a Messages response, the first token is the first `content_block_delta`
+event, or the end of a response that has no such event. An `error` event before
+the first token is an upstream failure with upstream_status 500.
+*/
 message ReportFirstTokenRequest {
   uint64 response_id = 1;
   uint32 observed_ttft_ms = 2;
@@ -173,6 +199,20 @@ message ReportFirstTokenResponse {
   bool acknowledged = 1;
 }
 
+/*
+For a Messages response, the caller fills the fields as follows. An absent or
+null `usage` field counts as 0.
+
+  model              the response's `model`
+  prompt_tokens      `input_tokens` + `cache_read_input_tokens` +
+                     `cache_creation_input_tokens`
+  cached_tokens      `cache_read_input_tokens`; unset when absent or null
+  completion_tokens  `output_tokens`
+
+In a stream, the counts come from `message_start`, and a count in a later
+`message_delta` that is not null replaces the earlier count. An inter-token gap
+is the time between two `content_block_delta` events.
+*/
 message ReportFinalTokenRequest {
   uint64 response_id = 1;
   string model = 2;
@@ -224,82 +264,6 @@ message AbortRequest {
 
 message AbortResponse {
   bool released = 1;
-}
-
-/*
-Validate a Kubernetes bearer token.
-
-Treat the token as a credential: do not log it, do not put it in an error
-message, and do not include it in a trace attribute.
-
-Results may be cached, keyed on (token, audiences), with a TTL short enough
-that a revoked token stops working promptly. A cached negative is as useful as
-a cached positive.
-*/
-
-service TokenReview {
-  rpc ReviewToken(ReviewTokenRequest) returns (ReviewTokenResponse);
-}
-
-message ReviewTokenRequest {
-  string token = 1;
-  repeated string audiences = 2;
-}
-
-message ReviewTokenResponse {
-  bool authenticated = 1;
-  string username = 2;
-}
-
-/*
-Token-based rate limiting: reserve then reconcile.
-
-Conformance
-
-A `limit` of 0 means no window is enforced, so `remaining` carries no
-information. Omit rate-limit headers entirely in that case rather than
-reporting a budget of zero, which reads as throttled when it means the
-opposite.
-*/
-service RateLimiter {
-  rpc Reserve(ReserveRequest) returns (ReserveResponse);
-  rpc Commit(CommitRequest) returns (CommitResponse);
-}
-
-message ReserveRequest {
-  string tenant_id = 1;
-  int64 max_tokens = 2;
-}
-
-message ReserveResponse {
-  bool allowed = 1;
-  int64 request_id = 2;
-  int64 retry_after_ms = 3;
-  int64 limit = 4;
-  int64 remaining = 5;
-  int64 window_ms = 6;
-  DenialReason reason = 7;
-}
-
-enum DenialReason {
-  DENIAL_REASON_UNSPECIFIED = 0;
-  DENIAL_REASON_OVER_BUDGET = 1;
-  DENIAL_REASON_EXCEEDS_LIMIT = 2;
-}
-
-message CommitRequest {
-  int64 request_id = 1;
-  int64 actual_tokens = 2;
-}
-
-message CommitResponse {
-  CommitStatus status = 1;
-}
-
-enum CommitStatus {
-  COMMIT_STATUS_UNSPECIFIED = 0;
-  COMMIT_STATUS_OK = 1;
-  COMMIT_STATUS_NOT_FOUND = 2;
 }
 
 /*

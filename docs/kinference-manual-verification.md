@@ -4,7 +4,10 @@ How to drive a real inference request through the full path. The client
 sends a chat completion to the gateway data plane, the
 `kinference_selector` extension streams the body to the Kinference
 Picker, the Picker picks a dummy vLLM worker, and the response streams
-back while the extension reports the first and the final token.
+back while the extension reports the first and the final token. Step 4
+also sends an Anthropic Messages request and a token-count request. For
+the token-count request, the extension sends one first-token report and
+no final-token report.
 
 ## 1. Gateway cluster
 
@@ -146,6 +149,35 @@ curl -sN "http://$GW/v1/chat/completions" \
   -H 'x-request-id: manual-1' \
   -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "max_tokens": 64, "stream": true, "stream_options": {"include_usage": true}, "messages": [{"role": "user", "content": "say hi"}]}'
 ```
+
+#### Send an Anthropic Messages request
+
+The route matches every path, so the same route serves the Messages
+paths. The extension names the API call in `Pick` from the path of the
+request. A path that ends in `/v1/messages` is a Messages request, and
+a path that ends in `/v1/messages/count_tokens` is a token-count
+request.
+
+```bash
+curl -sN "http://$GW/v1/messages" \
+  -H 'content-type: application/json' \
+  -H 'x-request-id: manual-messages-1' \
+  -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "say hi"}]}'
+```
+
+The data plane's debug log shows the first-token report at the first
+`content_block_delta` event, and a final-token report with the token
+counts of the stream.
+
+```bash
+curl -s "http://$GW/v1/messages/count_tokens" \
+  -H 'content-type: application/json' \
+  -H 'x-request-id: manual-count-1' \
+  -d '{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "messages": [{"role": "user", "content": "say hi"}]}'
+```
+
+For the token-count request, the data plane's debug log shows one
+first-token report when the response ends, and no final-token report.
 
 ### Option B: Load-balance between the dummy worker and a Databricks provider
 
