@@ -39,8 +39,8 @@ use tonic::transport::Channel;
 
 use proto::picker_client::PickerClient;
 use proto::{
-    AbortRequest, BodyChunk, InferencePoolRef, PickRequest, PullBodyRequest, PushBodyResponse,
-    ReportFinalTokenRequest, ReportFirstTokenRequest,
+    AbortRequest, ApiCall, BodyChunk, InferencePoolRef, PickRequest, PullBodyRequest,
+    PushBodyResponse, ReportFinalTokenRequest, ReportFirstTokenRequest,
 };
 
 /// The class name routes reference through `Extension` objects.
@@ -200,6 +200,7 @@ impl ExtensionBuilder for KinferenceSelectorBuilder {
             upstream_status: 0,
             ttft_reported: false,
             provider: false,
+            api_call: ApiCall::ChatCompletions,
             itl: usage::Itl::default(),
             capture: usage::Capture::default(),
         })
@@ -229,6 +230,7 @@ struct KinferenceSelector {
     /// synthesized 5xx ending aborts as `BACKEND_UNRESOLVED` rather
     /// than `NOT_DISPATCHED`.
     provider: bool,
+    api_call: ApiCall,
     itl: usage::Itl,
     capture: usage::Capture,
 }
@@ -253,6 +255,8 @@ impl Extension for KinferenceSelector {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .clone_into(&mut self.client_request_id);
+
+        self.api_call = api_call_of(head.uri.path());
 
         let (tx, rx) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
         let mut request = tonic::Request::new(ReceiverStream::new(rx));
@@ -349,7 +353,7 @@ impl Extension for KinferenceSelector {
             inference_pool: pool_from_targets(cx),
             qos_class: self.prepared.qos,
             tenant: self.tenant.clone(),
-            api_call: proto::ApiCall::ChatCompletions as i32,
+            api_call: self.api_call as i32,
         });
         let pick = tokio::time::timeout(self.prepared.rpc_timeout, pick)
             .await
@@ -651,6 +655,17 @@ fn dispatch_on(head: &mut http::request::Parts, path: &str) -> Result<(), Error>
     Ok(())
 }
 
+/// The API call that the path of the client's request names.
+fn api_call_of(path: &str) -> ApiCall {
+    if path.ends_with("/v1/messages/count_tokens") {
+        ApiCall::MessagesCountTokens
+    } else if path.ends_with("/v1/messages") {
+        ApiCall::Messages
+    } else {
+        ApiCall::ChatCompletions
+    }
+}
+
 fn clamp_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -798,6 +813,7 @@ qos: Batch
             upstream_status: 0,
             ttft_reported: false,
             provider: false,
+            api_call: ApiCall::ChatCompletions,
             itl: usage::Itl::default(),
             capture: usage::Capture::default(),
         }
@@ -1034,6 +1050,26 @@ qos: Batch
         );
     }
 
+    // ---- the API call ----
+
+    #[test]
+    fn the_path_names_the_api_call() {
+        assert_eq!(api_call_of("/v1/messages"), ApiCall::Messages);
+        assert_eq!(api_call_of("/tenant/v1/messages"), ApiCall::Messages);
+        assert_eq!(
+            api_call_of("/v1/messages/count_tokens"),
+            ApiCall::MessagesCountTokens
+        );
+        assert_eq!(
+            api_call_of("/v1/chat/completions"),
+            ApiCall::ChatCompletions
+        );
+        assert_eq!(
+            api_call_of("/v1/messages/batches"),
+            ApiCall::ChatCompletions
+        );
+    }
+
     // ---- the fake picker: select() through a real gRPC exchange ----
 
     use std::net::IpAddr;
@@ -1225,8 +1261,19 @@ qos: Batch
         http::request::Parts,
         Result<Selected, Error>,
     ) {
+        run_select_on(service, request_parts(), cx).await
+    }
+
+    async fn run_select_on(
+        service: &str,
+        mut parts: http::request::Parts,
+        cx: &mut Cx,
+    ) -> (
+        KinferenceSelector,
+        http::request::Parts,
+        Result<Selected, Error>,
+    ) {
         let mut ext = selector_for(service, None);
-        let mut parts = request_parts();
         ext.on_request_start(&mut parts, cx).await.unwrap();
         ext.on_request_body(Bytes::from_static(b"prompt"), true, cx)
             .await
@@ -1298,6 +1345,32 @@ qos: Batch
         // An endpoint pick is a member of the service the client
         // addressed, so it keeps the client's request line.
         assert_eq!(parts.uri, "/v1/chat");
+    }
+
+    /// The API call of the client's path travels with the Pick, and
+    /// the query plays no part.
+    #[tokio::test]
+    async fn select_names_the_api_call() {
+        let pick = ok_pick(provider_pick("prod", "anthropic"), 0);
+        let (service, _aborts, mut picks) = spawn_picker(pick, vec![]).await;
+
+        let parts = http::Request::builder()
+            .uri("/v1/messages/count_tokens?beta=true")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let (_ext, parts, selected) = run_select_on(&service, parts, &mut Cx::new()).await;
+        dispatched(selected);
+        let asked = picks.try_recv().expect("the picker was asked to pick");
+        assert_eq!(asked.api_call, ApiCall::MessagesCountTokens as i32);
+        // An empty pick path keeps the client's request line.
+        assert_eq!(parts.uri, "/v1/messages/count_tokens?beta=true");
+
+        let (_ext, _parts, selected) = run_select(&service, &mut Cx::new()).await;
+        dispatched(selected);
+        let asked = picks.try_recv().expect("the picker was asked to pick");
+        assert_eq!(asked.api_call, ApiCall::ChatCompletions as i32);
     }
 
     /// The pool is the rule's, not the object's: it is read off the
