@@ -9,7 +9,7 @@ use anyhow::Result;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
 use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+    HttpRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
 use gateway_e2e::fixtures::{apply_gateway, apply_http_route};
 use gateway_e2e::{Scope, deploy_echo, gateway, http_route};
@@ -62,7 +62,7 @@ fn condition_true(gw: &Gateway, type_: &str) -> bool {
 }
 
 /// Our parent entry's condition of `type_`, if written.
-fn route_condition<'a>(hr: &'a HTTPRoute, type_: &str) -> Option<&'a Condition> {
+fn route_condition<'a>(hr: &'a HttpRoute, type_: &str) -> Option<&'a Condition> {
     hr.status
         .as_ref()?
         .parents
@@ -73,17 +73,17 @@ fn route_condition<'a>(hr: &'a HTTPRoute, type_: &str) -> Option<&'a Condition> 
         .find(|c| c.type_ == type_)
 }
 
-fn route_reason(hr: &HTTPRoute, type_: &str) -> Option<String> {
+fn route_reason(hr: &HttpRoute, type_: &str) -> Option<String> {
     route_condition(hr, type_).map(|c| format!("{}/{}", c.status, c.reason))
 }
 
 /// Set the route's hostnames and wait for our entry to report the
 /// new generation.
 async fn patch_and_wait_for_status(
-    api: &Api<HTTPRoute>,
+    api: &Api<HttpRoute>,
     name: &str,
     hostnames: &[&str],
-) -> Result<HTTPRoute> {
+) -> Result<HttpRoute> {
     let patch = serde_json::json!({ "spec": { "hostnames": hostnames } });
     let generation = api
         .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -97,7 +97,7 @@ async fn patch_and_wait_for_status(
 }
 
 /// Add a `status.parents` entry owned by another controller.
-async fn seed_foreign_entry(api: &Api<HTTPRoute>, name: &str) -> Result<()> {
+async fn seed_foreign_entry(api: &Api<HttpRoute>, name: &str) -> Result<()> {
     let mut route = api.get(name).await?;
     let condition = Condition {
         message: "seeded by the test".into(),
@@ -177,7 +177,7 @@ async fn gateway_status_reflects_the_world() -> Result<()> {
     })
     .await?;
 
-    let route_api: Api<gateway_api::apis::standard::httproutes::HTTPRoute> =
+    let route_api: Api<gateway_api::apis::standard::httproutes::HttpRoute> =
         Api::namespaced(client.clone(), ns);
     for name in ["route-a", "route-b"] {
         route_api.delete(name, &DeleteParams::default()).await?;
@@ -206,7 +206,7 @@ async fn http_route_status_reflects_attachment_and_backends() -> Result<()> {
     let scope = Scope::new("route-status").await?;
     let ns = scope.name();
     let client = scope.client();
-    let route_api: Api<HTTPRoute> = Api::namespaced(client.clone(), ns);
+    let route_api: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
 
     apply_gateway(client, &gateway(ns, "gw", 80, Some("a.example"))).await?;
     deploy_echo(client, ns, "echo", None).await?;

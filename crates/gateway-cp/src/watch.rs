@@ -52,7 +52,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use gateway_api::apis::standard::gatewayclasses::GatewayClass;
 use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::httproutes::HTTPRoute;
+use gateway_api::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::Api;
@@ -124,8 +124,8 @@ pub async fn run(
     let mut gw_stream =
         reflector::reflector(gw_writer, watcher::watcher(gw_api, Config::default())).boxed();
 
-    let (hr_store, hr_writer) = reflector::store::<HTTPRoute>();
-    let hr_api: Api<HTTPRoute> = Api::all(client.clone());
+    let (hr_store, hr_writer) = reflector::store::<HttpRoute>();
+    let hr_api: Api<HttpRoute> = Api::all(client.clone());
     let mut hr_stream =
         reflector::reflector(hr_writer, watcher::watcher(hr_api, Config::default())).boxed();
 
@@ -287,7 +287,7 @@ impl SyncTracker {
 fn collect_state(
     gc: &ReflectorStore<GatewayClass>,
     gw: &ReflectorStore<Gateway>,
-    hr: &ReflectorStore<HTTPRoute>,
+    hr: &ReflectorStore<HttpRoute>,
     svc: &ReflectorStore<Service>,
     es: &ReflectorStore<EndpointSlice>,
     sec: &ReflectorStore<Secret>,
