@@ -349,6 +349,7 @@ impl Extension for KinferenceSelector {
             inference_pool: pool_from_targets(cx),
             qos_class: self.prepared.qos,
             tenant: self.tenant.clone(),
+            api_call: proto::ApiCall::ChatCompletions as i32,
         });
         let pick = tokio::time::timeout(self.prepared.rpc_timeout, pick)
             .await
