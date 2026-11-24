@@ -235,6 +235,29 @@ struct KinferenceSelector {
     capture: usage::Capture,
 }
 
+impl KinferenceSelector {
+    /// Sends the pick's one `ReportFirstToken`. Later calls do nothing.
+    fn report_first(&mut self, now: Instant) {
+        if std::mem::replace(&mut self.ttft_reported, true) {
+            return;
+        }
+        let ttft_ms = self.dispatched_at.map_or_default(|t| {
+            u32::try_from(now.duration_since(t).as_millis()).unwrap_or(u32::MAX)
+        });
+        tracing::debug!(target: LOG,
+            response_id = self.response_id,
+            ttft_ms,
+            status = self.upstream_status,
+            "kinference: reporting first token"
+        );
+        self.reporter.send(Report::First(ReportFirstTokenRequest {
+            response_id: self.response_id,
+            observed_ttft_ms: ttft_ms,
+            upstream_status: self.upstream_status,
+        }));
+    }
+}
+
 #[async_trait]
 impl Extension for KinferenceSelector {
     async fn on_request_start(
@@ -432,24 +455,12 @@ impl Extension for KinferenceSelector {
         if self.response_id == 0 || chunk.is_empty() {
             return;
         }
-        let now = Instant::now();
-        if !self.ttft_reported {
-            self.ttft_reported = true;
-            let ttft_ms = self.dispatched_at.map_or_default(|t| {
-                u32::try_from(now.duration_since(t).as_millis()).unwrap_or(u32::MAX)
-            });
-            tracing::debug!(target: LOG,
-                response_id = self.response_id,
-                ttft_ms,
-                status = self.upstream_status,
-                "kinference: first response chunk"
-            );
-            self.reporter.send(Report::First(ReportFirstTokenRequest {
-                response_id: self.response_id,
-                observed_ttft_ms: ttft_ms,
-                upstream_status: self.upstream_status,
-            }));
+        // A token-count response holds no tokens and no usage.
+        if self.api_call == ApiCall::MessagesCountTokens {
+            return;
         }
+        let now = Instant::now();
+        self.report_first(now);
         self.itl.record(now);
         self.capture.feed(&chunk);
     }
@@ -458,8 +469,15 @@ impl Extension for KinferenceSelector {
         if self.response_id == 0 {
             return;
         }
+        let token_count = self.api_call == ApiCall::MessagesCountTokens;
+        if end.upstream && token_count {
+            self.report_first(Instant::now());
+        }
         let response_id = std::mem::take(&mut self.response_id);
         if end.upstream {
+            if token_count {
+                return;
+            }
             let prompt = self.capture.prompt_tokens();
             let completion = self.capture.completion_tokens();
             let counts = self.itl.counts();
@@ -1068,6 +1086,62 @@ qos: Batch
             api_call_of("/v1/messages/batches"),
             ApiCall::ChatCompletions
         );
+    }
+
+    // ---- the reports ----
+
+    /// A dispatched selector whose reports land on the returned queue.
+    fn dispatched_selector(api_call: ApiCall) -> (KinferenceSelector, mpsc::Receiver<Report>) {
+        let (reporter, rx) = capturing_reporter();
+        let mut ext = selector_for("127.0.0.1:1", None);
+        ext.reporter = reporter;
+        ext.response_id = 7;
+        ext.dispatched_at = Some(Instant::now());
+        ext.api_call = api_call;
+        (ext, rx)
+    }
+
+    fn respond_with(ext: &mut KinferenceSelector, status: StatusCode, content_type: &str) {
+        let mut head = http::Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        ext.on_response_start(&mut head, &mut Cx::new());
+    }
+
+    fn body(ext: &mut KinferenceSelector, chunk: &'static str) {
+        ext.on_response_body(Bytes::from_static(chunk.as_bytes()), false, &mut Cx::new());
+    }
+
+    /// A token-count response reports the upstream status at the end
+    /// and sends no final-token report.
+    #[tokio::test]
+    async fn a_token_count_response_reports_only_its_status() {
+        let (mut ext, mut rx) = dispatched_selector(ApiCall::MessagesCountTokens);
+        respond_with(&mut ext, StatusCode::UNAUTHORIZED, "application/json");
+        body(&mut ext, "{\"input_tokens\":12}");
+        assert!(rx.try_recv().is_err(), "nothing before the end");
+        ext.on_response_end(&ended(StatusCode::UNAUTHORIZED, true), &mut Cx::new());
+
+        let Ok(Report::First(first)) = rx.try_recv() else {
+            panic!("expected a first-token report");
+        };
+        assert_eq!(first.response_id, 7);
+        assert_eq!(first.upstream_status, 401);
+        assert!(rx.try_recv().is_err(), "no final-token report");
+    }
+
+    /// A token-count request that never reached an upstream aborts
+    /// the pick and reports no first token.
+    #[tokio::test]
+    async fn a_token_count_request_without_a_response_aborts() {
+        let (mut ext, mut rx) = dispatched_selector(ApiCall::MessagesCountTokens);
+        ext.on_response_end(&ended(StatusCode::BAD_GATEWAY, false), &mut Cx::new());
+        assert!(matches!(rx.try_recv(), Ok(Report::Abort(_))));
+        assert!(rx.try_recv().is_err(), "the abort is the only report");
     }
 
     // ---- the fake picker: select() through a real gRPC exchange ----
