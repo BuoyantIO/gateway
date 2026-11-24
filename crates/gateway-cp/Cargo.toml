@@ -23,7 +23,7 @@ gateway-api = "0.21"
 http = "1"
 k8s-openapi = { version = "0.27", features = ["v1_33", "schemars"] }
 kube = { version = "3.1", default-features = false, features = ["client", "derive", "runtime", "rustls-tls", "ring"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 schemars = "1"
 serde = "1"
 serde_json = "1"

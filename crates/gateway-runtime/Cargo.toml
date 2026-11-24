@@ -23,7 +23,7 @@ http-body-util = "0.1"
 tokio-stream = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "tokio", "http1", "http2"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 prometheus-client = "0.25"
 rand = "0.10"
 regex = "1"
