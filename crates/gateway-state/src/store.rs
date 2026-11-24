@@ -691,8 +691,7 @@ impl Inner {
         let previous = self
             .backends
             .get(&key)
-            .map(|old| secret_deps(&old.kind))
-            .unwrap_or_default();
+            .map_or_default(|old| secret_deps(&old.kind));
         self.unindex_backend_secrets(&key, &previous);
         for sk in secret_deps(&kind) {
             self.backends_by_secret
@@ -1252,16 +1251,13 @@ impl Inner {
         if !secrets_ready {
             return;
         }
-        let mut active_route_keys: Vec<RouteKey> = self
-            .routes_by_parent
-            .get(key)
-            .map(|set| {
+        let mut active_route_keys: Vec<RouteKey> =
+            self.routes_by_parent.get(key).map_or_default(|set| {
                 set.iter()
                     .filter(|rk| self.active_routes.contains_key(rk))
                     .cloned()
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         if active_route_keys.is_empty() {
             return;
         }

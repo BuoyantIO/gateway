@@ -332,15 +332,11 @@ fn emit_routes_under_edge(
                 .collect()
         };
 
-        let backend_refs = route
-            .rule_backends
-            .get(rule_idx)
-            .map(|refs| {
-                refs.iter()
-                    .filter_map(|br| backend_ref_proto(br, route.route_ns))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let backend_refs = route.rule_backends.get(rule_idx).map_or_default(|refs| {
+            refs.iter()
+                .filter_map(|br| backend_ref_proto(br, route.route_ns))
+                .collect()
+        });
 
         // Binding-prepended extensions run ahead of the rule's own
         // filters. `filter_idx` stays the position in the spec, so a
@@ -349,8 +345,7 @@ fn emit_routes_under_edge(
         let mut filters: Vec<pb::HttpFilter> = route
             .rule_prepends
             .get(rule_idx)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+            .map_or_default(Vec::as_slice)
             .iter()
             .map(|p| pb::HttpFilter {
                 kind: Some(pb::http_filter::Kind::ExtensionRef(pb::ExtensionRef {
@@ -675,13 +670,11 @@ fn translate_match(m: &HttpRouteRulesMatches) -> pb::HttpMatch {
     let header_matches = m
         .headers
         .as_deref()
-        .map(translate_header_matches)
-        .unwrap_or_default();
+        .map_or_default(translate_header_matches);
     let query_param_matches = m
         .query_params
         .as_deref()
-        .map(translate_query_param_matches)
-        .unwrap_or_default();
+        .map_or_default(translate_query_param_matches);
     pb::HttpMatch {
         host: String::new(),
         has_host: false,

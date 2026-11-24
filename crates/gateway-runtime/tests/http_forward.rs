@@ -852,8 +852,7 @@ async fn spawn_body_echo() -> u16 {
                         .into_body()
                         .collect()
                         .await
-                        .map(http_body_util::Collected::to_bytes)
-                        .unwrap_or_default();
+                        .map_or_default(http_body_util::Collected::to_bytes);
                     let resp = http::Response::builder()
                         .status(StatusCode::OK)
                         .header("x-server-version", server_version)
@@ -1804,8 +1803,7 @@ async fn spawn_framing_echo() -> u16 {
                         .into_body()
                         .collect()
                         .await
-                        .map(http_body_util::Collected::to_bytes)
-                        .unwrap_or_default();
+                        .map_or_default(http_body_util::Collected::to_bytes);
                     let resp = http::Response::builder()
                         .status(StatusCode::OK)
                         .header("x-recv-content-length", cl)
@@ -2344,8 +2342,7 @@ async fn spawn_port_echo() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
                             .into_body()
                             .collect()
                             .await
-                            .map(http_body_util::Collected::to_bytes)
-                            .unwrap_or_default();
+                            .map_or_default(http_body_util::Collected::to_bytes);
                         let resp = http::Response::builder()
                             .status(StatusCode::OK)
                             .header("x-port", port.to_string())

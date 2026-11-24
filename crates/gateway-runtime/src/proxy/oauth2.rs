@@ -571,7 +571,7 @@ enum FetchError {
     Unreachable(String),
     #[error("token endpoint did not answer within {}s", FETCH_TIMEOUT.as_secs())]
     Timeout,
-    #[error("token endpoint answered {status}{}", .code.as_ref().map(|c| format!(": {c}")).unwrap_or_default())]
+    #[error("token endpoint answered {status}{}", .code.as_ref().map_or_default(|c| format!(": {c}")))]
     Rejected {
         status: StatusCode,
         code: Option<String>,
