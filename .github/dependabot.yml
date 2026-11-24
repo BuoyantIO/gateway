@@ -1,0 +1,30 @@
+# Dependabot leaves the Dockerfiles alone. The rust:1 tag already tracks
+# the latest stable release, and the debian tag names a release, not a
+# version.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Each kube release pins one k8s-openapi minor version. Dependabot
+      # must bump the two crates in one pull request, or Cargo.lock ends up
+      # with two k8s-openapi versions and the build fails.
+      kube:
+        patterns: ["kube", "kube-*", "k8s-openapi"]
+      # Each tonic release pins one prost minor version, so the two
+      # crates move together for the same reason.
+      tonic:
+        patterns: ["tonic", "tonic-*", "prost", "prost-*"]
+      cargo:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
