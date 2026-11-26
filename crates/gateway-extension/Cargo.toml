@@ -9,10 +9,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-async-trait = "0.1"
-bytes = "1"
-gateway-config = { path = "../gateway-config" }
-gateway-state = { path = "../gateway-state" }
-http = "1"
-http-body-util = "0.1"
-thiserror = "2"
+async-trait.workspace = true
+bytes.workspace = true
+gateway-config.workspace = true
+gateway-state.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+thiserror.workspace = true

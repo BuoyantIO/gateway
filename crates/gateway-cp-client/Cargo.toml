@@ -9,18 +9,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-gateway-config = { path = "../gateway-config" }
-gateway-cp-proto = { path = "../gateway-cp-proto" }
-gateway-state = { path = "../gateway-state" }
-http = "1"
-rand = "0.10"
-regex = "1"
-serde_yaml = "0.9"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-tokio-stream = "0.1"
-tonic = "0.14"
-tracing = "0.1"
+gateway-config.workspace = true
+gateway-cp-proto.workspace = true
+gateway-state.workspace = true
+http.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread"] }

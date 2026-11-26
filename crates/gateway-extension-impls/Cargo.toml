@@ -9,27 +9,27 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-bytes = "1"
-gateway-config = { path = "../gateway-config" }
-gateway-extension = { path = "../gateway-extension" }
-http = "1"
-http-body = "1"
-http-body-util = "0.1"
-prost = "0.14"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync"] }
-tokio-stream = "0.1"
-tonic = "0.14"
-tonic-prost = "0.14"
-tracing = "0.1"
+bytes.workspace = true
+gateway-config.workspace = true
+gateway-extension.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-gateway-state = { path = "../gateway-state" }
-serde_yaml = "0.9"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+gateway-state.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [build-dependencies]
-tonic-prost-build = "0.14"
+tonic-prost-build.workspace = true
